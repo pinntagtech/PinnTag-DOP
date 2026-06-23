@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn==0.30.0
+pydantic==2.9.2
+# pypostal is a Python binding over the libpostal C library. Installing
+# pypostal alone is NOT enough — the host must also have libpostal-dev
+# (apt) AND the trained data files (~2GB) extracted to either the
+# default LIBPOSTAL_DATA_DIR or wherever libpostal was configured with
+# --datadir at build time. See README.md in this directory.
+postal==1.1.10

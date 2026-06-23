@@ -1,0 +1,188 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+:root {
+  --bg: #09090B;
+  --surface: #111113;
+  --surface-elevated: #1C1C1F;
+  --border: #27272A;
+  --border-strong: #3F3F46;
+  --text: #FAFAFA;
+  --text-secondary: #A1A1AA;
+  --text-muted: #52525B;
+  --accent: #6366F1;
+  --accent-hover: #4F46E5;
+  --accent-subtle: rgba(99,102,241,0.12);
+  --green: #22C55E;
+  --green-subtle: rgba(34,197,94,0.12);
+  --amber: #F59E0B;
+  --amber-subtle: rgba(245,158,11,0.12);
+  --red: #EF4444;
+  --red-subtle: rgba(239,68,68,0.12);
+  --blue: #3B82F6;
+  --blue-subtle: rgba(59,130,246,0.12);
+  --purple: #A855F7;
+  --purple-subtle: rgba(168,85,247,0.12);
+  --teal: #14B8A6;
+  --teal-subtle: rgba(20,184,166,0.12);
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --font: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'DM Mono', 'Fira Code', monospace;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow: 0 4px 12px rgba(0,0,0,0.5);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.6);
+}
+
+:root[data-theme="light"] {
+  --bg: #F8F8F9;
+  --surface: #FFFFFF;
+  --surface-elevated: #F4F4F5;
+  --border: #E4E4E7;
+  --border-strong: #D4D4D8;
+  --text: #09090B;
+  --text-secondary: #52525B;
+  --text-muted: #A1A1AA;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
+  --shadow: 0 4px 12px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.12);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 2px;
+}
+
+::selection {
+  background: var(--accent-subtle);
+  color: var(--text);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease forwards;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Ensure all text defaults to theme color */
+p, span, div, td, th, label, h1, h2, h3, h4 {
+  color: inherit;
+}
+
+/* Table cells always use theme text */
+table {
+  color: var(--text);
+}
+
+/* Fix any remaining white backgrounds in dark mode */
+:root:not([data-theme="light"]) {
+  color-scheme: dark;
+}
+
+/* Force dark theme on all modal elements */
+[role="dialog"],
+.modal-backdrop ~ div,
+div[style*="position: fixed"] > div {
+  color-scheme: dark;
+}
+
+/* All inputs globally */
+input, select, textarea {
+  background: var(--surface-elevated) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+  border-radius: var(--radius);
+  font-family: var(--font);
+  font-size: 13px;
+  padding: 0 12px;
+  height: 36px;
+}
+textarea {
+  height: auto;
+  padding: 8px 12px;
+  resize: vertical;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent) !important;
+  outline: none;
+}
+input::placeholder, textarea::placeholder {
+  color: var(--text-muted) !important;
+}
+select option {
+  background: var(--surface-elevated);
+  color: var(--text);
+}
+
+/* Checkboxes */
+input[type="checkbox"] {
+  width: 14px !important;
+  height: 14px !important;
+  accent-color: var(--accent);
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  padding: 0;
+}
+
+/* Labels */
+label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+:root[data-theme="light"] input,
+:root[data-theme="light"] select,
+:root[data-theme="light"] textarea {
+  background: var(--surface-elevated) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+
+:root[data-theme="light"] button[style*="accent-subtle"] {
+  background: var(--accent-subtle) !important;
+}

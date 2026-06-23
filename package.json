@@ -1,0 +1,14 @@
+{
+  "name": "pinntag-dop",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "api": "npm run start:dev --workspace=apps/api",
+    "portal": "npm run dev --workspace=apps/portal",
+    "build:api": "npm run build --workspace=apps/api",
+    "build:portal": "npm run build --workspace=apps/portal"
+  }
+}

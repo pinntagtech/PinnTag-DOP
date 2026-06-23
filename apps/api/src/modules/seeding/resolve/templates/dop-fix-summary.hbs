@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>DOP Fix complete — {{batchLabel}}</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont,
+        'Segoe UI', sans-serif;
+      background: #F4F4F5;
+      margin: 0;
+      padding: 40px 20px;
+    }
+    .card {
+      max-width: 560px;
+      margin: 0 auto;
+      background: #ffffff;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+    }
+    .header {
+      background: #0A0A0A;
+      padding: 24px 32px;
+    }
+    .header h1 {
+      color: #ffffff;
+      font-size: 18px;
+      margin: 0;
+      font-weight: 600;
+    }
+    .header p {
+      color: #A1A1AA;
+      font-size: 12px;
+      margin: 4px 0 0;
+    }
+    .body {
+      padding: 28px 32px;
+    }
+    .lede {
+      color: #3F3F46;
+      font-size: 14px;
+      line-height: 1.55;
+      margin: 0 0 20px;
+    }
+    .summary {
+      background: #F4F4F5;
+      border-radius: 8px;
+      padding: 18px 20px;
+      margin: 0 0 20px;
+    }
+    .summary .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: #18181B;
+      padding: 6px 0;
+    }
+    .summary .row + .row {
+      border-top: 1px solid #E4E4E7;
+    }
+    .summary .row.headline {
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .summary .row .label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .summary .row .value {
+      font-variant-numeric: tabular-nums;
+      font-weight: 500;
+    }
+    .bucket {
+      margin-top: 20px;
+    }
+    .bucket .bucket-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #71717A;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .bucket .examples {
+      font-size: 13px;
+      color: #3F3F46;
+      line-height: 1.55;
+    }
+    .review-list {
+      background: #FFF7ED;
+      border: 1px solid #FED7AA;
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin: 16px 0 0;
+    }
+    .review-list .bucket-title {
+      color: #C2410C;
+      margin-bottom: 6px;
+    }
+    .review-list .examples {
+      color: #9A3412;
+    }
+    .btn {
+      display: block;
+      padding: 12px;
+      background: #0A0A0A;
+      color: #ffffff;
+      text-align: center;
+      text-decoration: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      margin: 24px 0 0;
+      box-sizing: border-box;
+    }
+    .footer {
+      padding: 18px 32px;
+      border-top: 1px solid #E4E4E7;
+      font-size: 11px;
+      color: #A1A1AA;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <h1>DOP Fix complete</h1>
+      <p>{{batchLabel}} · {{environment}} · batch {{batchId}}</p>
+    </div>
+    <div class="body">
+      <p class="lede">
+        The Fix cascade just finished for this batch. Hours, rating,
+        cover and taxonomy were applied where mappable. Anything below
+        the "Needs review" line still needs operator attention.
+      </p>
+      <div class="summary">
+        <div class="row headline">
+          <span class="label">✅ Fully fixed</span>
+          <span class="value">{{fullyFixed}} / {{total}}</span>
+        </div>
+        <div class="row">
+          <span class="label">🕒 Hours written</span>
+          <span class="value">{{countsHours}}</span>
+        </div>
+        <div class="row">
+          <span class="label">⭐ Rating captured</span>
+          <span class="value">{{countsRating}}</span>
+        </div>
+        <div class="row">
+          <span class="label">🖼 Cover synced</span>
+          <span class="value">{{countsCover}}</span>
+        </div>
+        <div class="row">
+          <span class="label">🏷 Taxonomy corrected</span>
+          <span class="value">{{countsTaxonomy}}</span>
+        </div>
+      </div>
+
+      {{examplesHtml}}
+
+      {{reviewHtml}}
+
+      <a href="{{resolveUrl}}" class="btn">
+        Open Resolve →
+      </a>
+    </div>
+    <div class="footer">
+      Batch {{batchId}} · {{completedAtLabel}} · sent by PinnTag DOP
+    </div>
+  </div>
+</body>
+</html>
