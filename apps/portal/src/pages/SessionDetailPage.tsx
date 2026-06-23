@@ -21,6 +21,7 @@ import {
   CheckCircle,
   Zap,
   Image as ImageIcon,
+  ShieldCheck,
 } from "lucide-react";
 import {
   useSession,
@@ -35,7 +36,9 @@ import {
   useAssignCoverAsLogo,
   useSessionBotJobs,
   useActiveSessionJobs,
+  useVerifyAndFix,
 } from "../hooks/use-sessions";
+import type { VerifyAndFixResult } from "../hooks/use-sessions";
 import {
   recordKeys,
   useSessionRecords,
@@ -172,8 +175,33 @@ export default function SessionDetailPage() {
   const cvbValidate = useCvbValidate();
   const cvbAutoFix = useCvbAutoFix();
   const assignCoverAsLogo = useAssignCoverAsLogo();
+  const verifyAndFix = useVerifyAndFix();
+  const [verifyResult, setVerifyResult] = useState<VerifyAndFixResult | null>(
+    null,
+  );
   const { data: activeBotJobs } = useActiveSessionJobs(id ?? "");
   const [showActiveJobs, setShowActiveJobs] = useState(false);
+
+  // Verify & Fix — dryRun:true audits, dryRun:false applies auto-fixes.
+  const handleVerifyAndFix = async (dryRun: boolean) => {
+    if (!id) return;
+    try {
+      const r = await verifyAndFix.mutateAsync({ sessionId: id, dryRun });
+      setVerifyResult(r);
+      setBotToast(
+        dryRun
+          ? `Audit complete: ${r.ready}/${r.totalBusinesses} ready`
+          : `Auto-fixes applied: ${r.ready}/${r.totalBusinesses} ready`,
+      );
+      setTimeout(() => setBotToast(null), 5000);
+    } catch (err: any) {
+      alert(
+        err?.response?.data?.message ??
+          err.message ??
+          "Verify & Fix failed",
+      );
+    }
+  };
 
   // When bot jobs transition from running → idle, do ONE extra refetch
   // so the final webhook write (cover/logo mirror) lands in the table
@@ -647,6 +675,36 @@ export default function SessionDetailPage() {
               </>
             )}
 
+            {session.totalRecords > 0 && (
+              <Button
+                variant="secondary"
+                icon={<ShieldCheck size={14} />}
+                loading={verifyAndFix.isPending}
+                onClick={() => handleVerifyAndFix(true)}
+              >
+                Verify &amp; Fix
+              </Button>
+            )}
+
+            {verifyResult &&
+              verifyResult.dryRun &&
+              (verifyResult.autoFixable.hours +
+                verifyResult.autoFixable.hoursEncoding +
+                verifyResult.autoFixable.keys +
+                verifyResult.autoFixable.countryCode +
+                verifyResult.autoFixable.coverQueued +
+                verifyResult.autoFixable.outletLink >
+                0) && (
+                <Button
+                  variant="primary"
+                  icon={<Wand2 size={14} />}
+                  loading={verifyAndFix.isPending}
+                  onClick={() => handleVerifyAndFix(false)}
+                >
+                  Apply auto-fixes
+                </Button>
+              )}
+
             {/* Admin menu */}
             <div style={{ position: "relative" }}>
               <Button
@@ -780,6 +838,131 @@ export default function SessionDetailPage() {
           </div>
         </div>
       </div>
+
+      {/* Verify & Fix summary panel (session-level aggregate only) */}
+      {verifyResult &&
+        (() => {
+          const r = verifyResult;
+          const af = r.autoFixable;
+          const nm = r.needsManual;
+          const autoChips: { label: string; n: number }[] = [
+            { label: "hours", n: af.hours },
+            { label: "encoding", n: af.hoursEncoding },
+            { label: "keys", n: af.keys },
+            { label: "countryCode", n: af.countryCode },
+            { label: "outlet-link", n: af.outletLink },
+            { label: "covers queued", n: af.coverQueued },
+          ].filter((c) => c.n > 0);
+          const manualChips: { label: string; n: number }[] = [
+            { label: "address", n: nm.address },
+            { label: "coords", n: nm.coords },
+            { label: "name", n: nm.name },
+            { label: "taxonomy", n: nm.taxonomy },
+            { label: "resolve", n: nm.resolve },
+          ].filter((c) => c.n > 0);
+          return (
+            <div
+              style={{
+                padding: "12px 16px",
+                backgroundColor: "var(--surface)",
+                border: "1px solid var(--border)",
+                borderRadius: "8px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  fontSize: "13px",
+                }}
+              >
+                <ShieldCheck size={15} style={{ color: "var(--text)" }} />
+                <span style={{ fontWeight: 600, color: "var(--text)" }}>
+                  {r.ready} of {r.totalBusinesses} ready
+                </span>
+                <span style={{ color: "var(--text-muted)" }}>·</span>
+                <span style={{ color: "var(--text-secondary)" }}>
+                  {r.dryRun ? "Audit (no changes written)" : "Auto-fixes applied"}
+                </span>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: "6px",
+                  alignItems: "center",
+                  fontSize: "12px",
+                }}
+              >
+                <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>
+                  {r.dryRun ? "Auto-fixable:" : "Auto-fixed:"}
+                </span>
+                {autoChips.length === 0 ? (
+                  <span style={{ color: "var(--text-muted)" }}>none</span>
+                ) : (
+                  autoChips.map((c) => (
+                    <span
+                      key={c.label}
+                      style={{
+                        padding: "2px 8px",
+                        borderRadius: "999px",
+                        backgroundColor: "#ECFDF5",
+                        color: "#047857",
+                        fontWeight: 500,
+                      }}
+                    >
+                      {c.label} ({c.n})
+                    </span>
+                  ))
+                )}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: "6px",
+                  alignItems: "center",
+                  fontSize: "12px",
+                }}
+              >
+                <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>
+                  Needs manual:
+                </span>
+                {manualChips.length === 0 ? (
+                  <span style={{ color: "var(--text-muted)" }}>none</span>
+                ) : (
+                  manualChips.map((c) => (
+                    <span
+                      key={c.label}
+                      style={{
+                        padding: "2px 8px",
+                        borderRadius: "999px",
+                        backgroundColor: "#FEF2F2",
+                        color: "#B91C1C",
+                        fontWeight: 500,
+                      }}
+                    >
+                      {c.label} ({c.n})
+                    </span>
+                  ))
+                )}
+              </div>
+
+              {r.dryRun && autoChips.length > 0 && (
+                <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                  Click “Apply auto-fixes” to write these changes. Cover fixes
+                  enqueue cover-sync bot jobs (shown in the bot strip below).
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
       {/* Bot processes strip */}
       {botJobs &&

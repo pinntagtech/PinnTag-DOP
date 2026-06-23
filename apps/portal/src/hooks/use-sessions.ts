@@ -320,6 +320,67 @@ export function useAssignCoverAsLogo() {
   });
 }
 
+export interface VerifyAndFixResult {
+  totalBusinesses: number;
+  ready: number;
+  checkSummary: {
+    name: number;
+    address: number;
+    coords: number;
+    hours: number;
+    hoursEncoding: number;
+    keys: number;
+    countryCode: number;
+    cover: number;
+    taxonomy: number;
+    outletLink: number;
+    resolve: number;
+  };
+  autoFixable: {
+    hours: number;
+    hoursEncoding: number;
+    keys: number;
+    countryCode: number;
+    coverQueued: number;
+    outletLink: number;
+  };
+  needsManual: {
+    address: number;
+    coords: number;
+    taxonomy: number;
+    resolve: number;
+    name: number;
+  };
+  dryRun: boolean;
+}
+
+// Audit (dryRun:true) or auto-fix (dryRun:false) already-seeded businesses
+// in a previous session against the current activation checklist.
+export function useVerifyAndFix() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: {
+      sessionId: string;
+      dryRun: boolean;
+    }) => {
+      const { data } = await apiClient.post(
+        `/seeding/sessions/${payload.sessionId}/verify-and-fix`,
+        { dryRun: payload.dryRun },
+      );
+      return data as VerifyAndFixResult;
+    },
+    onSuccess: (_data, variables) => {
+      // Only an applied run mutates data / enqueues bot jobs.
+      if (!variables.dryRun) {
+        queryClient.invalidateQueries({ queryKey: sessionKeys.all });
+        queryClient.invalidateQueries({
+          queryKey: sessionKeys.botJobs(variables.sessionId),
+        });
+      }
+    },
+  });
+}
+
 export function useResetBotStages() {
   const queryClient = useQueryClient();
   return useMutation({

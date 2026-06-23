@@ -96,6 +96,7 @@ export const SeedingLogActions = {
   CVB_FIX_AUTO: 'cvb_fix_auto',
   CVB_FIX_REJECTED: 'cvb_fix_rejected',
   SCRAPER_IMPORT: 'scraper_import',
+  VERIFY_AND_FIX: 'verify_and_fix',
 } as const;
 
 export const ValidationSeverity = {

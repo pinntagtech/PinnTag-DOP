@@ -26,6 +26,7 @@ import { BotWebhookService } from './bot/bot-webhook.service';
 import { BotJobService } from './bot/bot-job.service';
 import { BotJobType } from './schemas/bot-job.schema';
 import { MigrationService } from './migration/migration.service';
+import { VerifyAndFixService } from './verify/verify-and-fix.service';
 import { CvbService } from './cvb/cvb.service';
 import { CvbProdMigrationService } from './cvb-migration/cvb-prod-migration.service';
 import { LocationsService } from '../locations/locations.service';
@@ -62,6 +63,7 @@ export class SeedingController {
     private readonly botWebhookService: BotWebhookService,
     private readonly botJobService: BotJobService,
     private readonly migrationService: MigrationService,
+    private readonly verifyAndFixService: VerifyAndFixService,
     private readonly cvbService: CvbService,
     private readonly cvbProdMigrationService: CvbProdMigrationService,
     private readonly locationsService: LocationsService,
@@ -411,6 +413,23 @@ export class SeedingController {
     const actor = req.user?.name || 'Operator';
     await this.pipelineService.runEnrichment(id, actor);
     return { message: 'Enrichment complete' };
+  }
+
+  // Audit (and optionally auto-fix) already-seeded businesses in a previous
+  // session against the current activation checklist. dryRun:true reports
+  // only; dryRun:false applies the auto-fixable items. Returns a SESSION-LEVEL
+  // aggregate (no per-business list).
+  @Post('sessions/:id/verify-and-fix')
+  async verifyAndFix(
+    @Param('id') id: string,
+    @Body() body: { dryRun?: boolean },
+    @Request() req: any,
+  ) {
+    const actor = req.user?.name || 'Operator';
+    return this.verifyAndFixService.run(id, {
+      dryRun: body?.dryRun ?? true,
+      actor,
+    });
   }
 
   @Post('sessions/:id/re-enrich')
