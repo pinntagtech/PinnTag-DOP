@@ -1,3 +1,6 @@
+import { BusinessStatus } from '../../../common/enums';
+import { OPEN_24H_DURATION } from '../resolve/hours-constants';
+
 export interface ScraperRecord {
   place_name?: string;
   name?: string;
@@ -52,6 +55,15 @@ export interface AdapterResult {
     cityUnresolved: number;
     areaInList: number;
     areaKeptCustom: number;
+    // ── Stage B data-quality counters ──
+    // Each counts records that tripped an import-validation flag below.
+    // Surfaced in the import summary so the operator sees data quality
+    // BEFORE running the pipeline. These are warnings, not failures.
+    hoursUnparsed: number;
+    addressInvalid: number;
+    noCoords: number;
+    noPlaceId: number;
+    noName: number;
   };
 }
 
@@ -178,26 +190,100 @@ function extractPlaceId(url: string): string | null {
   return null;
 }
 
+// Parse the raw phone into its national digits plus, when present, the
+// "+NN" country-code prefix. We do NOT default the country code here — an
+// absent prefix returns hadPrefix:false so the caller can infer it from
+// coords/country instead of blindly stamping "+1".
 function parsePhone(raw: string): {
   countryCode: string;
   phone: string;
+  hadPrefix: boolean;
 } {
-  if (!raw) return { countryCode: '+1', phone: '' };
+  if (!raw || !raw.trim()) {
+    return { countryCode: '', phone: '', hadPrefix: false };
+  }
 
   const trimmed = raw.trim();
 
-  let countryCode = '+1';
+  let countryCode = '';
+  let hadPrefix = false;
   let digits = trimmed;
 
-  const ccMatch = trimmed.match(/^(\+\d{1,3})\s/);
+  // Require a separator after the prefix so "+1 802…" yields "+1" (not
+  // "+1 8…") and a glued local number like "8023475362" isn't misread.
+  const ccMatch = trimmed.match(/^(\+\d{1,3})[\s\-.]/);
   if (ccMatch) {
     countryCode = ccMatch[1];
+    hadPrefix = true;
     digits = trimmed.slice(ccMatch[0].length);
   }
 
   const phone = digits.replace(/\D/g, '');
 
-  return { countryCode, phone };
+  return { countryCode, phone, hadPrefix };
+}
+
+// Calling codes for the handful of countries the scraper has actually
+// produced. Used only when the raw phone has no "+NN" prefix but the
+// country field names a country — we still avoid stamping "+1" blindly.
+const COUNTRY_TO_CALLING_CODE: Record<string, string> = {
+  'united states': '+1',
+  'united states of america': '+1',
+  usa: '+1',
+  canada: '+1',
+  india: '+91',
+  'united kingdom': '+44',
+  uk: '+44',
+  australia: '+61',
+  mexico: '+52',
+};
+
+// Resolve the country code without blindly defaulting to "+1":
+//   1. an explicit "+NN" prefix on the raw phone always wins;
+//   2. else infer "+1" from a US signal (US coords / "United States" / a
+//      valid US state);
+//   3. else map a named non-US country to its calling code;
+//   4. else, if coords are set but non-US, leave blank and FLAG it;
+//   5. else (no signal at all) fall back to "+1" — the dataset is US-centric
+//      and nothing contradicts it. The key is always present either way.
+function resolveCountryCode(args: {
+  hadPrefix: boolean;
+  prefix: string;
+  country: string;
+  state: string;
+  latitude: number;
+  longitude: number;
+  warnings: string[];
+}): string {
+  const { hadPrefix, prefix, country, state, latitude, longitude, warnings } =
+    args;
+
+  if (hadPrefix && prefix) return prefix;
+
+  const coordsSet = latitude !== 0 || longitude !== 0;
+  const usByCoord = coordsSet && isUsCoord(latitude, longitude);
+  const countryKey = (country || '').trim().toLowerCase();
+  const usByCountry =
+    countryKey === 'united states' ||
+    countryKey === 'united states of america' ||
+    countryKey === 'usa';
+  const usByState = !!normalizeUsState(state);
+
+  if (usByCoord || usByCountry || usByState) return '+1';
+
+  if (countryKey && COUNTRY_TO_CALLING_CODE[countryKey]) {
+    return COUNTRY_TO_CALLING_CODE[countryKey];
+  }
+
+  if (coordsSet && !usByCoord) {
+    warnings.push(
+      '[stage-b] countryCode could not be inferred — phone has no "+NN" ' +
+        `prefix and coordinates (${latitude}, ${longitude}) are non-US`,
+    );
+    return '';
+  }
+
+  return '+1';
 }
 
 function parseCoordinates(raw: string): {
@@ -227,26 +313,6 @@ function parseReviewCount(raw: string | number): number {
   return isNaN(parsed) ? 0 : parsed;
 }
 
-function parseTime(timeStr: string): {
-  hour: number;
-  minute: number;
-} {
-  const t = timeStr.trim().toLowerCase();
-  if (!t || t === 'closed') return { hour: 0, minute: 0 };
-
-  const match = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
-  if (!match) return { hour: 0, minute: 0 };
-
-  let hour = parseInt(match[1], 10);
-  const minute = match[2] ? parseInt(match[2], 10) : 0;
-  const ampm = match[3].toLowerCase();
-
-  if (ampm === 'pm' && hour !== 12) hour += 12;
-  if (ampm === 'am' && hour === 12) hour = 0;
-
-  return { hour, minute };
-}
-
 const DAY_NAMES = [
   'sunday',
   'monday',
@@ -257,44 +323,210 @@ const DAY_NAMES = [
   'saturday',
 ];
 
-function parseHours(raw: string): any {
+// ─── Hours parser ──────────────────────────────────────────────────────────
+//
+// Google's scraped hours arrive as ONE glued string with all seven days
+// concatenated directly onto their time text and footer/advisory UI mixed
+// in, e.g.
+//   "Tuesday8 am–8 pmWednesday8 am–8 pm…Friday(Juneteenth)8 am–8 pm Hours
+//    might differSaturday8 am–8 pm…Monday8 am–8 pmSuggest new hours"
+// The old spaced-only regex matched none of this, so every business imported
+// all-closed. We split on day-name boundaries, strip the noise, then parse
+// each day's time text (single range, split-shift envelope, 24h, closed,
+// meridiem-inherit, overnight).
+
+type HoursDuration = {
+  startHour: number;
+  startMinute: number;
+  endHour: number;
+  endMinute: number;
+};
+type HoursDay = { duration: HoursDuration | null; isClosed: boolean };
+
+// "Open 24 hours" → 0:00–23:59 (LOCKED, shared with the resolve hours-parser
+// via hours-constants so the two never diverge).
+
+// Day-name boundary — used both to split the blob and to read each
+// segment's leading day label.
+const DAY_NAME_RE =
+  /(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)/i;
+const DAY_NAME_GLOBAL_RE = new RegExp(DAY_NAME_RE.source, 'gi');
+
+// Footer / advisory / holiday noise that the scraper glues onto a day's
+// time text. Stripped before parsing. "(…)" covers "(Juneteenth)" and any
+// other parenthetical holiday note. No \b anchors — these arrive fused to
+// the preceding time ("8 pmSuggest new hours"), so a leading word boundary
+// would never match; they're whole multi-word phrases, so a plain substring
+// strip is safe.
+const HOURS_NOISE_RE =
+  /\([^)]*\)|hours might (?:differ|vary)|holiday hours|suggest new hours|copy open hours/gi;
+
+// One clock token: "8", "8:30", "8 am", "8:30 pm", "noon", "midnight".
+// Returns the raw 12-hour value + minute + meridiem (null when omitted) so
+// the caller can apply meridiem inheritance before normalising to 24h.
+function parseClockToken(
+  tok: string,
+): { raw12: number; minute: number; meridiem: 'am' | 'pm' | null } | null {
+  const t = tok.trim().toLowerCase();
+  if (!t) return null;
+  if (t === 'noon') return { raw12: 12, minute: 0, meridiem: 'pm' };
+  if (t === 'midnight') return { raw12: 12, minute: 0, meridiem: 'am' };
+
+  const m = t.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+  if (!m) return null;
+  const raw12 = parseInt(m[1], 10);
+  const minute = m[2] ? parseInt(m[2], 10) : 0;
+  const meridiem = (m[3] as 'am' | 'pm' | undefined) ?? null;
+  if (raw12 < 0 || raw12 > 23) return null;
+  if (minute < 0 || minute > 59) return null;
+  return { raw12, minute, meridiem };
+}
+
+// Apply a meridiem to a raw 12-hour value → 24-hour. "12 am" → 0, "12 pm"
+// → 12, "1 pm" → 13.
+function to24(raw12: number, meridiem: 'am' | 'pm'): number {
+  if (meridiem === 'pm' && raw12 !== 12) return raw12 + 12;
+  if (meridiem === 'am' && raw12 === 12) return 0;
+  return raw12;
+}
+
+// Parse ONE "start-end" range to a 24-hour duration. The end token must
+// carry a meridiem (it's the anchor). When the start omits its meridiem we
+// inherit the end's; if that makes start>end on the same day (e.g.
+// "11–2 pm" → 23:00–14:00) we flip the start to am ("11 am–2 pm"). Overnight
+// ranges where the end legitimately carries its own earlier meridiem
+// ("11 am–2 am") are kept as end<start — the consumer wraps them.
+function parseHoursRange(
+  rawStart: string,
+  rawEnd: string,
+): HoursDuration | null {
+  const start = parseClockToken(rawStart);
+  const end = parseClockToken(rawEnd);
+  if (!start || !end || !end.meridiem) return null;
+
+  const endHour = to24(end.raw12, end.meridiem);
+  const endMinute = end.minute;
+
+  let startHour: number;
+  if (start.meridiem) {
+    startHour = to24(start.raw12, start.meridiem);
+  } else {
+    const inherited = to24(start.raw12, end.meridiem);
+    const inheritedMin = inherited * 60 + start.minute;
+    const endMin = endHour * 60 + endMinute;
+    startHour =
+      inheritedMin > endMin ? to24(start.raw12, 'am') : inherited;
+  }
+  const startMinute = start.minute;
+
+  // Zero-length same-clock range ("12 pm–12 pm") is ambiguous — skip.
+  if (startHour === endHour && startMinute === endMinute) return null;
+
+  return { startHour, startMinute, endHour, endMinute };
+}
+
+// One TIME-TIME range fragment; scanned globally to collect split shifts.
+const HOURS_TIME_FRAG = String.raw`(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)`;
+const HOURS_RANGE_RE = new RegExp(
+  `(${HOURS_TIME_FRAG})\\s*-\\s*(${HOURS_TIME_FRAG})`,
+  'gi',
+);
+
+// Parse a single day's time text (post day-label, post-split) into a
+// HoursDay, or null when it can't be parsed (caller leaves the day Closed).
+function parseDayValue(rawValue: string): HoursDay | null {
+  let v = rawValue
+    .replace(HOURS_NOISE_RE, ' ')
+    .replace(/[–—‒−]/g, '-') // en/em/figure dash, minus → '-'
+    .replace(/ /g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+
+  if (!v) return null;
+  if (v === 'closed') return { duration: null, isClosed: true };
+  if (/open 24 hours|^24 hours$|^open 24$/.test(v)) {
+    return { duration: { ...OPEN_24H_DURATION }, isClosed: false };
+  }
+
+  // Un-glue a meridiem fused to the next range's start digit
+  // ("1 pm5–8:30 pm" → "1 pm 5–8:30 pm") so split shifts tokenise cleanly.
+  v = v.replace(/(am|pm)(?=\d)/g, '$1 ');
+
+  const ranges: HoursDuration[] = [];
+  HOURS_RANGE_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = HOURS_RANGE_RE.exec(v)) !== null) {
+    const range = parseHoursRange(m[1], m[2]);
+    if (range) ranges.push(range);
+  }
+  if (ranges.length === 0) return null;
+  if (ranges.length === 1) return { duration: ranges[0], isClosed: false };
+
+  // Split shift — the schema stores ONE duration per day, so collapse the
+  // N ranges to a single envelope: earliest start → latest end.
+  let earliest = ranges[0];
+  let latest = ranges[0];
+  for (const r of ranges) {
+    if (r.startHour * 60 + r.startMinute < earliest.startHour * 60 + earliest.startMinute) {
+      earliest = r;
+    }
+    if (r.endHour * 60 + r.endMinute > latest.endHour * 60 + latest.endMinute) {
+      latest = r;
+    }
+  }
+  return {
+    duration: {
+      startHour: earliest.startHour,
+      startMinute: earliest.startMinute,
+      endHour: latest.endHour,
+      endMinute: latest.endMinute,
+    },
+    isClosed: false,
+  };
+}
+
+// Split the glued blob into { day, value } segments. Each day's segment is
+// everything from its name until the next day name.
+function splitGluedHours(raw: string): { day: string; value: string }[] {
+  // Scan for every day-name occurrence; each day's value runs from the end
+  // of its name to the start of the next day name (or end of string). Index
+  // based so we never split on the spaces inside a time value ("8 am-8 pm").
+  const re = new RegExp(DAY_NAME_GLOBAL_RE.source, 'gi');
+  const hits: { day: string; start: number; nameStart: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    hits.push({
+      day: m[1].toLowerCase(),
+      nameStart: m.index,
+      start: m.index + m[1].length,
+    });
+  }
+  const out: { day: string; value: string }[] = [];
+  for (let i = 0; i < hits.length; i++) {
+    const end = i + 1 < hits.length ? hits[i + 1].nameStart : raw.length;
+    out.push({ day: hits[i].day, value: raw.slice(hits[i].start, end) });
+  }
+  return out;
+}
+
+export function parseHours(raw: string): { weekDays: Record<string, HoursDay> } {
   // Real PinnTag DaySchedule shape:
   //   open:   { duration: {startHour,startMinute,endHour,endMinute}, isClosed: false }
   //   closed: { duration: null, isClosed: true }
-  // Default every day to closed; positive matches below set open hours.
-  const weekDays: any = {};
+  // Every day defaults to Closed; a successful parse overwrites it. A day we
+  // can't parse stays Closed (the import-validation flag below catches the
+  // all-closed case so it doesn't pass silently).
+  const weekDays: Record<string, HoursDay> = {};
   for (const day of DAY_NAMES) {
     weekDays[day] = { duration: null, isClosed: true };
   }
 
   if (!raw || !raw.trim()) return { weekDays };
 
-  for (const day of DAY_NAMES) {
-    const dayCapitalized = day.charAt(0).toUpperCase() + day.slice(1);
-    const regex = new RegExp(
-      dayCapitalized +
-        '\\s*([\\d:]+\\s*[AaPp][Mm])\\s*[–\\-]\\s*' +
-        '([\\d:]+\\s*[AaPp][Mm])',
-      'i',
-    );
-    const match = raw.match(regex);
-    if (match) {
-      const start = parseTime(match[1]);
-      const end = parseTime(match[2]);
-      weekDays[day] = {
-        duration: {
-          startHour: start.hour,
-          startMinute: start.minute,
-          endHour: end.hour,
-          endMinute: end.minute,
-        },
-        isClosed: false,
-      };
-    }
-    const closedRegex = new RegExp(dayCapitalized + '\\s*Closed', 'i');
-    if (raw.match(closedRegex)) {
-      weekDays[day] = { duration: null, isClosed: true };
-    }
+  for (const { day, value } of splitGluedHours(raw)) {
+    const parsed = parseDayValue(value);
+    if (parsed) weekDays[day] = parsed;
   }
 
   return { weekDays };
@@ -1242,6 +1474,114 @@ function appendStageBValidationWarnings(args: {
   }
 }
 
+// Stage B data-quality flags. Unlike the contradiction checks above (which
+// compare fields against each other) these flag a single field that is
+// structurally unusable downstream — no real address, hours that didn't
+// parse, junk coords/name, or a missing placeId. Each flag BOTH pushes a
+// [stage-b] warning (→ validationError, surfaced on the SeedingRecord row)
+// AND bumps a stats counter, so the operator sees aggregate data quality in
+// the import summary before running the pipeline. We flag, never correct.
+function appendStageBDataQualityFlags(args: {
+  name: string;
+  placeId: string;
+  address1: string;
+  rawHours: string;
+  openDayCount: number;
+  latitude: number;
+  longitude: number;
+  warnings: string[];
+  stats: {
+    hoursUnparsed: number;
+    addressInvalid: number;
+    noCoords: number;
+    noPlaceId: number;
+    noName: number;
+  };
+}): void {
+  const {
+    name,
+    placeId,
+    address1,
+    rawHours,
+    openDayCount,
+    latitude,
+    longitude,
+    warnings,
+    stats,
+  } = args;
+
+  // ── EMPTY/JUNK NAME ──
+  if (!name || name.trim().length < 2) {
+    stats.noName++;
+    warnings.push(
+      `[stage-b] Name is empty or under 2 chars ("${name}") — likely a ` +
+        'junk/blank record',
+    );
+  }
+
+  // ── MISSING PLACEID ──
+  if (!placeId || !placeId.trim()) {
+    stats.noPlaceId++;
+    warnings.push(
+      '[stage-b] placeId is empty — record cannot be resolved/deduped ' +
+        'downstream',
+    );
+  }
+
+  // ── ADDRESS-IS-NOT-AN-ADDRESS ──
+  // After parseAddress, address1 should be a street line. Flag the
+  // confirmed real-data failures: a phone number ("+1 802-347-3562"),
+  // a URL / social handle / domain, or an empty string.
+  const addr = (address1 || '').trim();
+  const addrIsPhone = /^\+?\d[\d\s\-()]+$/.test(addr);
+  const addrIsUrl = /\.com|http|www\.|instagram|facebook/i.test(addr);
+  if (!addr || addrIsPhone || addrIsUrl) {
+    stats.addressInvalid++;
+    const why = !addr
+      ? 'empty'
+      : addrIsPhone
+        ? 'a phone number'
+        : 'a URL/handle';
+    warnings.push(
+      `[stage-b] address1 "${address1}" is ${why}, not a street address — ` +
+        'needs a real address',
+    );
+  }
+
+  // ── HOURS-PRESENT-BUT-UNPARSED ──
+  // raw.hours had content but parseHours produced ZERO open days — the
+  // format didn't match and the business would import all-closed wrongly.
+  const hasRawHours = !!rawHours && rawHours.trim().length > 0;
+  if (hasRawHours && openDayCount === 0) {
+    stats.hoursUnparsed++;
+    warnings.push(
+      '[stage-b] Hours were present but none parsed — all 7 days would ' +
+        'import as Closed; check the hours format',
+    );
+  }
+
+  // ── NO-HOURS ──
+  // raw.hours empty/missing. Flagged (no dedicated counter) so an
+  // all-closed import is distinguishable from genuinely-closed real hours;
+  // distinct from hoursUnparsed, which means a format we couldn't read.
+  if (!hasRawHours) {
+    warnings.push(
+      '[stage-b] No hours captured — record will import with all days ' +
+        'Closed by default',
+    );
+  }
+
+  // ── ZERO/MISSING COORDS ──
+  // The adapter defaults missing coords to (0, 0); a real venue is never at
+  // (0, 0) (null-island in the Atlantic), so treat it as "no real coords".
+  if (latitude === 0 && longitude === 0) {
+    stats.noCoords++;
+    warnings.push(
+      '[stage-b] Coordinates are (0, 0) — no real location captured',
+    );
+  }
+}
+
 function normalizeWebsite(url: string): string | null {
   if (!url || !url.trim()) return null;
   const trimmed = url.trim();
@@ -1274,6 +1614,11 @@ export function adaptScraperData(
     cityUnresolved: 0,
     areaInList: 0,
     areaKeptCustom: 0,
+    hoursUnparsed: 0,
+    addressInvalid: 0,
+    noCoords: 0,
+    noPlaceId: 0,
+    noName: 0,
   };
 
   const emailLookup = normalizeEmailMap(emailMap);
@@ -1470,7 +1815,17 @@ export function adaptScraperData(
       raw.review_count || raw.userRatingCount || 0,
     );
 
-    const { countryCode, phone } = parsePhone(raw.phone || '');
+    const parsedPhone = parsePhone(raw.phone || '');
+    const phone = parsedPhone.phone;
+    const countryCode = resolveCountryCode({
+      hadPrefix: parsedPhone.hadPrefix,
+      prefix: parsedPhone.countryCode,
+      country: country ?? '',
+      state,
+      latitude,
+      longitude,
+      warnings: recordWarnings,
+    });
 
     const website = normalizeWebsite(raw.website || '');
     if (!website) stats.noWebsite++;
@@ -1569,6 +1924,11 @@ export function adaptScraperData(
       categories: categoryResult.categories,
       regularTiming,
       tags,
+      // Every seeded business enters the pipeline at the post-cover
+      // confetti screen and must NOT auto-advance the onboarding journey —
+      // the operator drives activation from here.
+      status: BusinessStatus.CONFETTI_SCREEN, // 4.1
+      continueJourney: false,
     };
 
     if (address2) record.address2 = address2;
@@ -1603,6 +1963,25 @@ export function adaptScraperData(
       latitude,
       longitude,
       warnings: recordWarnings,
+    });
+
+    // Stage B data-quality flags (import-time gaps that caused major
+    // downstream cleanup). openDayCount drives the HOURS-PRESENT-BUT-UNPARSED
+    // check — a day is "open" only when the parser wrote isClosed: false.
+    const openDayCount = Object.values(
+      (regularTiming as any).weekDays ?? {},
+    ).filter((d: any) => d && d.isClosed === false).length;
+
+    appendStageBDataQualityFlags({
+      name,
+      placeId,
+      address1,
+      rawHours: String(raw.hours ?? raw.operating_hours ?? ''),
+      openDayCount,
+      latitude,
+      longitude,
+      warnings: recordWarnings,
+      stats,
     });
 
     if (recordWarnings.length > 0) {

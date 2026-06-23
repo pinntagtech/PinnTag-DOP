@@ -292,6 +292,11 @@ export function ScraperImportModal({
     emailMatched: number;
     categoryMapped: number;
     categoryFallback: number;
+    hoursUnparsed: number;
+    addressInvalid: number;
+    noCoords: number;
+    noPlaceId: number;
+    noName: number;
     sessionId: string;
   } | null>(null);
 
@@ -334,6 +339,11 @@ export function ScraperImportModal({
         emailMatched: result.stats.emailMatched,
         categoryMapped: result.stats.categoryMapped,
         categoryFallback: result.stats.categoryFallback,
+        hoursUnparsed: result.stats.hoursUnparsed,
+        addressInvalid: result.stats.addressInvalid,
+        noCoords: result.stats.noCoords,
+        noPlaceId: result.stats.noPlaceId,
+        noName: result.stats.noName,
         sessionId: result.sessionId,
       });
       setTimeout(() => {
@@ -767,6 +777,25 @@ export function ScraperImportModal({
                   {success.categoryMapped} categories mapped ·{' '}
                   {success.categoryFallback} used fallback
                 </p>
+                {(success.hoursUnparsed > 0 ||
+                  success.addressInvalid > 0 ||
+                  success.noCoords > 0 ||
+                  success.noPlaceId > 0 ||
+                  success.noName > 0) && (
+                  <p
+                    style={{
+                      fontSize: '12px',
+                      lineHeight: 1.5,
+                      marginTop: '4px',
+                      color: '#92400E',
+                    }}
+                  >
+                    Data quality: {success.hoursUnparsed} hours unparsed ·{' '}
+                    {success.addressInvalid} invalid address ·{' '}
+                    {success.noCoords} no coords · {success.noPlaceId} no
+                    placeId · {success.noName} no name
+                  </p>
+                )}
               </div>
             </div>
           )}

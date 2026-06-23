@@ -48,7 +48,7 @@ describe('hours-parser', () => {
       ]);
       expect(r.parsedDays.monday).toEqual({ duration: null, isClosed: true });
       expect(r.parsedDays.tuesday).toEqual({
-        duration: { startHour: 0, startMinute: 0, endHour: 24, endMinute: 0 },
+        duration: { startHour: 0, startMinute: 0, endHour: 23, endMinute: 59 },
         isClosed: false,
       });
     });

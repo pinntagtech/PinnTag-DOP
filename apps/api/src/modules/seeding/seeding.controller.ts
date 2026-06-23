@@ -198,11 +198,24 @@ export class SeedingController {
       delete clean.__warnings;
 
       const validationErrors = warnings.map((message) => ({
+        // Best-effort field attribution for the operator UI. State/area
+        // keep top priority so the existing contradiction warnings (which
+        // mention "coordinates" alongside "state") still map to 'state'.
         field: /state/i.test(message)
           ? 'state'
           : /area/i.test(message)
             ? 'area'
-            : 'city',
+            : /placeId/i.test(message)
+              ? 'placeId'
+              : /coordinates|coords/i.test(message)
+                ? 'coordinates'
+                : /\bhours\b/i.test(message)
+                  ? 'regularTiming'
+                  : /address1|address/i.test(message)
+                    ? 'address1'
+                    : /\bname\b/i.test(message)
+                      ? 'name'
+                      : 'city',
         message,
         severity: 'warning',
       }));
@@ -246,7 +259,12 @@ export class SeedingController {
         `${result.stats.cityDefaulted} city defaulted, ` +
         `${result.stats.cityUnresolved} city unresolved, ` +
         `${result.stats.areaInList} area in list, ` +
-        `${result.stats.areaKeptCustom} area kept custom)`,
+        `${result.stats.areaKeptCustom} area kept custom) ` +
+        `| data quality: ${result.stats.hoursUnparsed} hours unparsed, ` +
+        `${result.stats.addressInvalid} invalid address, ` +
+        `${result.stats.noCoords} no coords, ` +
+        `${result.stats.noPlaceId} no placeId, ` +
+        `${result.stats.noName} no name`,
     });
 
     return {

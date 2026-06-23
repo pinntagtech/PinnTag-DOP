@@ -10,6 +10,8 @@
 // than overwriting with a guessed Closed. The whole business is no
 // longer flagged just because one day didn't parse.
 
+import { OPEN_24H_DURATION } from './hours-constants';
+
 // DaySchedule shape mirrors the real PinnTag main-backend Schema:
 //   open:   { duration: {startHour,...,endMinute},    isClosed: false }
 //   closed: { duration: null,                         isClosed: true  }
@@ -80,8 +82,10 @@ const CLOSED_DAY: ParsedDay = {
   duration: null,
   isClosed: true,
 };
+// 24-hour day → 0:00–23:59 (shared with the scraper adapter; see
+// hours-constants). Must stay identical across both parsers.
 const OPEN_24H_DAY: ParsedDay = {
-  duration: { startHour: 0, startMinute: 0, endHour: 24, endMinute: 0 },
+  duration: { ...OPEN_24H_DURATION },
   isClosed: false,
 };
 

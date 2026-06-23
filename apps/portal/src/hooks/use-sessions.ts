@@ -207,6 +207,12 @@ export function useImportScraperData() {
           emailUnmatched: number;
           categoryMapped: number;
           categoryFallback: number;
+          // Stage B data-quality counters.
+          hoursUnparsed: number;
+          addressInvalid: number;
+          noCoords: number;
+          noPlaceId: number;
+          noName: number;
         };
       };
     },
