@@ -1,0 +1,29 @@
+.env.production
+apps/api/.env.production
+apps/portal/.env.production
+
+# deps / build
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# env
+.env
+.env.*
+!.env.example
+
+# bot
+apps/bot/venv/
+apps/bot/__pycache__/
+**/__pycache__/
+apps/bot/google_cookies.json
+*.pyc
+apps/bot/.env
+
+# artifacts / local
+PinnTag-DOP-Bot.zip
+node_modules
+.DS_Store
+*.log
+prod-env
