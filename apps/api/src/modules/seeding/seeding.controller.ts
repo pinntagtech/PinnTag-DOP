@@ -256,7 +256,7 @@ export class SeedingController {
         `Scraper import: ${result.stats.processed} records ` +
         `(${result.stats.emailMatched} emails matched, ` +
         `${result.stats.noWebsite} no website, ` +
-        `${result.stats.categoryFallback} category fallbacks, ` +
+        `${result.stats.categoryFallback} category deferred to Fix-taxonomy, ` +
         `${result.stats.cityResolved} city resolved, ` +
         `${result.stats.cityDefaulted} city defaulted, ` +
         `${result.stats.cityUnresolved} city unresolved, ` +

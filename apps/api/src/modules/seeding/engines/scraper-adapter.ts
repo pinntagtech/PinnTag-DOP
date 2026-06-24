@@ -1084,38 +1084,47 @@ for (const cat of ['Campground', 'Glamping site', 'RV park']) {
 
 function mapCategory(
   rawCategory: string,
-  fallbackIndustry?: string,
-  fallbackCategory?: string[],
+  selectedIndustry?: string,
+  fallbackCategory?: string[],   // kept for back-compat; unused when industry-scoped
 ): {
   industry: string;
   categories: string[];
   isFallback: boolean;
 } {
-  if (!rawCategory) {
-    return {
-      industry: fallbackIndustry || 'Food & Drinks',
-      categories: fallbackCategory || ['Restaurant'],
-      isFallback: true,
-    };
-  }
+  const want = (selectedIndustry || '').trim().toLowerCase();
+
+  const accept = (val: { industry: string; categories: string[] }) => {
+    // Industry-scoped: only accept a map hit in the selected industry.
+    if (want && val.industry.trim().toLowerCase() !== want) return null;
+    return { industry: selectedIndustry || val.industry,
+             categories: val.categories, isFallback: false };
+  };
+
+  const unresolved = () => ({
+    // Industry kept; category left EMPTY so post-publish Fix-taxonomy resolves it.
+    industry: selectedIndustry || 'Food & Drinks',
+    categories: [] as string[],
+    isFallback: true,
+  });
+
+  if (!rawCategory) return unresolved();
 
   const key = rawCategory.trim().toLowerCase();
   const exact = CATEGORY_MAP[key];
   if (exact) {
-    return { ...exact, isFallback: false };
+    const ok = accept(exact);
+    if (ok) return ok;
+    return unresolved();   // exact hit but wrong industry → unresolved, not cross-industry
   }
 
   for (const [mapKey, mapVal] of Object.entries(CATEGORY_MAP)) {
     if (key.includes(mapKey) || mapKey.includes(key)) {
-      return { ...mapVal, isFallback: false };
+      const ok = accept(mapVal);
+      if (ok) return ok;
     }
   }
 
-  return {
-    industry: fallbackIndustry || 'Food & Drinks',
-    categories: fallbackCategory || ['Restaurant'],
-    isFallback: true,
-  };
+  return unresolved();
 }
 
 function generateTags(
@@ -1855,6 +1864,12 @@ export function adaptScraperData(
       stats.categoryFallback++;
     } else {
       stats.categoryMapped++;
+    }
+
+    if (categoryResult.categories.length === 0) {
+      recordWarnings.push(
+        'Category not auto-resolved from Google type — will be set by Fix taxonomy after publish',
+      );
     }
 
     let emails: string[] | undefined;

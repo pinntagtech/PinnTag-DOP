@@ -278,11 +278,9 @@ export function ScraperImportModal({
   const [name, setName] = useState(defaultName());
   const [env, setEnv] = useState<Environment>(environment);
   const [defaultIndustry, setDefaultIndustry] = useState<string>('');
-  const [defaultCategory, setDefaultCategory] = useState<string>('');
   const [defaultCity, setDefaultCity] = useState<string>('');
   const [defaultState, setDefaultState] = useState<string>('');
   const [industryError, setIndustryError] = useState('');
-  const [categoryError, setCategoryError] = useState('');
   const { data: locations } = useLocations();
   const [scraperFile, setScraperFile] = useState<File | null>(null);
   const [emailFile, setEmailFile] = useState<File | null>(null);
@@ -312,13 +310,8 @@ export function ScraperImportModal({
       return;
     }
     setIndustryError('');
-    setCategoryError('');
     if (!defaultIndustry) {
       setIndustryError('Please select an industry');
-      return;
-    }
-    if (!defaultCategory) {
-      setCategoryError('Please select a category');
       return;
     }
     setError('');
@@ -330,7 +323,6 @@ export function ScraperImportModal({
         environment: env,
         actor: 'Operator',
         defaultIndustry,
-        defaultCategories: [defaultCategory],
         ...(defaultCity ? { defaultCity } : {}),
         ...(defaultState ? { defaultState } : {}),
       });
@@ -503,7 +495,6 @@ export function ScraperImportModal({
               value={defaultIndustry}
               onChange={(e) => {
                 setDefaultIndustry(e.target.value);
-                setDefaultCategory('');
                 setIndustryError('');
               }}
               style={{
@@ -542,66 +533,17 @@ export function ScraperImportModal({
                 {industryError}
               </p>
             )}
-          </div>
-
-          {/* Category */}
-          <div>
-            <label
+            <p
               style={{
-                display: 'block',
-                fontSize: '12px',
-                color: 'var(--text-secondary)',
-                marginBottom: '6px',
+                fontSize: '11px',
+                color: 'var(--text-muted)',
+                marginTop: '6px',
+                lineHeight: 1.5,
               }}
             >
-              Category *
-            </label>
-            <select
-              value={defaultCategory}
-              onChange={(e) => {
-                setDefaultCategory(e.target.value);
-                setCategoryError('');
-              }}
-              disabled={!defaultIndustry}
-              style={{
-                width: '100%',
-                height: '36px',
-                paddingLeft: '10px',
-                paddingRight: '28px',
-                border: `1px solid ${
-                  categoryError ? '#DC2626' : 'var(--border)'
-                }`,
-                borderRadius: '8px',
-                fontSize: '13px',
-                color: 'var(--text)',
-                backgroundColor: 'var(--surface)',
-                outline: 'none',
-                cursor: defaultIndustry ? 'pointer' : 'not-allowed',
-                opacity: defaultIndustry ? 1 : 0.6,
-              }}
-            >
-              <option value="" disabled>
-                {defaultIndustry
-                  ? 'Select a category'
-                  : 'Select an industry first'}
-              </option>
-              {(INDUSTRY_CATEGORIES[defaultIndustry] ?? []).map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-            {categoryError && (
-              <p
-                style={{
-                  fontSize: '12px',
-                  color: '#DC2626',
-                  marginTop: '4px',
-                }}
-              >
-                {categoryError}
-              </p>
-            )}
+              Category is auto-detected per business from Google data;
+              unresolved ones are set later by Fix taxonomy.
+            </p>
           </div>
 
           {/* City (optional) */}
