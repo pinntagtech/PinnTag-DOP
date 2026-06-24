@@ -46,6 +46,49 @@ except ImportError:
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 
+# ── Face/portrait detector — DORMANT (ENABLE_FACE_FILTER=False) ──
+# To enable later:
+#   1. add `opencv-python-headless` + `numpy` to requirements.txt
+#   2. uncomment the two imports and the two cascade loads below
+#   3. set ENABLE_FACE_FILTER = True
+#
+# import numpy as np
+# import cv2
+# _FACE_FRONTAL = cv2.CascadeClassifier(
+#     cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# _FACE_PROFILE = cv2.CascadeClassifier(
+#     cv2.data.haarcascades + "haarcascade_profileface.xml")
+FACE_AREA_THRESHOLD = 0.12   # face box ≥ 12% of image area → portrait → drop
+
+
+def _is_portrait(image_bytes: bytes) -> bool:
+    """True if the image is dominated by a face (selfie/headshot/avatar).
+    No-op while ENABLE_FACE_FILTER is False / opencv not imported."""
+    if not ENABLE_FACE_FILTER:
+        return False
+    try:
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return False
+        h, w = img.shape[:2]
+        if h == 0 or w == 0:
+            return False
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        area = float(h * w)
+        for cascade in (_FACE_FRONTAL, _FACE_PROFILE):
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1,
+                                             minNeighbors=5, minSize=(40, 40))
+            for (_, _, fw, fh) in faces:
+                if (fw * fh) / area >= FACE_AREA_THRESHOLD:
+                    return True
+            if len(faces) and 0.8 <= (w / h) <= 1.25 and max(h, w) <= 600:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════
 #  ANSI helpers
 # ═══════════════════════════════════════════════════════════════
@@ -750,21 +793,18 @@ async def scrape_menu(page: Page, state: WorkerState, dashboard: Dashboard) -> l
 # ── gallery helpers ───────────────────────────────────────────
 GALLERY_SCROLL_ROUNDS = 12
 
-# WHITELIST — only these folder categories are scraped. Anything not in this
-# set (All, From visitors, highlights, People, Latest, etc.) is skipped, so
-# visitor selfies / reviewer faces never get collected.
-ALLOWED_CATS = {
-    "by owner", "exterior", "interior", "vibe",
-    "food & drink", "food and drink", "food", "drink",
-    "menu", "at this place", "products",
-    "street view & 360°", "street view", "360°", "videos",
-}
+# Pseudo-folders handled by the catch-all pass — don't iterate as named folders.
+SKIP_CATS = {"all", "latest", ""}
 
-# Cover-priority order (mirrors webhook auto-cover priority). Folders not
-# listed sort last but are still scraped if in ALLOWED_CATS.
 PRIORITY = ["by owner", "food & drink", "vibe", "menu",
             "exterior", "interior", "products", "videos",
             "street view & 360°", "street view"]
+
+# Face/portrait filtering is DISABLED for now (selfies allowed through).
+# Flip to True later to drop selfie/headshot/avatar photos. When enabled,
+# also uncomment the opencv import + cascades below and add
+# opencv-python-headless to requirements.txt.
+ENABLE_FACE_FILTER = False
 
 # Bulk URL extractor — returns {id, url, type}. id = stable photo id
 # so the SAME photo at any size counts once (kills cross-folder repeats).
@@ -952,7 +992,7 @@ async def _harvest(page, folder, global_ids: set, max_items: int, label: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  GALLERY scraper — whitelist business folders, global dedup, NO catch-all
+#  GALLERY scraper — named folders + catch-all All, shared global dedup
 # ═══════════════════════════════════════════════════════════════
 async def scrape_gallery(page, state, dashboard,
                          max_per_folder: int = 200,
@@ -966,24 +1006,13 @@ async def scrape_gallery(page, state, dashboard,
     await page.wait_for_timeout(1200)
 
     detected = await _detect_categories(page)
-    # WHITELIST: keep only known business-content folders. Everything else
-    # (All, From visitors, highlights, People, Latest, unknown) is skipped.
-    cats = [c for c in detected if c.strip().lower() in ALLOWED_CATS]
-    skipped = [c for c in detected if c.strip().lower() not in ALLOWED_CATS]
+    cats = [c for c in detected if c.strip().lower() not in SKIP_CATS]
     cats = sorted(set(cats),
                   key=lambda c: PRIORITY.index(c.lower())
                   if c.lower() in PRIORITY else len(PRIORITY))
-    scraper_logger.info(
-        f"[GALLERY] Allowed folders: {cats or '(none)'} | "
-        f"Skipped: {skipped or '(none)'}")
+    scraper_logger.info(f"[GALLERY] Folders: {cats or '(none — flat/All only)'}")
 
-    if not cats:
-        scraper_logger.warning(
-            "[GALLERY] No whitelisted business folders — skipping "
-            "(business likely has only an 'All' folder; refusing to scrape "
-            "it to avoid visitor faces/avatars)")
-        return []
-
+    # named-folder pass (keeps folder names for cover-priority)
     for idx, label in enumerate(cats):
         if progress_callback:
             await progress_callback("gallery", "folder_started", 0, 0,
@@ -999,7 +1028,15 @@ async def scrape_gallery(page, state, dashboard,
                                     sum(len(f.media) for f in folders),
                                     f"{label}: {len(folder.media)}", label)
 
-    # NO catch-all "All" pass — it was the source of duplicates + visitor faces.
+    # catch-all "All" pass — picks up everything not already captured,
+    # incl. businesses that only have an "All" folder. Shared global_ids
+    # guarantees no duplicates vs. the named folders above.
+    await _click_label(page, "All")
+    await page.wait_for_timeout(800)
+    leftover = GalleryFolder(folder_name="Photos")
+    await _harvest(page, leftover, global_ids, max_per_folder, "Photos (All)")
+    if leftover.media:
+        folders.append(leftover)
 
     total = sum(len(f.media) for f in folders)
     scraper_logger.info(

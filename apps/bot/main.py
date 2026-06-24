@@ -688,6 +688,44 @@ async def run_scrape(req: ScrapeRequest):
                             if f.get("folder_name", "").lower().strip()
                             not in SKIP_FOLDERS
                         ]
+                        # ── portrait/selfie filter (gated; no-op while disabled) ──
+                        from scraper_bulk import ENABLE_FACE_FILTER, _is_portrait
+                        if ENABLE_FACE_FILTER:
+                            import httpx as _httpx
+                            sem = asyncio.Semaphore(8)
+                            loop = asyncio.get_event_loop()
+
+                            async def _keep(item) -> bool:
+                                if item.get("type") == "video":
+                                    return True
+                                url = item.get("url", "")
+                                if not url:
+                                    return True
+                                thumb = url.replace("=s0", "=s400") if "=s0" in url \
+                                        else url + "=s400"
+                                async with sem:
+                                    try:
+                                        async with _httpx.AsyncClient(timeout=8) as cx:
+                                            r = await cx.get(thumb)
+                                            if r.status_code != 200 or not r.content:
+                                                return True
+                                            is_face = await loop.run_in_executor(
+                                                None, _is_portrait, r.content)
+                                            return not is_face
+                                    except Exception:
+                                        return True
+
+                            dropped = 0
+                            for fobj in result["gallery"]:
+                                media = fobj.get("media", [])
+                                flags = await asyncio.gather(*[_keep(m) for m in media])
+                                kept = [m for m, k in zip(media, flags) if k]
+                                dropped += len(media) - len(kept)
+                                fobj["media"] = kept
+                            result["gallery"] = [
+                                f for f in result["gallery"] if f.get("media")
+                            ]
+                            logger.info(f"[GALLERY] Portrait filter dropped {dropped} face images")
                         logger.info(
                             f'Gallery filtered: {len(result["gallery"])} folders kept — '
                             f'{[f.get("folder_name") for f in result["gallery"]]}'
