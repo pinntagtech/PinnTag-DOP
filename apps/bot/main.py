@@ -164,6 +164,7 @@ async def lifespan(app: FastAPI):
     logger.info(f'Max reviews: {MAX_REVIEWS}')
     logger.info(f'Max gallery per folder: {MAX_GALLERY}')
     logger.info(f'Headless mode: {HEADLESS}')
+    logger.info(f"Chrome path: {CHROME_PATH or 'bundled Chromium'}")
     logger.info(f'Log level: {LOG_LEVEL}')
 
     # Self-update runs BEFORE we kick off the poll loops. If it finds a
@@ -215,6 +216,30 @@ MAX_GALLERY = int(os.getenv("MAX_GALLERY_PER_FOLDER", "50"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "")
 CHROME_PROFILE = os.getenv("CHROME_PROFILE", "Default")
+
+
+# System Chrome executable path. Required on Ubuntu 26.04 where Playwright's
+# bundled Chromium won't install — point at the OS Google Chrome instead.
+# Empty / unset → Playwright uses its own bundled Chromium (Mac, older Ubuntu).
+def _resolve_chrome_path() -> str | None:
+    # 1. Explicit override always wins
+    env = os.getenv("CHROME_PATH", "").strip()
+    if env:
+        return env
+    # 2. Common system Chrome locations
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None  # fall back to Playwright bundled Chromium
+
+
+CHROME_PATH = _resolve_chrome_path()
 
 SKIP_FOLDERS = {
     'all',
@@ -551,6 +576,7 @@ async def run_scrape(req: ScrapeRequest):
         if not req.skipGallery or not req.skipMenu:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
+                    executable_path=CHROME_PATH if CHROME_PATH else None,
                     headless=True,
                     args=[
                         "--no-sandbox",
@@ -806,6 +832,7 @@ async def run_reviews_scrape(req: ScrapeRequest):
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
+                executable_path=CHROME_PATH if CHROME_PATH else None,
                 headless=False,
                 args=[
                     "--no-sandbox",
@@ -958,6 +985,7 @@ async def run_cover_sync(req: ScrapeRequest):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
+            executable_path=CHROME_PATH if CHROME_PATH else None,
             headless=True,
             args=[
                 '--no-sandbox',
@@ -1075,6 +1103,7 @@ async def run_image_sync(req: ScrapeRequest):
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
+                executable_path=CHROME_PATH if CHROME_PATH else None,
                 headless=False,
                 args=[
                     '--no-sandbox',
@@ -2211,6 +2240,7 @@ async def run_resolve_business(req: ScrapeRequest):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
+            executable_path=CHROME_PATH if CHROME_PATH else None,
             headless=True,
             args=[
                 '--no-sandbox',
@@ -2469,6 +2499,7 @@ async def resolve_pool_loop():
             if browser is None:
                 try:
                     browser = await pw.chromium.launch(
+                        executable_path=CHROME_PATH if CHROME_PATH else None,
                         headless=HEADLESS,
                         args=[
                             '--no-sandbox',

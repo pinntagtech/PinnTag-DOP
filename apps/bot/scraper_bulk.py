@@ -747,401 +747,264 @@ async def scrape_menu(page: Page, state: WorkerState, dashboard: Dashboard) -> l
     return items
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ③ GALLERY scraper  (folder-aware, NO lightbox clicking)
-# ═══════════════════════════════════════════════════════════════
+# ── gallery helpers ───────────────────────────────────────────
+GALLERY_SCROLL_ROUNDS = 12
 
-async def scrape_gallery(
-    page: Page,
-    state: WorkerState,
-    dashboard: Dashboard,
-    max_per_folder: int = 200,
-    progress_callback=None,
-) -> list:
-    """
-    Opens the Photos tab, iterates every folder tab, scrolls each,
-    and collects full-size image + video URLs — folder name preserved.
+# WHITELIST — only these folder categories are scraped. Anything not in this
+# set (All, From visitors, highlights, People, Latest, etc.) is skipped, so
+# visitor selfies / reviewer faces never get collected.
+ALLOWED_CATS = {
+    "by owner", "exterior", "interior", "vibe",
+    "food & drink", "food and drink", "food", "drink",
+    "menu", "at this place", "products",
+    "street view & 360°", "street view", "360°", "videos",
+}
 
-    Speed approach:
-      • Extract ALL photo URLs via JS evaluate (reads img src / background-image in bulk)
-      • NO lightbox clicking — that was the 14-minute killer
-      • Scroll to load more, then bulk-extract again
-    """
-    folders: list[GalleryFolder] = []
+# Cover-priority order (mirrors webhook auto-cover priority). Folders not
+# listed sort last but are still scraped if in ALLOWED_CATS.
+PRIORITY = ["by owner", "food & drink", "vibe", "menu",
+            "exterior", "interior", "products", "videos",
+            "street view & 360°", "street view"]
 
-    # ── Click the Photos tab ──────────────────────────────────
-    clicked = False
-    for sel in [
-        'button[aria-label*="Photo"]',
-        'button[aria-label*="photo"]',
-        'button[jsaction*="photosTab"]',
-        'button[data-tab-index="2"]',
-        'button[aria-label*="See photos"]',
-    ]:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=2500):
-                await btn.click()
-                await page.wait_for_timeout(1800)
-                clicked = True
-                break
-        except Exception:
-            pass
+# Bulk URL extractor — returns {id, url, type}. id = stable photo id
+# so the SAME photo at any size counts once (kills cross-folder repeats).
+EXTRACT_JS = r"""() => {
+  const items = [], seen = new Set();
+  const PLACE = (s) => (
+    s.includes('/geo/') || s.includes('p/AF') || s.includes('geougc') ||
+    s.includes('gps-cs') || s.includes('streetviewpixels') || s.includes('/p/')
+  );
+  const skipAvatar = (s) =>
+    /=s(16|24|32|40|48|50|60|64|72|96)\b/.test(s) ||  // small square = avatar
+    s.includes('/a/ACg') ||                            // contributor profile
+    s.includes('/a-/') ||                              // contributor profile
+    /\/a\//.test(s) ||                                 // any /a/ avatar path
+    /=s\d+-c\b/.test(s);                               // circle-cropped = avatar
+  const photoId = (u) => {
+    // Prefer the stable long token (same image → same token across folders,
+    // regardless of /p/ vs geougc-cs/ vs gps-cs path prefix).
+    const tokens = (u.match(/[A-Za-z0-9_\-]{25,}/g) || []);
+    if (tokens.length) {
+      // longest token is the photo id; trims CDN/host noise
+      return 'id:' + tokens.sort((a, b) => b.length - a.length)[0];
+    }
+    // Street View panoramas
+    let m = u.match(/[?&]panoid=([A-Za-z0-9_\-]+)/);
+    if (m) return 'sv:' + m[1];
+    return u.replace(/=[^/]*$/, '');
+  };
+  const full = (u) => u.replace(/=w\d+-h\d+[^/]*$/, '=s0').replace(/=s\d+[^/]*$/, '=s0');
+  const add = (src, type) => {
+    if (!src) return;
+    if (!src.includes('googleusercontent') && !src.includes('streetviewpixels')
+        && type === 'image') return;
+    if (type === 'image' && (!PLACE(src) || skipAvatar(src))) return;
+    const id = type === 'video' ? 'v:' + src : photoId(src);
+    if (seen.has(id)) return; seen.add(id);
+    items.push({ id, url: type === 'video' ? src : full(src), type });
+  };
+  const root =
+    document.querySelector('div[role="dialog"]') ||
+    document.querySelector('div[role="main"]') || document.body;
 
-    if not clicked:
-        # Fallback: look for any "See all photos" link
-        try:
-            btn = page.locator('a[href*="/photos"], button[aria-label*="all photo"]').first
-            if await btn.is_visible(timeout=1500):
-                await btn.click()
-                await page.wait_for_timeout(1800)
-                clicked = True
-        except Exception:
-            pass
+  root.querySelectorAll('[style*="background-image"]').forEach(el => {
+    const m = (el.style.backgroundImage || '').match(/url\("?([^"')]+)"?\)/);
+    if (m) add(m[1], 'image');
+  });
+  root.querySelectorAll('img[src*="googleusercontent"], img[src*="streetviewpixels"]')
+      .forEach(img => add(img.getAttribute('src') || '', 'image'));
+  root.querySelectorAll('video, video source')
+      .forEach(el => { const s = el.getAttribute('src') || ''; if (s.startsWith('http')) add(s, 'video'); });
+  root.querySelectorAll('a[href*="youtube.com/watch"], a[href*="youtu.be/"]')
+      .forEach(a => { const h = a.getAttribute('href') || ''; if (h.startsWith('http')) add(h, 'video'); });
+  return items;
+}"""
 
-    if not clicked:
-        scraper_logger.warning("[GALLERY] Photos tab not found — skipping gallery")
+
+async def _tiles(page) -> list:
+    try:
+        return await page.evaluate(EXTRACT_JS) or []
+    except Exception:
         return []
 
-    scraper_logger.info("[GALLERY] Photos tab clicked ✓")
 
-    # Wait for the actual photo grid to render before extracting
-    await page.wait_for_timeout(2500)
+async def _scroll_photos(page):
+    """Find the real scroll container dynamically and scroll it to the bottom."""
     try:
-        await page.wait_for_selector(
-            'button[style*="background-image"], '
-            'div[style*="background-image"][role="img"]',
-            timeout=8000,
-        )
-    except Exception:
-        pass  # continue anyway
-
-    # ── Collect folder tab buttons ────────────────────────────
-    # Use JS to read all tab labels at once — no fragile per-selector loops
-    try:
-        folder_info = await page.evaluate("""() => {
-            // Google renders folder tabs as role=tab or as chip buttons
-            const candidates = [
-                ...document.querySelectorAll('[role="tab"]'),
-                ...document.querySelectorAll('button[class*="hH0dDd"]'),
-                ...document.querySelectorAll('div[class*="e2moi"] button'),
-                ...document.querySelectorAll('div[class*="Gpq6kf"] button'),
-            ];
-            const seen = new Set();
-            return candidates
-                .map(el => ({
-                    label: (el.innerText || el.getAttribute('aria-label') || '').trim(),
-                    index: candidates.indexOf(el)
-                }))
-                .filter(f => {
-                    if (!f.label || seen.has(f.label)) return false;
-                    seen.add(f.label);
-                    return true;
-                });
+        await page.evaluate("""() => {
+            const root = document.querySelector('div[role="dialog"]') || document;
+            let best = null, h = 0;
+            root.querySelectorAll('div').forEach(d => {
+                if (d.scrollHeight > d.clientHeight + 50 && d.clientHeight > 200
+                    && d.scrollHeight > h) { h = d.scrollHeight; best = d; }
+            });
+            const el = best || document.scrollingElement;
+            el.scrollTop = el.scrollHeight;
         }""")
     except Exception:
-        folder_info = []
+        try:
+            await page.keyboard.press("End")
+        except Exception:
+            pass
 
-    # If no folder tabs found, scrape as a single "All" folder
-    if not folder_info:
-        folder_info = [{"label": "All", "index": -1}]
 
-    SKIP_FOLDERS_SCRAPER = {
-        'all',
-        'latest',
-    }
-    folder_info = [
-        f for f in folder_info
-        if f.get('label', '').lower() not in SKIP_FOLDERS_SCRAPER
+async def _open_photos(page) -> bool:
+    """Open the photo experience via whatever trigger works; verify by tile count."""
+    before = len(await _tiles(page))
+    triggers = [
+        'button[jsaction*="heroHeaderImage"]',
+        'button[aria-label^="Photo"]',
+        'button[aria-label*="Photo of"]',
+        'button[aria-label="Exterior"]', 'button[aria-label="Interior"]',
+        'button[aria-label="By owner"]', 'button[aria-label="Vibe"]',
+        'button[aria-label="Menu"]',     'button[aria-label="Food & drink"]',
+        'button[aria-label="Videos"]',   'button[aria-label="All"]',
+        'button[aria-label*="Photo"]', 'a[href*="/photos"]',
+        'button[aria-label*="See all"]', 'button[aria-label*="all photo"]',
     ]
-
-    scraper_logger.info(
-        f"[GALLERY] Found {len(folder_info)} folder tabs: "
-        f"{[f['label'] for f in folder_info]}"
-    )
-
-    # ── JS extractor: bulk-read all photo URLs from the grid ──
-    EXTRACT_JS = r"""() => {
-        const urls = new Set();
-        const items = [];
-
-        // ONLY look inside the photos panel container
-        // Google Maps renders the photo grid inside a
-        // specific scrollable div — target that only
-        const photoPanel = (
-            document.querySelector('div[role="main"]') ||
-            document.querySelector('div.m6QErb') ||
-            document.body
-        );
-
-        // Skip these — they are sidebar/nav elements
-        const skipSelectors = [
-            'div.m6QErb.aIFcqe',  // search results
-            'div[data-index]',      // nearby results
-            'div.Nv2PK',            // place cards
-            'div.hfpxzc',           // map markers
-            'a[href*="maps/place"]', // place links
-        ];
-
-        // Get all skip zones
-        const skipZones = [];
-        skipSelectors.forEach(sel => {
-            document.querySelectorAll(sel).forEach(el => {
-                skipZones.push(el);
-            });
-        });
-
-        function isInSkipZone(el) {
-            return skipZones.some(zone => zone.contains(el));
-        }
-
-        // Pattern A: background-image style on photo buttons
-        // These are the actual grid photo tiles
-        photoPanel.querySelectorAll(
-            'button[style*="background-image"], ' +
-            'div[style*="background-image"][role="img"], ' +
-            'div[style*="background-image"][jsaction]'
-        ).forEach(el => {
-            if (isInSkipZone(el)) return;
-            const m = el.style.backgroundImage.match(
-                /url\("?([^"')]+)"?\)/
-            );
-            if (m && m[1].includes('googleusercontent')) {
-                const url = m[1]
-                    .replace(/=w\d+-h\d+.*$/, '=s0')
-                    .replace(/=s\d+$/, '=s0');
-                // Must be a geo/photo URL not a profile pic
-                if (url.includes('/geo/') ||
-                    url.includes('p/AF') ||
-                    url.includes('geougc') ||
-                    url.includes('gps-cs')) {
-                    if (!urls.has(url)) {
-                        urls.add(url);
-                        items.push({
-                            type: 'image',
-                            url,
-                            thumbnail_url: url,
-                        });
-                    }
-                }
-            }
-        });
-
-        // Pattern B: img tags inside the photo grid only
-        // Must be inside a button or photo container
-        photoPanel.querySelectorAll(
-            'button img[src*="googleusercontent"], ' +
-            'div[jsaction] img[src*="googleusercontent"]'
-        ).forEach(img => {
-            if (isInSkipZone(img)) return;
-            const src = img.getAttribute('src') || '';
-            if (!src) return;
-
-            // Skip profile pictures (small avatars)
-            if (src.includes('=s32') || src.includes('=s40') ||
-                src.includes('=s50') || src.includes('=s60') ||
-                src.includes('a-/') || src.includes('/a/')) return;
-
-            // Must look like a place photo
-            if (!src.includes('/geo/') &&
-                !src.includes('p/AF') &&
-                !src.includes('geougc') &&
-                !src.includes('gps-cs')) return;
-
-            const url = src
-                .replace(/=w\d+-h\d+.*$/, '=s0')
-                .replace(/=s\d+$/, '=s0');
-
-            if (!urls.has(url)) {
-                urls.add(url);
-                const parent = img.closest(
-                    '[aria-label], [data-video-id]'
-                );
-                const isVideo = parent && (
-                    (parent.getAttribute('aria-label') || '')
-                        .toLowerCase().includes('video') ||
-                    parent.hasAttribute('data-video-id')
-                );
-                items.push({
-                    type: isVideo ? 'video' : 'image',
-                    url,
-                    thumbnail_url: url,
-                });
-            }
-        });
-
-        return items;
-    }"""
-
-    # ── Scrape each folder ────────────────────────────────────
-    folder_idx = 0
-    total_images_so_far = 0
-    for fi in folder_info:
-        if fi.get("label", "").lower().strip() in {
-            'all', 'latest',
-        }:
-            scraper_logger.info(
-                f"[GALLERY] Skipping folder: "
-                f"'{fi.get('label')}' (filtered)"
-            )
+    for sel in triggers:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1000):
+                await btn.click(timeout=2000)
+                await page.wait_for_timeout(1800)
+                now = len(await _tiles(page))
+                if now >= 3 and now >= before:
+                    scraper_logger.info(f"[GALLERY] Opened via '{sel}' — {now} tiles")
+                    return True
+        except Exception:
             continue
+    now = len(await _tiles(page))
+    if now >= 3:
+        scraper_logger.info(f"[GALLERY] Tiles already present — {now}")
+        return True
+    return False
 
-        folder_name = fi["label"]
-        state.current_section = folder_name
-        await dashboard.update(state)
 
-        scraper_logger.info(
-            f"[GALLERY] Processing folder: '{folder_name}' "
-            f"(folder {folder_info.index(fi)+1}/{len(folder_info)})"
-        )
+async def _detect_categories(page) -> list:
+    try:
+        cats = await page.evaluate(r"""() => {
+            const out = [], seen = new Set();
+            const KNOWN = ['exterior','interior','by owner','street view',
+              'street view & 360°','videos','menu','food & drink','vibe',
+              'from visitors','people','rooms','front','others','additional'];
+            const push = (t) => {
+                t = (t||'').trim(); if (!t || t.length > 30) return;
+                const k = t.toLowerCase(); if (seen.has(k)) return; seen.add(k);
+                out.push(t);
+            };
+            document.querySelectorAll('[role="tab"]').forEach(el =>
+                push(el.innerText || el.getAttribute('aria-label')));
+            document.querySelectorAll('button[aria-label]').forEach(el => {
+                const l = (el.getAttribute('aria-label')||'').trim();
+                if (KNOWN.includes(l.toLowerCase())) push(l);
+            });
+            return out;
+        }""")
+    except Exception:
+        cats = []
+    return cats or []
 
-        if progress_callback:
-            await progress_callback(
-                "gallery", "folder_started",
-                0, 0,
-                f"Scraping folder: {folder_name}",
-                folder_name,
-            )
 
-        # Click this folder tab by re-querying (refs go stale after navigation)
-        if fi["index"] >= 0:
-            try:
-                tabs = await page.locator(
-                    '[role="tab"], button[class*="hH0dDd"], div[class*="e2moi"] button'
-                ).all()
-                matching = [t for t in tabs if (await t.inner_text(timeout=300)).strip() == folder_name]
-                if matching:
-                    await matching[0].click()
+async def _click_label(page, label) -> bool:
+    for sel in ['[role="tab"]', 'button[aria-label]']:
+        try:
+            for el in await page.locator(sel).all():
+                txt = ((await el.get_attribute("aria-label")) or "").strip()
+                if not txt:
+                    try: txt = (await el.inner_text(timeout=300)).strip()
+                    except Exception: txt = ""
+                if txt.lower() == label.lower():
+                    await el.click(timeout=2000)
                     await page.wait_for_timeout(1200)
-            except Exception:
-                pass
+                    return True
+        except Exception:
+            continue
+    return False
 
-        folder   = GalleryFolder(folder_name=folder_name)
-        seen_urls: set = set()
 
-        # Scroll + bulk-extract loop
-        stale      = 0
-        last_count = 0
-        SCROLL_ROUNDS = 15  # max scroll attempts per folder
-
-        for scroll_i in range(SCROLL_ROUNDS):
-            # Bulk extract all currently-visible photos via JS
-            try:
-                raw_media = await page.evaluate(EXTRACT_JS)
-            except Exception:
-                raw_media = []
-
-            for item in (raw_media or []):
-                url = item.get("url", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    folder.media.append({
-                        "type":          item.get("type", "image"),
-                        "url":           url,
-                        "thumbnail_url": url,
-                        "caption":       None,
-                        "contributor":   None,
-                    })
-
-            # Also pick up any <video> / video source elements in the folder.
-            # Google Maps renders videos as <video><source src="..."> in the
-            # photo grid and as <a href="..."> for off-site links (YouTube).
-            try:
-                raw_videos = await page.evaluate(r"""() => {
-                    const out = [];
-                    const seen = new Set();
-                    const addUrl = (src) => {
-                        if (!src || seen.has(src)) return;
-                        seen.add(src);
-                        out.push({
-                            url: src,
-                            thumbnail_url: '',
-                            type: 'video',
-                        });
-                    };
-                    document.querySelectorAll(
-                        'video source, video'
-                    ).forEach(el => {
-                        const src = el.getAttribute('src');
-                        if (src && src.startsWith('http')) addUrl(src);
-                    });
-                    document.querySelectorAll(
-                        'a[href*="youtube.com/watch"], ' +
-                        'a[href*="youtu.be/"]'
-                    ).forEach(el => {
-                        const href = el.getAttribute('href') || '';
-                        if (href.startsWith('http')) addUrl(href);
-                    });
-                    return out;
-                }""")
-            except Exception:
-                raw_videos = []
-
-            for v in (raw_videos or []):
-                vurl = v.get("url", "")
-                if vurl and vurl not in seen_urls:
-                    seen_urls.add(vurl)
-                    folder.media.append({
-                        "type":          "video",
-                        "url":           vurl,
-                        "thumbnail_url": v.get("thumbnail_url") or "",
-                        "caption":       None,
-                        "contributor":   None,
-                    })
-
-            scraper_logger.debug(
-                f"[GALLERY] '{folder_name}' scroll round {scroll_i+1} — "
-                f"{len(folder.media)} images so far"
-            )
-
-            if len(folder.media) >= max_per_folder:
+async def _harvest(page, folder, global_ids: set, max_items: int, label: str):
+    stale = 0
+    for _ in range(GALLERY_SCROLL_ROUNDS):
+        added = 0
+        for it in await _tiles(page):
+            pid = it.get("id")
+            if not pid or pid in global_ids:
+                continue
+            global_ids.add(pid)
+            folder.media.append({
+                "type": it.get("type", "image"),
+                "url": it.get("url", ""),
+                "thumbnail_url": it.get("url", ""),
+                "caption": None, "contributor": None,
+            })
+            added += 1
+            if len(folder.media) >= max_items:
                 break
+        if len(folder.media) >= max_items:
+            break
+        stale = stale + 1 if added == 0 else 0
+        if stale >= 3:
+            break
+        await _scroll_photos(page)
+        await page.wait_for_timeout(700)
+    scraper_logger.info(f"[GALLERY] '{label}': {len(folder.media)} media")
 
-            if len(folder.media) == last_count:
-                stale += 1
-                scraper_logger.warning(
-                    f"[GALLERY] '{folder_name}' stale — "
-                    f"no new images found, moving to next folder"
-                )
-                if stale >= 4:
-                    break
-            else:
-                stale = 0
-                last_count = len(folder.media)
-                scraper_logger.info(
-                    f"[GALLERY] '{folder_name}' — "
-                    f"{len(folder.media)} images collected"
-                )
 
-            # Scroll the photo grid
-            try:
-                grid = page.locator('div.m6QErb').last
-                await grid.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-                await page.wait_for_timeout(900)
-            except Exception:
-                try:
-                    await page.keyboard.press("End")
-                    await page.wait_for_timeout(900)
-                except Exception:
-                    break
+# ═══════════════════════════════════════════════════════════════
+#  GALLERY scraper — whitelist business folders, global dedup, NO catch-all
+# ═══════════════════════════════════════════════════════════════
+async def scrape_gallery(page, state, dashboard,
+                         max_per_folder: int = 200,
+                         progress_callback=None) -> list:
+    folders: list = []
+    global_ids: set = set()        # shared → no repeats across any folder
 
+    if not await _open_photos(page):
+        scraper_logger.warning("[GALLERY] No photos could be opened — skipping")
+        return []
+    await page.wait_for_timeout(1200)
+
+    detected = await _detect_categories(page)
+    # WHITELIST: keep only known business-content folders. Everything else
+    # (All, From visitors, highlights, People, Latest, unknown) is skipped.
+    cats = [c for c in detected if c.strip().lower() in ALLOWED_CATS]
+    skipped = [c for c in detected if c.strip().lower() not in ALLOWED_CATS]
+    cats = sorted(set(cats),
+                  key=lambda c: PRIORITY.index(c.lower())
+                  if c.lower() in PRIORITY else len(PRIORITY))
+    scraper_logger.info(
+        f"[GALLERY] Allowed folders: {cats or '(none)'} | "
+        f"Skipped: {skipped or '(none)'}")
+
+    if not cats:
+        scraper_logger.warning(
+            "[GALLERY] No whitelisted business folders — skipping "
+            "(business likely has only an 'All' folder; refusing to scrape "
+            "it to avoid visitor faces/avatars)")
+        return []
+
+    for idx, label in enumerate(cats):
+        if progress_callback:
+            await progress_callback("gallery", "folder_started", 0, 0,
+                                    f"Scraping {label}", label)
+        if not await _click_label(page, label):
+            continue
+        folder = GalleryFolder(folder_name=label)
+        await _harvest(page, folder, global_ids, max_per_folder, label)
         if folder.media:
             folders.append(folder)
-        scraper_logger.info(
-            f"[GALLERY] Folder '{folder_name}' done: "
-            f"{len(folder.media)} images ✓"
-        )
-
-        total_images_so_far += len(folder.media)
         if progress_callback:
-            await progress_callback(
-                "gallery", "folder_done",
-                folder_idx + 1, total_images_so_far,
-                f"{folder_name}: {len(folder.media)} images",
-                folder_name,
-            )
-        folder_idx += 1
+            await progress_callback("gallery", "folder_done", idx + 1,
+                                    sum(len(f.media) for f in folders),
+                                    f"{label}: {len(folder.media)}", label)
 
+    # NO catch-all "All" pass — it was the source of duplicates + visitor faces.
+
+    total = sum(len(f.media) for f in folders)
+    scraper_logger.info(
+        f"[GALLERY] DONE — {total} unique media / {len(folders)} folders: "
+        f"{[(f.folder_name, len(f.media)) for f in folders]}")
     return [asdict(f) for f in folders]
 
 

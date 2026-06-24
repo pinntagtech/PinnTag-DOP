@@ -1,41 +1,53 @@
+import argparse
 import asyncio
 import json
 import os
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_COOKIES_PATH = os.getenv(
-    'GOOGLE_COOKIES_PATH', './google_cookies.json'
+GOOGLE_COOKIES_PATH = os.getenv('GOOGLE_COOKIES_PATH', './google_cookies.json')
+COOKIE_MAX_AGE_DAYS = 25
+PROFILE_DIR = os.getenv(
+    'CHROME_PROFILE_DIR',
+    str(Path.home() / '.pinntag-dop-bot-chrome-profile'),
 )
-COOKIE_MAX_AGE_DAYS = 25  # refresh before 30-day expiry
+AUTH_COOKIES = {'SID', 'HSID', 'SSID', 'APISID', 'SAPISID',
+                '__Secure-1PSID', '__Secure-3PSID'}
+
+
+def resolve_chrome_path():
+    env = os.getenv('CHROME_PATH', '').strip()
+    if env:
+        return env
+    for path in [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/opt/google/chrome/chrome',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ]:
+        if os.path.exists(path):
+            return path
+    return None
 
 
 def cookies_are_valid() -> bool:
-    """Check if cookies exist and are fresh enough."""
     path = Path(GOOGLE_COOKIES_PATH)
     if not path.exists():
         return False
-
-    # Check file age
-    mtime = path.stat().st_mtime
-    age_days = (datetime.now().timestamp() - mtime) / 86400
+    age_days = (datetime.now().timestamp() - path.stat().st_mtime) / 86400
     if age_days > COOKIE_MAX_AGE_DAYS:
         print(f"[SETUP] Cookies are {age_days:.0f} days old — refreshing")
         return False
-
-    # Check file has content
     try:
         cookies = json.loads(path.read_text())
         if not isinstance(cookies, list) or len(cookies) < 5:
             return False
-        # Check for key Google auth cookies
         names = {c.get('name') for c in cookies}
-        required = {'SID', 'HSID', 'SSID', 'APISID', 'SAPISID'}
-        if not required.intersection(names):
+        if not AUTH_COOKIES.intersection(names):
             print("[SETUP] Cookies missing Google auth tokens — refreshing")
             return False
         return True
@@ -43,191 +55,121 @@ def cookies_are_valid() -> bool:
         return False
 
 
-async def run_google_login():
-    """Open browser for Google login and save cookies."""
+def _sanitize(raw: list) -> list:
+    same_map = {'no_restriction': 'None', 'unspecified': 'Lax',
+                'strict': 'Strict', 'lax': 'Lax', 'none': 'None'}
+    out = []
+    for c in raw:
+        name = c.get('name', '')
+        value = c.get('value', '')
+        if not name or value is None:
+            continue
+        ck = {
+            'name': name,
+            'value': value,
+            'domain': c.get('domain', '.google.com'),
+            'path': c.get('path', '/'),
+        }
+        if c.get('secure') is not None:
+            ck['secure'] = bool(c['secure'])
+        if c.get('httpOnly') is not None:
+            ck['httpOnly'] = bool(c['httpOnly'])
+        ss = c.get('sameSite')
+        if isinstance(ss, str):
+            norm = same_map.get(ss.strip().lower(), ss if ss in
+                                ('Strict', 'Lax', 'None') else None)
+            if norm in ('Strict', 'Lax', 'None'):
+                ck['sameSite'] = norm
+        exp = c.get('expires') or c.get('expirationDate')
+        if isinstance(exp, (int, float)) and exp > 0:
+            ck['expires'] = int(exp)
+        out.append(ck)
+    return out
+
+
+async def run_manual_capture() -> bool:
     from playwright.async_api import async_playwright
 
-    print("[SETUP] Opening browser for Google login...")
-    print("[SETUP] Please log into your Google account")
+    chrome = resolve_chrome_path()
+    print("=" * 64)
+    print("  PinnTag DOP — Google cookie capture (MANUAL)")
+    print("=" * 64)
+    print(f"  Chrome:  {chrome or 'bundled Chromium (no system Chrome found)'}")
+    print(f"  Profile: {PROFILE_DIR}")
+    print(f"  Output:  {GOOGLE_COOKIES_PATH}")
+    print("-" * 64)
+
+    Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
+        context = await p.chromium.launch_persistent_context(
+            PROFILE_DIR,
+            executable_path=chrome if chrome else None,
             headless=False,
             args=[
                 '--no-sandbox',
                 '--disable-blink-features=AutomationControlled',
                 '--no-first-run',
                 '--no-default-browser-check',
-                '--window-size=1000,700',
+                '--window-size=1100,800',
             ],
-        )
-
-        context = await browser.new_context(
-            viewport={'width': 1000, 'height': 700},
+            viewport={'width': 1100, 'height': 800},
             locale='en-US',
-            user_agent=(
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            ),
         )
-
-        page = await context.new_page()
-
-        # Navigate to Google sign-in
-        await page.goto(
-            'https://accounts.google.com/signin',
-            wait_until='domcontentloaded',
-        )
-
-        # Inject instruction banner into the page
+        page = context.pages[0] if context.pages else await context.new_page()
         try:
-            await page.evaluate("""
-                const banner = document.createElement('div');
-                banner.id = 'dop-banner';
-                banner.style.cssText = [
-                    'position:fixed',
-                    'top:0',
-                    'left:0',
-                    'right:0',
-                    'background:#1a1a2e',
-                    'color:#ffffff',
-                    'padding:12px 20px',
-                    'font-family:-apple-system,sans-serif',
-                    'font-size:14px',
-                    'font-weight:500',
-                    'z-index:999999',
-                    'display:flex',
-                    'align-items:center',
-                    'gap:12px',
-                    'box-shadow:0 2px 8px rgba(0,0,0,0.4)'
-                ].join(';');
-
-                const icon = document.createElement('span');
-                icon.textContent = '🔐';
-                icon.style.fontSize = '20px';
-
-                const text = document.createElement('span');
-                const strong = document.createElement('strong');
-                strong.textContent = 'PinnTag DOP Setup';
-                text.appendChild(strong);
-                text.appendChild(document.createTextNode(
-                    ' — Please sign in to your Google account. ' +
-                    'The window will close automatically once done.'
-                ));
-
-                banner.appendChild(icon);
-                banner.appendChild(text);
-                document.body.prepend(banner);
-            """)
+            await page.goto('https://accounts.google.com',
+                            wait_until='domcontentloaded', timeout=40000)
         except Exception:
-            pass  # Banner is cosmetic — login still works
+            pass
 
-        print("[SETUP] Waiting for Google login...")
-        print("[SETUP] The browser window will close automatically")
+        print()
+        print("  ┌────────────────────────────────────────────────────────┐")
+        print("  │  1. In the Chrome window: sign in to your Google account│")
+        print("  │     (handle any 2FA / 'verify it's you' prompts).      │")
+        print("  │  2. Then open  https://www.google.com/maps  in that    │")
+        print("  │     SAME window and wait for it to fully load.         │")
+        print("  │  3. Come back here and press ENTER to capture cookies. │")
+        print("  └────────────────────────────────────────────────────────┘")
+        print()
 
-        # Poll until logged in (myaccount.google.com accessible)
-        logged_in = False
-        for attempt in range(120):  # wait up to 4 minutes
-            await asyncio.sleep(2)
+        # BLOCK on human — no auto-detection. input() is sync; run in executor
+        # so we don't block the event loop hard (browser stays responsive).
+        await asyncio.get_event_loop().run_in_executor(
+            None, input, "  >>> Press ENTER once logged in + Maps loaded... ")
 
-            try:
-                current_url = page.url
+        raw = await context.cookies()  # ALL domains, no scoping
+        cookies = _sanitize(raw)
+        Path(GOOGLE_COOKIES_PATH).write_text(json.dumps(cookies, indent=2))
+        await context.close()
 
-                # Check if redirected away from signin
-                if 'accounts.google.com/signin' not in current_url:
-                    # Navigate to maps to confirm login
-                    await page.goto(
-                        'https://www.google.com/maps',
-                        wait_until='domcontentloaded',
-                        timeout=15000,
-                    )
-                    await asyncio.sleep(2)
-
-                    # Check if logged in by looking for
-                    # account avatar
-                    avatar = await page.query_selector(
-                        'a[aria-label*="Google Account"],'
-                        'img[aria-label*="Google Account"],'
-                        '[data-ogsr-up]'
-                    )
-
-                    if avatar:
-                        logged_in = True
-                        print("[SETUP] ✓ Google login detected!")
-                        break
-
-                    # Go back to signin if not logged in
-                    if 'accounts.google.com' in page.url:
-                        continue
-
-            except Exception:
-                continue
-
-        if not logged_in:
-            print("[SETUP] ✗ Login timeout — please try again")
-            await browser.close()
-            return False
-
-        # Save cookies
-        print("[SETUP] Saving session cookies...")
-        await asyncio.sleep(2)
-
-        cookies = await context.cookies([
-            'https://google.com',
-            'https://www.google.com',
-            'https://maps.google.com',
-            'https://accounts.google.com',
-        ])
-
-        Path(GOOGLE_COOKIES_PATH).write_text(
-            json.dumps(cookies, indent=2)
-        )
-
-        print(f"[SETUP] ✓ Saved {len(cookies)} cookies to "
-              f"{GOOGLE_COOKIES_PATH}")
-
-        # Show success message in browser
-        try:
-            await page.evaluate("""
-                const banner = document.getElementById('dop-banner');
-                if (banner) {
-                    banner.style.background = '#065f46';
-                    while (banner.firstChild) {
-                        banner.removeChild(banner.firstChild);
-                    }
-                    const icon = document.createElement('span');
-                    icon.textContent = '✅';
-                    icon.style.fontSize = '20px';
-
-                    const text = document.createElement('span');
-                    const strong = document.createElement('strong');
-                    strong.textContent = 'Setup complete!';
-                    text.appendChild(strong);
-                    text.appendChild(document.createTextNode(
-                        ' — This window will close in 3 seconds.'
-                    ));
-
-                    banner.appendChild(icon);
-                    banner.appendChild(text);
-                }
-            """)
-        except Exception:
-            pass  # Banner is cosmetic — login still works
-
-        await asyncio.sleep(3)
-        await browser.close()
+    # Verify
+    check = json.loads(Path(GOOGLE_COOKIES_PATH).read_text())
+    names = {c.get('name') for c in check}
+    found = AUTH_COOKIES.intersection(names)
+    print("-" * 64)
+    print(f"  Saved {len(check)} cookies → {GOOGLE_COOKIES_PATH}")
+    if found:
+        print(f"  ✓ Auth cookies present: {sorted(found)}")
+        print("  ✓ Capture looks good.")
         return True
+    print("  ✗ NO Google auth cookies found — login likely did not complete.")
+    print("    Re-run and make sure you finish sign-in BEFORE pressing Enter.")
+    return False
 
 
 def main():
-    if cookies_are_valid():
-        print("[SETUP] ✓ Google cookies are valid — skipping login")
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--force', action='store_true',
+                    help='Re-capture even if existing cookies look valid')
+    args = ap.parse_args()
+
+    if not args.force and cookies_are_valid():
+        print("[SETUP] ✓ Google cookies are valid — skipping (use --force to redo)")
         sys.exit(0)
 
-    print("[SETUP] Google login required...")
-    success = asyncio.run(run_google_login())
-    sys.exit(0 if success else 1)
+    ok = asyncio.run(run_manual_capture())
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':
