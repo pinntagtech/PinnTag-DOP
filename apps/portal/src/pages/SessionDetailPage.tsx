@@ -845,6 +845,8 @@ export default function SessionDetailPage() {
           const r = verifyResult;
           const af = r.autoFixable;
           const nm = r.needsManual;
+          const pp = r.pendingPublish;
+          const auditedTotal = r.totalBusinesses + r.unpublishedRecords;
           const autoChips: { label: string; n: number }[] = [
             { label: "hours", n: af.hours },
             { label: "encoding", n: af.hoursEncoding },
@@ -859,6 +861,11 @@ export default function SessionDetailPage() {
             { label: "name", n: nm.name },
             { label: "taxonomy", n: nm.taxonomy },
             { label: "resolve", n: nm.resolve },
+            { label: "placeId", n: nm.placeId },
+          ].filter((c) => c.n > 0);
+          const pendingChips: { label: string; n: number }[] = [
+            { label: "outlet-link", n: pp.outletLink },
+            { label: "cover", n: pp.cover },
           ].filter((c) => c.n > 0);
           return (
             <div
@@ -882,7 +889,12 @@ export default function SessionDetailPage() {
               >
                 <ShieldCheck size={15} style={{ color: "var(--text)" }} />
                 <span style={{ fontWeight: 600, color: "var(--text)" }}>
-                  {r.ready} of {r.totalBusinesses} ready
+                  {r.ready} of {auditedTotal} ready
+                </span>
+                <span style={{ color: "var(--text-muted)" }}>·</span>
+                <span style={{ color: "var(--text-secondary)" }}>
+                  published {r.totalBusinesses} · unpublished{" "}
+                  {r.unpublishedRecords}
                 </span>
                 <span style={{ color: "var(--text-muted)" }}>·</span>
                 <span style={{ color: "var(--text-secondary)" }}>
@@ -953,6 +965,36 @@ export default function SessionDetailPage() {
                   ))
                 )}
               </div>
+
+              {pendingChips.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: "6px",
+                    alignItems: "center",
+                    fontSize: "12px",
+                  }}
+                >
+                  <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>
+                    Pending publish:
+                  </span>
+                  {pendingChips.map((c) => (
+                    <span
+                      key={c.label}
+                      style={{
+                        padding: "2px 8px",
+                        borderRadius: "999px",
+                        backgroundColor: "#FEF3C7",
+                        color: "#92400E",
+                        fontWeight: 500,
+                      }}
+                    >
+                      {c.label} ({c.n})
+                    </span>
+                  ))}
+                </div>
+              )}
 
               {r.dryRun && autoChips.length > 0 && (
                 <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>

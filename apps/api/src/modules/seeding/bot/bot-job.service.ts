@@ -30,6 +30,27 @@ export class BotJobService {
     private readonly sessionService: SeedingSessionService,
   ) {}
 
+  // Which of the given businessIds already have an in-flight (pending or
+  // running) job of `type`. Used by VerifyAndFixService to suppress
+  // duplicate cover_sync enqueues on repeated Apply runs.
+  async findInflightBusinessIds(
+    type: BotJobType,
+    businessIds: string[],
+  ): Promise<Set<string>> {
+    if (businessIds.length === 0) return new Set();
+    const jobs = await this.botJobModel
+      .find(
+        {
+          type,
+          status: { $in: [BotJobStatus.PENDING, BotJobStatus.RUNNING] },
+          businessId: { $in: businessIds },
+        },
+        { businessId: 1 },
+      )
+      .lean();
+    return new Set((jobs as any[]).map((j) => String(j.businessId)));
+  }
+
   async createJobs(payload: {
     records: {
       placeId: string;

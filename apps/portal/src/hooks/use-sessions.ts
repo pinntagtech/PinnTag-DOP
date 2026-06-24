@@ -321,7 +321,11 @@ export function useAssignCoverAsLogo() {
 }
 
 export interface VerifyAndFixResult {
+  // Count of PUBLISHED businesses audited (live target DB).
   totalBusinesses: number;
+  // Count of UNPUBLISHED records audited against record.transformedData.
+  unpublishedRecords: number;
+  // Combined readiness across both paths.
   ready: number;
   checkSummary: {
     name: number;
@@ -335,6 +339,7 @@ export interface VerifyAndFixResult {
     taxonomy: number;
     outletLink: number;
     resolve: number;
+    placeId: number;
   };
   autoFixable: {
     hours: number;
@@ -350,6 +355,13 @@ export interface VerifyAndFixResult {
     taxonomy: number;
     resolve: number;
     name: number;
+    placeId: number;
+  };
+  // Items that can't be auto-fixed pre-publish — the operator publishes
+  // first, then the published path handles them.
+  pendingPublish: {
+    outletLink: number;
+    cover: number;
   };
   dryRun: boolean;
 }

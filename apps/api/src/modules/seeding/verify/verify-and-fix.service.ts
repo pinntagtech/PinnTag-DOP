@@ -39,6 +39,17 @@ function isUsCoord(lat: number, lng: number): boolean {
   return false;
 }
 
+// Country strings we accept as "US" for the genuinely-foreign EXCLUDE
+// signature. Lower-cased, trimmed at comparison time. Mirrors the small
+// COUNTRY_PHONE_MAP entries that resolve to +1.
+const US_COUNTRY_NAMES = new Set([
+  'united states',
+  'united states of america',
+  'usa',
+  'u.s.a.',
+  'us',
+]);
+
 const US_STATE_CODES = new Set([
   'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI',
   'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN',
@@ -177,7 +188,16 @@ function computeHoursEncodingFix(rt: any): { changed: boolean; timing: any } {
 // ─── Response shape ────────────────────────────────────────────────────────
 
 export interface VerifyAndFixResult {
+  // Count of PUBLISHED businesses that were audited (live Business docs in
+  // the target DB). Excludes those skipped by CHECK 12.
   totalBusinesses: number;
+  // Count of UNPUBLISHED records audited via record.transformedData — the
+  // seed shape that WOULD be published. A ready-but-unpublished session
+  // (e.g. fresh scraper import, 0 published) reports these here.
+  unpublishedRecords: number;
+  // Combined readiness across published + unpublished. An unpublished
+  // record is "ready" when all pre-publish quality checks pass; the
+  // post-publish-only items (outlets, cover bot) move to pendingPublish.
   ready: number;
   checkSummary: {
     name: number;
@@ -191,6 +211,7 @@ export interface VerifyAndFixResult {
     taxonomy: number;
     outletLink: number;
     resolve: number;
+    placeId: number;
   };
   autoFixable: {
     hours: number;
@@ -206,6 +227,16 @@ export interface VerifyAndFixResult {
     taxonomy: number;
     resolve: number;
     name: number;
+    placeId: number;
+  };
+  // Items that CANNOT be auto-fixed pre-publish — the operator publishes
+  // first and these become normal published-path concerns. outletLink is
+  // bumped once per unpublished record (outlets are created at publish
+  // time); cover bumps when the seed carries a googleusercontent URL
+  // (the post-publish cover_sync bot will replace it).
+  pendingPublish: {
+    outletLink: number;
+    cover: number;
   };
   dryRun: boolean;
 }
@@ -242,20 +273,24 @@ export class VerifyAndFixService {
   ): Promise<VerifyAndFixResult> {
     const { dryRun, actor } = opts;
 
-    const empty: VerifyAndFixResult = {
+    const result: VerifyAndFixResult = {
       totalBusinesses: 0,
+      unpublishedRecords: 0,
       ready: 0,
       checkSummary: {
         name: 0, address: 0, coords: 0, hours: 0, hoursEncoding: 0,
         keys: 0, countryCode: 0, cover: 0, taxonomy: 0, outletLink: 0,
-        resolve: 0,
+        resolve: 0, placeId: 0,
       },
       autoFixable: {
         hours: 0, hoursEncoding: 0, keys: 0, countryCode: 0,
         coverQueued: 0, outletLink: 0,
       },
       needsManual: {
-        address: 0, coords: 0, taxonomy: 0, resolve: 0, name: 0,
+        address: 0, coords: 0, taxonomy: 0, resolve: 0, name: 0, placeId: 0,
+      },
+      pendingPublish: {
+        outletLink: 0, cover: 0,
       },
       dryRun,
     };
@@ -263,27 +298,96 @@ export class VerifyAndFixService {
     const session = await this.sessionService.findById(sessionId);
     const environment = (session as any).environment as string;
 
+    // findBySession converts the controller's :id (Mongo _id hex) to
+    // ObjectId before querying seedingrecords.sessionId — querying with
+    // the human-readable "DOP-..." string here would return 0 records.
     const records = await this.recordService.findBySession(sessionId, {
       module: SeedingModules.BUSINESS,
     });
 
-    // record by publishedId — used to recover the Google placeId for the
-    // cover_sync bot job (the live Business doc may not carry it).
+    // Partition: records WITH a valid publishedId go through the live-DB
+    // path; those WITHOUT are audited against record.transformedData (the
+    // seed doc that would be published).
     const recordByPublishedId = new Map<string, any>();
     const publishedIds: mongoose.Types.ObjectId[] = [];
+    const unpublishedRecords: any[] = [];
     for (const r of records as any[]) {
       const pid = r.publishedId;
-      if (!pid) continue;
-      recordByPublishedId.set(String(pid), r);
-      if (mongoose.isValidObjectId(pid)) {
+      if (pid && mongoose.isValidObjectId(pid)) {
+        recordByPublishedId.set(String(pid), r);
         publishedIds.push(new mongoose.Types.ObjectId(String(pid)));
+      } else {
+        unpublishedRecords.push(r);
       }
     }
 
-    if (publishedIds.length === 0) return empty;
+    if (publishedIds.length === 0 && unpublishedRecords.length === 0) {
+      return result;
+    }
+
+    if (publishedIds.length > 0) {
+      await this.auditPublished({
+        environment,
+        sessionId,
+        dryRun,
+        publishedIds,
+        recordByPublishedId,
+        result,
+      });
+    }
+
+    if (unpublishedRecords.length > 0) {
+      await this.auditUnpublished({
+        dryRun,
+        records: unpublishedRecords,
+        result,
+      });
+    }
+
+    await this.logService.log({
+      sessionId,
+      action: SeedingLogActions.VERIFY_AND_FIX,
+      actor,
+      message:
+        `Verify & Fix (${dryRun ? 'dry-run' : 'applied'}): ` +
+        `${result.ready}/${result.totalBusinesses + result.unpublishedRecords} ready ` +
+        `(published=${result.totalBusinesses} unpublished=${result.unpublishedRecords}) · ` +
+        `auto-fixed hours=${result.autoFixable.hours} ` +
+        `encoding=${result.autoFixable.hoursEncoding} ` +
+        `keys=${result.autoFixable.keys} ` +
+        `countryCode=${result.autoFixable.countryCode} ` +
+        `outletLink=${result.autoFixable.outletLink} ` +
+        `coversQueued=${result.autoFixable.coverQueued} · ` +
+        `pendingPublish outletLink=${result.pendingPublish.outletLink} ` +
+        `cover=${result.pendingPublish.cover}`,
+      metadata: result as any,
+    });
+
+    return result;
+  }
+
+  // ── PUBLISHED PATH ──────────────────────────────────────────────────────
+  // Reads live Business + Outlet docs in the target DB and audits/fixes
+  // them against the activation checklist. Unchanged behavior from the
+  // pre-extension service — just extracted into a method.
+  private async auditPublished(args: {
+    environment: string;
+    sessionId: string;
+    dryRun: boolean;
+    publishedIds: mongoose.Types.ObjectId[];
+    recordByPublishedId: Map<string, any>;
+    result: VerifyAndFixResult;
+  }): Promise<void> {
+    const {
+      environment,
+      sessionId,
+      dryRun,
+      publishedIds,
+      recordByPublishedId,
+      result,
+    } = args;
 
     const conn = await this.openTargetConn(environment);
-    const result: VerifyAndFixResult = empty;
     const coverJobs: {
       businessId: string;
       businessName: string;
@@ -322,14 +426,32 @@ export class VerifyAndFixService {
         const batch = (businesses as any[]).slice(i, i + BATCH_SIZE);
         for (const b of batch) {
           const bizId = String(b._id);
+          const ctxOutlets = outletsByBiz.get(bizId) ?? [];
 
           // ── CHECK 12: EXCLUDE ──
-          // Skip deferred-corrupt / genuinely-foreign rows (markers may be
-          // absent today — this is a defensive guard) and any non-seeded
-          // doc that slipped in (read-side mirror of the seeded write guard).
+          // (a) The deferred-corrupt marker is set on OUTLETS via mongosh
+          // (not in any schema), so check active outlets, not the business.
+          // (b) Genuinely-foreign rows carry no marker — apply the
+          // signature inline: non-US country AND coords outside the US
+          // bbox. Don't waste cover-queue / key-set work on rows slated
+          // for delete/deactivate.
+          // (c) Read-side mirror of the seeded write guard.
+          const hasDeferredCorruptOutlet = ctxOutlets.some(
+            (o) => o._deferredCorrupt === true,
+          );
+          const countryStr = String(b.country ?? '')
+            .trim()
+            .toLowerCase();
+          const isUsCountry =
+            countryStr.length > 0 && US_COUNTRY_NAMES.has(countryStr);
+          const coordsOutsideUs =
+            hasRealCoords(b) && !isUsCoord(b.latitude, b.longitude);
+          const genuinelyForeign =
+            countryStr.length > 0 && !isUsCountry && coordsOutsideUs;
+
           if (
-            b._deferredCorrupt === true ||
-            b.genuinelyForeign === true ||
+            hasDeferredCorruptOutlet ||
+            genuinelyForeign ||
             (b.isCvb !== true && b.isFromCrawler !== true)
           ) {
             continue;
@@ -337,7 +459,6 @@ export class VerifyAndFixService {
 
           result.totalBusinesses++;
 
-          const ctxOutlets = outletsByBiz.get(bizId) ?? [];
           const record = recordByPublishedId.get(bizId);
 
           // ── Build the auto-fix plan from the CURRENT state ──
@@ -506,12 +627,21 @@ export class VerifyAndFixService {
       }
 
       // ── Enqueue cover_sync jobs (createJobs filters to those w/ placeId) ──
+      // Suppress duplicates: a business with an already-pending or running
+      // cover_sync job must not be re-enqueued on repeated Apply runs.
+      // Applied to dry-run too so the displayed count matches what an Apply
+      // would actually create.
       if (coverJobs.length > 0) {
+        const inflight = await this.botJobService.findInflightBusinessIds(
+          BotJobType.COVER_SYNC,
+          coverJobs.map((c) => c.businessId),
+        );
+        const fresh = coverJobs.filter((c) => !inflight.has(c.businessId));
         if (dryRun) {
-          result.autoFixable.coverQueued = coverJobs.length;
-        } else {
+          result.autoFixable.coverQueued = fresh.length;
+        } else if (fresh.length > 0) {
           const { created } = await this.botJobService.createJobs({
-            records: coverJobs.map((c) => ({
+            records: fresh.map((c) => ({
               placeId: c.placeId,
               businessId: c.businessId,
               businessName: c.businessName,
@@ -526,24 +656,154 @@ export class VerifyAndFixService {
     } finally {
       await conn.close();
     }
+  }
 
-    await this.logService.log({
-      sessionId,
-      action: SeedingLogActions.VERIFY_AND_FIX,
-      actor,
-      message:
-        `Verify & Fix (${dryRun ? 'dry-run' : 'applied'}): ` +
-        `${result.ready}/${result.totalBusinesses} ready · ` +
-        `auto-fixed hours=${result.autoFixable.hours} ` +
-        `encoding=${result.autoFixable.hoursEncoding} ` +
-        `keys=${result.autoFixable.keys} ` +
-        `countryCode=${result.autoFixable.countryCode} ` +
-        `outletLink=${result.autoFixable.outletLink} ` +
-        `coversQueued=${result.autoFixable.coverQueued}`,
-      metadata: result as any,
-    });
+  // ── UNPUBLISHED PATH ────────────────────────────────────────────────────
+  // Audits record.transformedData (the seed shape that WOULD be published).
+  // Field names differ from the live Business doc — notably `address1`
+  // instead of `addressLine1`, string `industry`/`categories` instead of
+  // ObjectId refs, and no resolveStatus/outlets exist pre-publish.
+  // Auto-fixes write back to record.transformedData via dot-path $set;
+  // post-publish-only items (outlet-link, cover-queue) move to
+  // result.pendingPublish rather than autoFixable.
+  private async auditUnpublished(args: {
+    dryRun: boolean;
+    records: any[];
+    result: VerifyAndFixResult;
+  }): Promise<void> {
+    const { dryRun, records, result } = args;
 
-    return result;
+    for (let i = 0; i < records.length; i += BATCH_SIZE) {
+      const batch = records.slice(i, i + BATCH_SIZE);
+      for (const r of batch) {
+        const t = (r.transformedData ?? {}) as Record<string, any>;
+        // Skip records that never reached the transformed stage — there's
+        // nothing to evaluate yet (validation/transform pipeline first).
+        if (!t || Object.keys(t).length === 0) continue;
+
+        // ── EXCLUDE (mirror of published-side CHECK 12 for pre-publish) ──
+        // deferred-corrupt is an outlet-only marker (no outlets exist
+        // pre-publish), so only the genuinely-foreign signature applies.
+        const countryStr = String(t.country ?? '').trim().toLowerCase();
+        const isUsCountry =
+          countryStr.length > 0 && US_COUNTRY_NAMES.has(countryStr);
+        const coordsOutsideUs =
+          hasRealCoords(t) && !isUsCoord(t.latitude, t.longitude);
+        const genuinelyForeign =
+          countryStr.length > 0 && !isUsCountry && coordsOutsideUs;
+        if (genuinelyForeign) continue;
+
+        result.unpublishedRecords++;
+
+        // ── Build the auto-fix plan ──
+        const set: Record<string, any> = {};
+        const fixed = {
+          hoursEncoding: false,
+          keys: false,
+          countryCode: false,
+        };
+
+        // KEYS — set missing status/continueJourney defaults.
+        if (t.status == null) {
+          set['transformedData.status'] = BusinessStatus.CONFETTI_SCREEN;
+          fixed.keys = true;
+        }
+        if (t.continueJourney == null) {
+          set['transformedData.continueJourney'] = false;
+          fixed.keys = true;
+        }
+
+        // COUNTRYCODE — set when missing (only when not clearly non-US,
+        // so we never stamp a wrong +1).
+        if (!t.countryCode) {
+          const nonUs =
+            hasRealCoords(t) && !isUsCoord(t.latitude, t.longitude);
+          if (!nonUs) {
+            set['transformedData.countryCode'] = '+1';
+            fixed.countryCode = true;
+          }
+        }
+
+        // HOURS ENCODING — normalize 24h/zero-span encodings.
+        const encFix = computeHoursEncodingFix(t.regularTiming);
+        if (encFix.changed) {
+          set['transformedData.regularTiming'] = encFix.timing;
+          fixed.hoursEncoding = true;
+        }
+
+        // Apply (writes scoped to this record's _id; records are
+        // DOP-owned by definition so no andSeeded equivalent is needed).
+        if (!dryRun && Object.keys(set).length > 0) {
+          await this.recordService.updateRecord(String(r._id), set);
+          // Mirror onto the in-memory transformedData so the post-fix
+          // evaluation below reflects the new state.
+          if (set['transformedData.status'] !== undefined) {
+            t.status = set['transformedData.status'];
+          }
+          if (set['transformedData.continueJourney'] !== undefined) {
+            t.continueJourney = set['transformedData.continueJourney'];
+          }
+          if (set['transformedData.countryCode'] !== undefined) {
+            t.countryCode = set['transformedData.countryCode'];
+          }
+          if (set['transformedData.regularTiming'] !== undefined) {
+            t.regularTiming = set['transformedData.regularTiming'];
+          }
+        }
+
+        // ── Evaluate seed-shape checks (post auto-fix) ──
+        const fail = this.evaluateSeedChecks(t);
+
+        // checkSummary — only count checks that actually apply pre-publish.
+        // outletLink / resolve are not failures pre-publish; cover only
+        // fails when MISSING (googleusercontent is acceptable and gets
+        // bucketed into pendingPublish.cover below).
+        if (fail.name) result.checkSummary.name++;
+        if (fail.address) result.checkSummary.address++;
+        if (fail.coords) result.checkSummary.coords++;
+        if (fail.hours) result.checkSummary.hours++;
+        if (fail.hoursEncoding) result.checkSummary.hoursEncoding++;
+        if (fail.keys) result.checkSummary.keys++;
+        if (fail.countryCode) result.checkSummary.countryCode++;
+        if (fail.coverMissing) result.checkSummary.cover++;
+        if (fail.taxonomy) result.checkSummary.taxonomy++;
+        if (fail.placeId) result.checkSummary.placeId++;
+
+        // autoFixable — what we fixed (apply) / would fix (dryRun).
+        if (fixed.hoursEncoding) result.autoFixable.hoursEncoding++;
+        if (fixed.keys) result.autoFixable.keys++;
+        if (fixed.countryCode) result.autoFixable.countryCode++;
+
+        // needsManual — what an operator must address (data-side gaps).
+        if (fail.name) result.needsManual.name++;
+        if (fail.address) result.needsManual.address++;
+        if (fail.coords) result.needsManual.coords++;
+        if (fail.taxonomy) result.needsManual.taxonomy++;
+        if (fail.placeId) result.needsManual.placeId++;
+
+        // pendingPublish — outlets are created at publish time, so every
+        // unpublished record contributes. Cover bucket only when the seed
+        // carries a googleusercontent URL the bot will replace.
+        result.pendingPublish.outletLink++;
+        if (fail.coverGoogleHost) result.pendingPublish.cover++;
+
+        // "ready" pre-publish: all data-side checks pass. We deliberately
+        // don't require outletLink/cover-queue/resolve here — those move
+        // through the published path after the operator publishes.
+        const dataSideFail =
+          fail.name ||
+          fail.address ||
+          fail.coords ||
+          fail.hours ||
+          fail.hoursEncoding ||
+          fail.keys ||
+          fail.countryCode ||
+          fail.coverMissing ||
+          fail.taxonomy ||
+          fail.placeId;
+        if (!dataSideFail) result.ready++;
+      }
+    }
   }
 
   // Returns a map of checkName → failed(boolean) for one business.
@@ -648,6 +908,94 @@ export class VerifyAndFixService {
       taxonomy: taxonomyFail,
       outletLink: outletLinkFail,
       resolve: resolveFail,
+    };
+  }
+
+  // Seed-shape evaluator for record.transformedData. Diffs from
+  // evaluateChecks (live business):
+  //   • address field is `address1`, not `addressLine1`
+  //   • hours has no resolveStatus.hoursRaw → judged from regularTiming
+  //     shape + placeholder check only
+  //   • countryCode wrong-+1 logic is identical
+  //   • cover is split into "missing" (counts as a fail) and
+  //     "googleHost" (acceptable pre-publish, contributes to
+  //     pendingPublish.cover)
+  //   • taxonomy accepts STRING industry + non-empty STRING categories
+  //     array (the seed shape — they're converted to ObjectIds at publish)
+  //   • placeId presence is checked (needed for resolve + cover bot)
+  //   • no outletLink / resolve (don't exist pre-publish)
+  private evaluateSeedChecks(t: any): {
+    name: boolean;
+    address: boolean;
+    coords: boolean;
+    hours: boolean;
+    hoursEncoding: boolean;
+    keys: boolean;
+    countryCode: boolean;
+    coverMissing: boolean;
+    coverGoogleHost: boolean;
+    taxonomy: boolean;
+    placeId: boolean;
+  } {
+    const name = String(t.name ?? '').trim();
+    const nameFail =
+      name.length <= 2 || GENERIC_NAMES.has(name.toLowerCase());
+
+    const addr = String(t.address1 ?? '').trim();
+    const addressFail =
+      !addr || ADDR_URL_RE.test(addr) || ADDR_PHONE_RE.test(addr);
+
+    let coordsFail = !hasRealCoords(t);
+    if (!coordsFail && isStatedUs(t) && !isUsCoord(t.latitude, t.longitude)) {
+      coordsFail = true;
+    }
+
+    const wd = t.regularTiming?.weekDays;
+    const hoursFail = !wd || isPlaceholderTiming(t.regularTiming);
+
+    const hoursEncodingFail = computeHoursEncodingFix(t.regularTiming).changed;
+
+    const keysFail = t.status == null || t.continueJourney == null;
+
+    let countryCodeFail = !t.countryCode;
+    if (
+      !countryCodeFail &&
+      t.countryCode === '+1' &&
+      hasRealCoords(t) &&
+      !isUsCoord(t.latitude, t.longitude)
+    ) {
+      countryCodeFail = true;
+    }
+
+    const coverStr = String(t.cover ?? '');
+    const coverMissing = !t.cover;
+    const coverGoogleHost =
+      !coverMissing && /googleusercontent/i.test(coverStr);
+
+    // Pre-publish, industry+categories are STRINGS (e.g. "Food & Drinks" /
+    // ["Restaurant"]). They're resolved to ObjectId refs at publish time.
+    const indStr = String(t.industry ?? '').trim();
+    const cats = t.categories;
+    const taxonomyFail =
+      indStr.length === 0 ||
+      !Array.isArray(cats) ||
+      cats.length === 0 ||
+      !cats.every((c: any) => String(c ?? '').trim().length > 0);
+
+    const placeIdFail = !t.placeId || String(t.placeId).trim().length === 0;
+
+    return {
+      name: nameFail,
+      address: addressFail,
+      coords: coordsFail,
+      hours: hoursFail,
+      hoursEncoding: hoursEncodingFail,
+      keys: keysFail,
+      countryCode: countryCodeFail,
+      coverMissing,
+      coverGoogleHost,
+      taxonomy: taxonomyFail,
+      placeId: placeIdFail,
     };
   }
 }
