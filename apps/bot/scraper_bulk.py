@@ -925,34 +925,57 @@ async def _scroll_photos(page, rounds: int = 12):
 
 
 async def _open_photos(page) -> bool:
-    """Open the photo experience via whatever trigger works; verify by tile count."""
+    """Open the full photo grid via the place panel's 'Photos & videos'
+    section — explicitly NOT the hero/cover image (which opens a single
+    photo or bounces to Street View). Verify by tile count."""
     before = len(await _tiles(page))
-    triggers = [
-        'button[jsaction*="heroHeaderImage"]',
-        'button[aria-label^="Photo"]',
-        'button[aria-label*="Photo of"]',
-        'button[aria-label="Exterior"]', 'button[aria-label="Interior"]',
-        'button[aria-label="By owner"]', 'button[aria-label="Vibe"]',
-        'button[aria-label="Menu"]',     'button[aria-label="Food & drink"]',
-        'button[aria-label="Videos"]',   'button[aria-label="All"]',
-        'button[aria-label*="Photo"]', 'a[href*="/photos"]',
-        'button[aria-label*="See all"]', 'button[aria-label*="all photo"]',
-    ]
-    for sel in triggers:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1000):
-                await btn.click(timeout=2000)
-                await page.wait_for_timeout(1800)
-                now = len(await _tiles(page))
-                if now >= 3 and now >= before:
-                    scraper_logger.info(f"[GALLERY] Opened via '{sel}' — {now} tiles")
-                    return True
-        except Exception:
-            continue
+
+    # 1) Scroll the "Photos & videos" section into view so its cards render.
+    try:
+        await page.evaluate(r"""() => {
+            const hdr = [...document.querySelectorAll('h2,h3,div')]
+                .find(e => /photos?\s*&?\s*videos?/i.test(e.textContent || ''));
+            if (hdr) hdr.scrollIntoView({block:'center'});
+        }""")
+        await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    # 2) Click the "All" card inside that section. heroHeaderImage is
+    #    explicitly excluded. Exact/leading "All" first, then any known
+    #    photo-folder card as a fallback grid entry.
+    try:
+        clicked = await page.evaluate(r"""() => {
+            const isHero = (el) =>
+                (el.getAttribute('jsaction') || '').includes('heroHeaderImage');
+            const cands = [...document.querySelectorAll('button,a')];
+            let el = cands.find(b => {
+                if (isHero(b)) return false;
+                const t = (b.getAttribute('aria-label') || b.innerText || '').trim();
+                return t === 'All' || /^All\b/.test(t);
+            });
+            if (!el) {
+                const KNOWN = /^(by owner|by visitor|from visitors|menu|food & drink|vibe|exterior|interior|videos|street view)/i;
+                el = cands.find(b => {
+                    if (isHero(b)) return false;
+                    const t = (b.getAttribute('aria-label') || b.innerText || '').trim();
+                    return KNOWN.test(t);
+                });
+            }
+            if (el) { el.click(); return true; }
+            return false;
+        }""")
+        if clicked:
+            await page.wait_for_timeout(1800)
+    except Exception:
+        pass
+
     now = len(await _tiles(page))
+    if now >= 3 and now >= before:
+        scraper_logger.info(f"[GALLERY] photo grid opened — {now} tiles")
+        return True
     if now >= 3:
-        scraper_logger.info(f"[GALLERY] Tiles already present — {now}")
+        scraper_logger.info(f"[GALLERY] tiles already present — {now}")
         return True
 
     # ── diagnostic: report what's actually on the page when we can't open ──

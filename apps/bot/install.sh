@@ -97,12 +97,24 @@ fi
 # ── Step 2: System deps (Linux only) ─────────────────────
 if [ "$OS" = "Linux" ]; then
     printf "${CYAN}[2/6] Installing system dependencies...${NC}\n"
-    sudo apt-get install -y -qq --no-install-recommends \
-        curl wget \
-        libnss3 libnspr4 libdrm2 libxkbcommon0 \
-        libxcomposite1 libxdamage1 libxfixes3 \
-        libxrandr2 libgbm1 \
-        > /dev/null 2>&1
+    sudo apt-get update -qq > /dev/null 2>&1 || true
+    sudo apt-get install -y -qq --no-install-recommends curl wget > /dev/null 2>&1 || true
+
+    # Chromium runtime libs. Ubuntu 24.04+ (incl. 26.04) renamed several
+    # of these with a `t64` suffix (64-bit time_t ABI transition). Install
+    # each tolerantly; fall back to the pre-t64 name on older Ubuntu.
+    CHROMIUM_DEPS=(
+        libnss3 libnspr4 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64
+        libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1
+        libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2
+        libasound2t64 libatspi2.0-0t64 libx11-6 libxcb1 libxext6
+        libxshmfence1 fonts-liberation
+    )
+    for pkg in "${CHROMIUM_DEPS[@]}"; do
+        sudo apt-get install -y -qq --no-install-recommends "$pkg" > /dev/null 2>&1 \
+          || sudo apt-get install -y -qq --no-install-recommends "${pkg%t64}" > /dev/null 2>&1 \
+          || true
+    done
     printf "${GREEN}  ✓ Done${NC}\n"
 else
     printf "${CYAN}[2/6] Checking system dependencies...${NC}\n"
@@ -173,11 +185,21 @@ if [ ! -f "$PLAYWRIGHT_BIN" ]; then
     exit 1
 fi
 printf "  Installing Chromium (this may take a minute)...\n"
-"$PLAYWRIGHT_BIN" install chromium 2>&1 | grep -v "^$" | grep -v "Downloading" || true
-if "$PLAYWRIGHT_BIN" install chromium > /dev/null 2>&1; then
-    printf "${GREEN}  ✓ Chromium installed${NC}\n"
+if [ "$OS" = "Linux" ]; then
+    # Playwright knows the correct per-distro dep names (incl. t64) on a
+    # current version. Run install-deps as root, but the browser download
+    # as the operator so it lands in their cache, not root's.
+    sudo "$PLAYWRIGHT_BIN" install-deps chromium > /dev/null 2>&1 || true
+fi
+"$PLAYWRIGHT_BIN" install chromium > /dev/null 2>&1 || true
+
+# Verify it actually launches — catches missing .so even when download "succeeded".
+if "$BOT_DIR/venv/bin/python3" -c \
+   "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(); b.close(); p.stop()" \
+   > /dev/null 2>&1; then
+    printf "${GREEN}  ✓ Chromium installed & launches${NC}\n"
 else
-    printf "${YELLOW}  ⚠ Chromium install had warnings${NC}\n"
+    printf "${YELLOW}  ⚠ Chromium installed but failed to launch — check system deps above${NC}\n"
 fi
 
 # ── Step 6: Google login ──────────────────────────────────

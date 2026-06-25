@@ -19,21 +19,6 @@ AUTH_COOKIES = {'SID', 'HSID', 'SSID', 'APISID', 'SAPISID',
                 '__Secure-1PSID', '__Secure-3PSID'}
 
 
-def resolve_chrome_path():
-    env = os.getenv('CHROME_PATH', '').strip()
-    if env:
-        return env
-    for path in [
-        '/usr/bin/google-chrome',
-        '/usr/bin/google-chrome-stable',
-        '/opt/google/chrome/chrome',
-        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    ]:
-        if os.path.exists(path):
-            return path
-    return None
-
-
 def cookies_are_valid() -> bool:
     path = Path(GOOGLE_COOKIES_PATH)
     if not path.exists():
@@ -90,11 +75,11 @@ def _sanitize(raw: list) -> list:
 async def run_manual_capture() -> bool:
     from playwright.async_api import async_playwright
 
-    chrome = resolve_chrome_path()
+    channel = os.getenv("BOT_BROWSER_CHANNEL", "").strip()
     print("=" * 64)
     print("  PinnTag DOP — Google cookie capture (MANUAL)")
     print("=" * 64)
-    print(f"  Chrome:  {chrome or 'bundled Chromium (no system Chrome found)'}")
+    print(f"  Browser: {channel or 'bundled Chromium'}")
     print(f"  Profile: {PROFILE_DIR}")
     print(f"  Output:  {GOOGLE_COOKIES_PATH}")
     print("-" * 64)
@@ -102,9 +87,7 @@ async def run_manual_capture() -> bool:
     Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            PROFILE_DIR,
-            executable_path=chrome if chrome else None,
+        launch_kwargs = dict(
             headless=False,
             args=[
                 '--no-sandbox',
@@ -116,6 +99,10 @@ async def run_manual_capture() -> bool:
             viewport={'width': 1100, 'height': 800},
             locale='en-US',
         )
+        if channel:
+            launch_kwargs["channel"] = channel
+        context = await p.chromium.launch_persistent_context(
+            PROFILE_DIR, **launch_kwargs)
         page = context.pages[0] if context.pages else await context.new_page()
         try:
             await page.goto('https://accounts.google.com',
