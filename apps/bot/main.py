@@ -357,6 +357,13 @@ async def poll_and_execute():
             f'{job_type} for {job.get("businessName")}'
         )
 
+        if job_type == 'gallery_menu':
+            logger.info(
+                f"[GALLERY] job addr: name={job.get('businessName')!r} "
+                f"addr={job.get('addressLine1')!r} city={job.get('city')!r} "
+                f"state={job.get('state')!r}"
+            )
+
         req = ScrapeRequest(
             placeId=job.get('placeId', '') or '',
             businessId=job['businessId'],
@@ -570,14 +577,21 @@ async def run_scrape(req: ScrapeRequest):
         state.place_name = req.businessName or ""
         dashboard = SilentDashboard()
 
-        url = f"https://www.google.com/maps/place/?q=place_id:{req.placeId}"
+        pid = req.placeId
+        url = f"https://www.google.com/maps/place/?q=place_id:{pid}"
+        logger.info(f"[GALLERY] entry url: {url}")
 
         # Phase 1: Gallery + Menu (headless)
         if not req.skipGallery or not req.skipMenu:
             async with async_playwright() as p:
+                # GALLERY_USE_BUNDLED=1 forces Playwright's bundled Chromium for the
+                # gallery/menu launch (system Chrome was rendering Maps place pages
+                # empty on some machines). Defaults to the normal CHROME_PATH behavior.
+                _gallery_exec = None if os.getenv("GALLERY_USE_BUNDLED") == "1" \
+                    else (CHROME_PATH if CHROME_PATH else None)
                 browser = await p.chromium.launch(
-                    executable_path=CHROME_PATH if CHROME_PATH else None,
-                    headless=True,
+                    executable_path=_gallery_exec,
+                    headless=False,
                     args=[
                         "--no-sandbox",
                         "--disable-blink-features=AutomationControlled",
@@ -599,25 +613,14 @@ async def run_scrape(req: ScrapeRequest):
                 context = await browser.new_context(
                     viewport={"width": 1280, "height": 900},
                     locale="en-US",
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    extra_http_headers={
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "Connection": "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "none",
-                        "Sec-Fetch-User": "?1",
-                    },
-                    java_script_enabled=True,
-                    bypass_csp=True,
+                    permissions=[],                 # grant nothing
+                    geolocation=None,
                 )
+                # Explicitly deny geolocation for google.com so no popup blocks clicks.
+                try:
+                    await context.clear_permissions()
+                except Exception:
+                    pass
 
                 # Override navigator.webdriver to hide automation
                 await context.add_init_script("""
@@ -662,6 +665,145 @@ async def run_scrape(req: ScrapeRequest):
 
                 await page.wait_for_timeout(4000)
 
+                # Wait for the place panel to hydrate (proven resolve-path signal).
+                h1_present = False
+                try:
+                    await page.wait_for_selector(
+                        'h1.DUwDvf, h1.fontHeadlineLarge',
+                        timeout=15000,
+                    )
+                    h1_present = True
+                    await page.wait_for_timeout(1500)  # let transient title settle
+                except Exception:
+                    logger.warning(
+                        f"[GALLERY] place panel h1 never appeared — url={page.url[:140]}"
+                    )
+                # Street-View guard: if the redirect bounced into a panorama, log it.
+                sv = ("/@" in page.url and (",3a," in page.url
+                      or "!1e1" in page.url or "!1e2" in page.url))
+                if sv:
+                    logger.warning(f"[GALLERY] landed in Street View — url={page.url[:140]}")
+
+                # Exit Street View if the place deep-linked into the pano.
+                # On Street View there's no hero image, so the photo-open
+                # below would miss. Get back to the place card first.
+                for attempt in range(4):
+                    sv = ("/@" in page.url and (",3a," in page.url
+                          or "!1e1" in page.url or "!1e2" in page.url))
+                    if not sv:
+                        break
+                    logger.info(f"[GALLERY] in Street View (attempt {attempt+1}) — exiting")
+                    closed = False
+                    # 1) the Street View overlay close (X) button
+                    for sel in [
+                        'button[aria-label="Close"]',
+                        'button[jsaction*="settings.close"]',
+                        'button[aria-label*="Back to"]',
+                        'button[aria-label*="Exit"]',
+                    ]:
+                        try:
+                            b = page.locator(sel).first
+                            if await b.is_visible(timeout=800):
+                                await b.click(timeout=1500)
+                                await page.wait_for_timeout(1200)
+                                closed = True
+                                break
+                        except Exception:
+                            continue
+                    # 2) fallback: browser back
+                    if not closed:
+                        try:
+                            await page.go_back(wait_until="domcontentloaded", timeout=8000)
+                            await page.wait_for_timeout(1200)
+                        except Exception:
+                            pass
+                    # 3) last resort: re-navigate to the place URL fresh
+                    sv = ("/@" in page.url and (",3a," in page.url
+                          or "!1e1" in page.url or "!1e2" in page.url))
+                    if sv and attempt >= 2:
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            await page.wait_for_timeout(2500)
+                        except Exception:
+                            pass
+                logger.info(f"[GALLERY] post-streetview url={page.url[:110]}")
+                # Re-wait for the place h1 after exiting Street View.
+                try:
+                    await page.wait_for_selector(
+                        'h1.DUwDvf, h1.fontHeadlineLarge', timeout=8000)
+                    await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+                # Open the gallery via the "All" card in the "Photos & videos"
+                # section of the place panel — the designed gallery entry (NOT
+                # the hero/cover image, which opens a single photo or Street View).
+                photo_opened = False
+                # Scroll the place panel so the Photos & videos section is in view.
+                try:
+                    await page.evaluate("""() => {
+                        const hdr = [...document.querySelectorAll('h2,h3,div')]
+                            .find(e => /photos?\\s*&?\\s*videos?/i.test(e.textContent||''));
+                        if (hdr) hdr.scrollIntoView({block:'center'});
+                    }""")
+                    await page.wait_for_timeout(800)
+                except Exception:
+                    pass
+
+                all_card_selectors = [
+                    'button[aria-label^="All"]',
+                    'button[aria-label="All"]',
+                    'button[aria-label*="All photos"]',
+                    'button[jsaction*="pane.heroHeaderImage.click"]',  # fallback
+                    'button[aria-label*="Photo"]',
+                ]
+                # Prefer an exact "All" card: find a button whose visible text is "All".
+                try:
+                    clicked = await page.evaluate("""() => {
+                        const btns = [...document.querySelectorAll('button,a')];
+                        // exact "All" label/text first
+                        let el = btns.find(b => {
+                            const t=(b.getAttribute('aria-label')||b.innerText||'').trim();
+                            return t === 'All' || /^All\\b/.test(t);
+                        });
+                        if (el){ el.click(); return true; }
+                        return false;
+                    }""")
+                    if clicked:
+                        await page.wait_for_timeout(2000)
+                except Exception:
+                    clicked = False
+
+                # Verify or fall back to selector clicks.
+                async def _grid_open():
+                    c = await page.evaluate("""() => ({
+                        tabs: document.querySelectorAll('[role="tab"]').length,
+                        tiles: document.querySelectorAll('[style*="background-image"]').length,
+                        imgs: document.querySelectorAll('img[src*="googleusercontent"]').length,
+                    })""")
+                    return c["tabs"] > 0 or c["tiles"] > 5 or c["imgs"] > 5, c
+
+                ok, counts = await _grid_open()
+                if ok:
+                    photo_opened = True
+                    logger.info(f"[GALLERY] opened via 'All' card text (tabs={counts['tabs']} tiles={counts['tiles']} imgs={counts['imgs']})")
+                else:
+                    for sel in all_card_selectors:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.is_visible(timeout=1000):
+                                await el.click(timeout=2000)
+                                await page.wait_for_timeout(2000)
+                                ok, counts = await _grid_open()
+                                if ok:
+                                    photo_opened = True
+                                    logger.info(f"[GALLERY] opened via '{sel}' (tabs={counts['tabs']} tiles={counts['tiles']} imgs={counts['imgs']})")
+                                    break
+                        except Exception:
+                            continue
+                if not photo_opened:
+                    logger.warning("[GALLERY] could not open photo grid via All card")
+
                 progress_cb = await make_progress_callback(
                     req.businessId, req.sessionId or ""
                 )
@@ -680,6 +822,7 @@ async def run_scrape(req: ScrapeRequest):
                                 page, state, dashboard,
                                 max_per_folder=MAX_GALLERY,
                                 progress_callback=progress_cb,
+                                already_open=photo_opened,
                             ),
                             timeout=180,
                         )

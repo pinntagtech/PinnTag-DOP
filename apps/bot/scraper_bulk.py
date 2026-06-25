@@ -810,37 +810,45 @@ ENABLE_FACE_FILTER = False
 # so the SAME photo at any size counts once (kills cross-folder repeats).
 EXTRACT_JS = r"""() => {
   const items = [], seen = new Set();
+  window.__tileReject = { notPlace: 0, avatar: 0, dup: 0, noBg: 0, kept: 0 };
   const PLACE = (s) => (
     s.includes('/geo/') || s.includes('p/AF') || s.includes('geougc') ||
     s.includes('gps-cs') || s.includes('streetviewpixels') || s.includes('/p/')
   );
   const skipAvatar = (s) =>
-    /=s(16|24|32|40|48|50|60|64|72|96)\b/.test(s) ||  // small square = avatar
-    s.includes('/a/ACg') ||                            // contributor profile
-    s.includes('/a-/') ||                              // contributor profile
-    /\/a\//.test(s) ||                                 // any /a/ avatar path
-    /=s\d+-c\b/.test(s);                               // circle-cropped = avatar
+    s.includes('/a/ACg') || s.includes('/a-/') ||
+    /\/a\/[A-Za-z0-9]/.test(s) ||         // contributor profile path
+    /=s(16|24|32|40|48|50|60|64)\b/.test(s);  // tiny square avatar sizes
+  // NOTE: gps-cs-s/<token> place tiles have none of these → kept.
   const photoId = (u) => {
-    // Prefer the stable long token (same image → same token across folders,
-    // regardless of /p/ vs geougc-cs/ vs gps-cs path prefix).
-    const tokens = (u.match(/[A-Za-z0-9_\-]{25,}/g) || []);
-    if (tokens.length) {
-      // longest token is the photo id; trims CDN/host noise
-      return 'id:' + tokens.sort((a, b) => b.length - a.length)[0];
-    }
-    // Street View panoramas
-    let m = u.match(/[?&]panoid=([A-Za-z0-9_\-]+)/);
-    if (m) return 'sv:' + m[1];
+    let m;
+    if (m = u.match(/gps-cs-s\/([A-Za-z0-9_\-]+)/)) return 'gps:' + m[1];
+    if (m = u.match(/gps-cs[^/]*\/([A-Za-z0-9_\-]+)/)) return 'gps:' + m[1];
+    if (m = u.match(/\/p\/([A-Za-z0-9_\-]+)/))       return 'p:'  + m[1];
+    if (m = u.match(/geougc-cs\/([A-Za-z0-9_\-]+)/)) return 'g:'  + m[1];
+    if (m = u.match(/geougc\/([A-Za-z0-9_\-]+)/))    return 'g:'  + m[1];
+    if (m = u.match(/[?&]panoid=([A-Za-z0-9_\-]+)/)) return 'sv:' + m[1];
+    // fallback: longest alnum token
+    const toks = (u.match(/[A-Za-z0-9_\-]{20,}/g) || []);
+    if (toks.length) return 'id:' + toks.sort((a,b)=>b.length-a.length)[0];
     return u.replace(/=[^/]*$/, '');
   };
-  const full = (u) => u.replace(/=w\d+-h\d+[^/]*$/, '=s0').replace(/=s\d+[^/]*$/, '=s0');
+  const full = (u) => {
+    if (/=w\d+-h\d+/.test(u)) return u.replace(/=w\d+-h\d+[^/]*$/, '=s0');
+    if (/=s\d+/.test(u))      return u.replace(/=s\d+[^/]*$/, '=s0');
+    return u; // gps-cs-s URLs have no size suffix — leave as-is
+  };
   const add = (src, type) => {
-    if (!src) return;
+    if (!src) { window.__tileReject.noBg++; return; }
     if (!src.includes('googleusercontent') && !src.includes('streetviewpixels')
-        && type === 'image') return;
-    if (type === 'image' && (!PLACE(src) || skipAvatar(src))) return;
+        && type === 'image') { window.__tileReject.notPlace++; return; }
+    if (type === 'image' && (!PLACE(src) || skipAvatar(src))) {
+        window.__tileReject.avatar++; return;
+    }
     const id = type === 'video' ? 'v:' + src : photoId(src);
-    if (seen.has(id)) return; seen.add(id);
+    if (seen.has(id)) { window.__tileReject.dup++; return; }
+    seen.add(id);
+    window.__tileReject.kept++;
     items.push({ id, url: type === 'video' ? src : full(src), type });
   };
   const root =
@@ -863,29 +871,57 @@ EXTRACT_JS = r"""() => {
 
 async def _tiles(page) -> list:
     try:
-        return await page.evaluate(EXTRACT_JS) or []
-    except Exception:
+        items = await page.evaluate(EXTRACT_JS) or []
+    except Exception as e:
+        scraper_logger.warning(f"[TILES-DIAG] EXTRACT_JS threw: {e}")
         return []
-
-
-async def _scroll_photos(page):
-    """Find the real scroll container dynamically and scroll it to the bottom."""
+    # one-time raw visibility: what EXTRACT_JS returned + a raw bg-div count
     try:
-        await page.evaluate("""() => {
-            const root = document.querySelector('div[role="dialog"]') || document;
-            let best = null, h = 0;
-            root.querySelectorAll('div').forEach(d => {
-                if (d.scrollHeight > d.clientHeight + 50 && d.clientHeight > 200
-                    && d.scrollHeight > h) { h = d.scrollHeight; best = d; }
-            });
-            const el = best || document.scrollingElement;
-            el.scrollTop = el.scrollHeight;
+        raw = await page.evaluate(r"""() => {
+            const root = document.querySelector('div[role="main"]') || document.body;
+            const bg = [...root.querySelectorAll('[style*="background-image"]')];
+            const out = [];
+            for (const el of bg.slice(0, 5)) {
+                const m = (el.style.backgroundImage||'').match(/url\(["']?([^"')]+)/);
+                out.push(m ? m[1].slice(0,80) : '(no-url)');
+            }
+            return { bg_count: bg.length, sample: out };
         }""")
+        scraper_logger.warning(
+            f"[TILES-DIAG] EXTRACT_JS returned {len(items)} items; "
+            f"raw bg-divs={raw['bg_count']}; sample={raw['sample']}")
+    except Exception as e:
+        scraper_logger.warning(f"[TILES-DIAG] raw probe failed: {e}")
+    try:
+        rej = await page.evaluate("() => window.__tileReject || null")
+        scraper_logger.warning(f"[TILES-DIAG] reject counts: {rej}")
     except Exception:
-        try:
-            await page.keyboard.press("End")
-        except Exception:
-            pass
+        pass
+    return items
+
+
+async def _scroll_photos(page, rounds: int = 12):
+    last = -1
+    for _ in range(rounds):
+        n = await page.evaluate(r"""() => {
+            const root = document.querySelector('div[role="main"]') || document.body;
+            // the scrollable photo container: the deepest scrollable ancestor of the tiles
+            const tile = root.querySelector('[style*="background-image"]');
+            let sc = tile;
+            while (sc && sc !== document.body) {
+                const oy = getComputedStyle(sc).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && sc.scrollHeight > sc.clientHeight) break;
+                sc = sc.parentElement;
+            }
+            sc = sc || root;
+            sc.scrollBy(0, sc.clientHeight * 0.9);
+            return root.querySelectorAll('[style*="background-image"]').length;
+        }""")
+        await page.wait_for_timeout(700)
+        if n == last:
+            break
+        last = n
+    return last
 
 
 async def _open_photos(page) -> bool:
@@ -918,6 +954,29 @@ async def _open_photos(page) -> bool:
     if now >= 3:
         scraper_logger.info(f"[GALLERY] Tiles already present — {now}")
         return True
+
+    # ── diagnostic: report what's actually on the page when we can't open ──
+    try:
+        diag = await page.evaluate("""() => {
+            const q = (s) => document.querySelectorAll(s).length;
+            return {
+                tiles: q('[style*="background-image"]'),
+                imgs_guc: q('img[src*="googleusercontent"]'),
+                btn_photo: q('button[aria-label*="hoto"]'),
+                btn_all: q('button[aria-label="All"]'),
+                role_img: q('[role="img"]'),
+                role_tab: q('[role="tab"]'),
+                hero: q('button[jsaction*="heroHeaderImage"]'),
+                consent: !!document.querySelector('form[action*="consent"], button[aria-label*="Accept"]'),
+                url: location.href.slice(0, 120),
+                total_nodes: document.querySelectorAll('*').length,
+                body_len: (document.body ? document.body.innerText.length : 0),
+                title: document.title.slice(0, 80),
+            };
+        }""")
+    except Exception as e:
+        diag = {"error": str(e)}
+    scraper_logger.warning(f"[GALLERY] open failed — DOM diag: {diag}")
     return False
 
 
@@ -996,13 +1055,17 @@ async def _harvest(page, folder, global_ids: set, max_items: int, label: str):
 # ═══════════════════════════════════════════════════════════════
 async def scrape_gallery(page, state, dashboard,
                          max_per_folder: int = 200,
-                         progress_callback=None) -> list:
+                         progress_callback=None,
+                         already_open: bool = False) -> list:
     folders: list = []
     global_ids: set = set()        # shared → no repeats across any folder
 
-    if not await _open_photos(page):
-        scraper_logger.warning("[GALLERY] No photos could be opened — skipping")
-        return []
+    if not already_open:
+        if not await _open_photos(page):
+            scraper_logger.warning("[GALLERY] No photos could be opened — skipping")
+            return []
+    else:
+        scraper_logger.info("[GALLERY] grid already open (opened by caller) — harvesting directly")
     await page.wait_for_timeout(1200)
 
     detected = await _detect_categories(page)
