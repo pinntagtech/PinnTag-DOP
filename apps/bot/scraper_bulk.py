@@ -810,7 +810,7 @@ ENABLE_FACE_FILTER = False
 # so the SAME photo at any size counts once (kills cross-folder repeats).
 EXTRACT_JS = r"""() => {
   const items = [], seen = new Set();
-  window.__tileReject = { notPlace: 0, avatar: 0, dup: 0, noBg: 0, kept: 0 };
+  window.__tileReject = { notPlace: 0, avatar: 0, dup: 0, noBg: 0, kept: 0, streetview: 0 };
   const PLACE = (s) => (
     s.includes('/geo/') || s.includes('p/AF') || s.includes('geougc') ||
     s.includes('gps-cs') || s.includes('streetviewpixels') || s.includes('/p/')
@@ -840,8 +840,14 @@ EXTRACT_JS = r"""() => {
   };
   const add = (src, type) => {
     if (!src) { window.__tileReject.noBg++; return; }
-    if (!src.includes('googleusercontent') && !src.includes('streetviewpixels')
-        && type === 'image') { window.__tileReject.notPlace++; return; }
+    // Street View / 360° panos are not business photos — drop them.
+    if (type === 'image' && src.includes('streetviewpixels')) {
+        window.__tileReject.streetview = (window.__tileReject.streetview || 0) + 1;
+        return;
+    }
+    if (!src.includes('googleusercontent') && type === 'image') {
+        window.__tileReject.notPlace++; return;
+    }
     if (type === 'image' && (!PLACE(src) || skipAvatar(src))) {
         window.__tileReject.avatar++; return;
     }
@@ -851,8 +857,10 @@ EXTRACT_JS = r"""() => {
     window.__tileReject.kept++;
     items.push({ id, url: type === 'video' ? src : full(src), type });
   };
+  // The photo thumbnails live in the left rail under role="main". The
+  // focused-photo overlay (role="dialog") holds only the 1 enlarged image,
+  // so preferring it returned 0 tiles. Root on main where the rail is.
   const root =
-    document.querySelector('div[role="dialog"]') ||
     document.querySelector('div[role="main"]') || document.body;
 
   root.querySelectorAll('[style*="background-image"]').forEach(el => {
@@ -906,7 +914,8 @@ async def _scroll_photos(page, rounds: int = 12):
         n = await page.evaluate(r"""() => {
             const root = document.querySelector('div[role="main"]') || document.body;
             // the scrollable photo container: the deepest scrollable ancestor of the tiles
-            const tile = root.querySelector('[style*="background-image"]');
+            const tile = root.querySelector(
+              '[style*="background-image"], img[src*="googleusercontent"], img[src*="streetviewpixels"]');
             let sc = tile;
             while (sc && sc !== document.body) {
                 const oy = getComputedStyle(sc).overflowY;
@@ -924,13 +933,54 @@ async def _scroll_photos(page, rounds: int = 12):
     return last
 
 
-async def _open_photos(page) -> bool:
-    """Open the full photo grid via the place panel's 'Photos & videos'
-    section — explicitly NOT the hero/cover image (which opens a single
-    photo or bounces to Street View). Verify by tile count."""
-    before = len(await _tiles(page))
+async def _dump_photo_dom(page, tag: str = "") -> None:
+    try:
+        snap = await page.evaluate(r"""() => {
+            const out = { url: location.href.slice(0, 160) };
+            out.dialog = !!document.querySelector('div[role="dialog"]');
+            out.tabs = [...document.querySelectorAll('[role="tab"]')]
+                .map(t => (t.getAttribute('aria-label') || t.innerText || '').trim())
+                .filter(Boolean).slice(0, 12);
+            const scrollers = [];
+            document.querySelectorAll('div').forEach(d => {
+                const oy = getComputedStyle(d).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && d.scrollHeight > d.clientHeight + 40) {
+                    scrollers.push({
+                        cls: (d.className || '').toString().slice(0, 44),
+                        sh: d.scrollHeight, ch: d.clientHeight,
+                        tiles: d.querySelectorAll('[style*="background-image"],img[src*="googleusercontent"]').length,
+                    });
+                }
+            });
+            out.scrollers = scrollers.sort((a, b) => b.tiles - a.tiles).slice(0, 5);
+            const tiles = [], seen = new Set();
+            document.querySelectorAll(
+                '[style*="background-image"],img[src*="googleusercontent"],img[src*="streetviewpixels"]'
+            ).forEach(el => {
+                if (tiles.length >= 8) return;
+                let url = '';
+                if (el.tagName === 'IMG') url = el.getAttribute('src') || '';
+                else { const m = (el.style.backgroundImage || '').match(/url\(["']?([^"')]+)/); url = m ? m[1] : ''; }
+                if (!url || seen.has(url)) return; seen.add(url);
+                tiles.push({ tag: el.tagName, cls: (el.className || '').toString().slice(0, 40), url: url.slice(0, 70) });
+            });
+            out.tiles = tiles;
+            return out;
+        }""")
+        scraper_logger.warning(f"[GALLERY-DOM {tag}] {snap}")
+    except Exception as e:
+        scraper_logger.warning(f"[GALLERY-DOM {tag}] dump failed: {e}")
 
-    # 1) Scroll the "Photos & videos" section into view so its cards render.
+
+async def _open_photos(page) -> bool:
+    """Open the full photo viewer (not the panel preview) and confirm it by
+    the presence of real folder tabs. Never the hero, never Street View."""
+    # Already inside the viewer? (real folder tabs visible)
+    if await _detect_categories(page):
+        scraper_logger.info("[GALLERY] viewer already open")
+        return True
+
+    # Bring the "Photos & videos" section into view, then click its "All".
     try:
         await page.evaluate(r"""() => {
             const hdr = [...document.querySelectorAll('h2,h3,div')]
@@ -941,41 +991,33 @@ async def _open_photos(page) -> bool:
     except Exception:
         pass
 
-    # 2) Click the "All" card inside that section. heroHeaderImage is
-    #    explicitly excluded. Exact/leading "All" first, then any known
-    #    photo-folder card as a fallback grid entry.
-    try:
-        clicked = await page.evaluate(r"""() => {
-            const isHero = (el) =>
-                (el.getAttribute('jsaction') || '').includes('heroHeaderImage');
-            const cands = [...document.querySelectorAll('button,a')];
-            let el = cands.find(b => {
-                if (isHero(b)) return false;
-                const t = (b.getAttribute('aria-label') || b.innerText || '').trim();
-                return t === 'All' || /^All\b/.test(t);
-            });
-            if (!el) {
-                const KNOWN = /^(by owner|by visitor|from visitors|menu|food & drink|vibe|exterior|interior|videos|street view)/i;
-                el = cands.find(b => {
-                    if (isHero(b)) return false;
-                    const t = (b.getAttribute('aria-label') || b.innerText || '').trim();
-                    return KNOWN.test(t);
-                });
-            }
-            if (el) { el.click(); return true; }
-            return false;
-        }""")
-        if clicked:
-            await page.wait_for_timeout(1800)
-    except Exception:
-        pass
+    clicked_label = await page.evaluate(r"""() => {
+        const isHero = (el) => (el.getAttribute('jsaction') || '').includes('heroHeaderImage');
+        const cands = [...document.querySelectorAll('button, a, [role="tab"]')];
+        const el = cands.find(b => {
+            if (isHero(b)) return false;
+            const t = (b.getAttribute('aria-label') || b.innerText || '').trim();
+            return t === 'All' || /^All\b/.test(t);
+        });
+        if (el) { el.click(); return (el.getAttribute('aria-label') || el.innerText || 'All').trim(); }
+        return null;
+    }""")
+    if clicked_label:
+        scraper_logger.info(f"[GALLERY] clicked entry: {clicked_label!r}")
+        await page.wait_for_timeout(1800)
+    else:
+        scraper_logger.info("[GALLERY] no 'All' entry found to click")
 
-    now = len(await _tiles(page))
-    if now >= 3 and now >= before:
-        scraper_logger.info(f"[GALLERY] photo grid opened — {now} tiles")
+    # Confirm the viewer opened: real folder tabs now present.
+    if await _detect_categories(page):
+        await _dump_photo_dom(page, "viewer-open")
+        scraper_logger.info("[GALLERY] viewer opened (folder tabs present)")
         return True
-    if now >= 3:
-        scraper_logger.info(f"[GALLERY] tiles already present — {now}")
+
+    # Fallback: a flat gallery with tiles but no tab bar.
+    if len(await _tiles(page)) >= 3:
+        await _dump_photo_dom(page, "flat-open")
+        scraper_logger.info("[GALLERY] flat gallery (tiles, no tabs)")
         return True
 
     # ── diagnostic: report what's actually on the page when we can't open ──
@@ -1004,23 +1046,28 @@ async def _open_photos(page) -> bool:
 
 
 async def _detect_categories(page) -> list:
+    """Read the photo-viewer's folder tabs generically — whatever Google
+    shows for THIS business (Hairstyle, By owner, Exterior, Menu, Food &
+    drink, Street View & 360°, …). Deny-list removes pseudo-folders and the
+    place-panel nav tabs; everything else is a real folder. No allow-list,
+    so business-specific folders are never missed."""
     try:
         cats = await page.evaluate(r"""() => {
             const out = [], seen = new Set();
-            const KNOWN = ['exterior','interior','by owner','street view',
-              'street view & 360°','videos','menu','food & drink','vibe',
-              'from visitors','people','rooms','front','others','additional'];
+            const DENY = new Set([
+                'all','latest','overview','reviews','about','updates','',
+                'street view & 360°','street view & 360','street view',
+                'videos',
+            ]);
             const push = (t) => {
-                t = (t||'').trim(); if (!t || t.length > 30) return;
-                const k = t.toLowerCase(); if (seen.has(k)) return; seen.add(k);
-                out.push(t);
+                t = (t || '').trim();
+                if (!t || t.length > 40) return;
+                const k = t.toLowerCase();
+                if (DENY.has(k) || seen.has(k)) return;
+                seen.add(k); out.push(t);
             };
             document.querySelectorAll('[role="tab"]').forEach(el =>
                 push(el.innerText || el.getAttribute('aria-label')));
-            document.querySelectorAll('button[aria-label]').forEach(el => {
-                const l = (el.getAttribute('aria-label')||'').trim();
-                if (KNOWN.includes(l.toLowerCase())) push(l);
-            });
             return out;
         }""")
     except Exception:
