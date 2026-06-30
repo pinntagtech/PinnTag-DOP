@@ -793,6 +793,11 @@ async def scrape_menu(page: Page, state: WorkerState, dashboard: Dashboard) -> l
 # ── gallery helpers ───────────────────────────────────────────
 GALLERY_SCROLL_ROUNDS = 12
 
+# Per-business TOTAL cap (across all folders). With a per-folder cap of 15
+# this lands on a folder boundary: up to 4 full folders (4×15=60), then stop
+# opening more. Between-folders check only — no mid-folder interrupt needed.
+MAX_GALLERY_TOTAL = int(os.getenv("MAX_GALLERY_TOTAL", "60"))
+
 # Pseudo-folders handled by the catch-all pass — don't iterate as named folders.
 SKIP_CATS = {"all", "latest", ""}
 
@@ -1130,6 +1135,10 @@ async def scrape_gallery(page, state, dashboard,
     folders: list = []
     global_ids: set = set()        # shared → no repeats across any folder
 
+    # Per-folder bound is hard-clamped to 15; the per-business total cap
+    # (MAX_GALLERY_TOTAL) then stops opening new folders between folders.
+    max_per_folder = min(max_per_folder or 15, 15)
+
     if not already_open:
         if not await _open_photos(page):
             scraper_logger.warning("[GALLERY] No photos could be opened — skipping")
@@ -1147,6 +1156,11 @@ async def scrape_gallery(page, state, dashboard,
 
     # named-folder pass (keeps folder names for cover-priority)
     for idx, label in enumerate(cats):
+        if len(global_ids) >= MAX_GALLERY_TOTAL:
+            scraper_logger.info(
+                f"[GALLERY] business total cap {MAX_GALLERY_TOTAL} reached "
+                f"— skipping remaining folders")
+            break
         if progress_callback:
             await progress_callback("gallery", "folder_started", 0, 0,
                                     f"Scraping {label}", label)
@@ -1163,13 +1177,18 @@ async def scrape_gallery(page, state, dashboard,
 
     # catch-all "All" pass — picks up everything not already captured,
     # incl. businesses that only have an "All" folder. Shared global_ids
-    # guarantees no duplicates vs. the named folders above.
-    await _click_label(page, "All")
-    await page.wait_for_timeout(800)
-    leftover = GalleryFolder(folder_name="Photos")
-    await _harvest(page, leftover, global_ids, max_per_folder, "Photos (All)")
-    if leftover.media:
-        folders.append(leftover)
+    # guarantees no duplicates vs. the named folders above. Skip entirely
+    # if the business total cap was already reached by the named folders.
+    if len(global_ids) >= MAX_GALLERY_TOTAL:
+        scraper_logger.info(
+            f"[GALLERY] business total cap reached — skipping 'All' pass")
+    else:
+        await _click_label(page, "All")
+        await page.wait_for_timeout(800)
+        leftover = GalleryFolder(folder_name="Photos")
+        await _harvest(page, leftover, global_ids, max_per_folder, "Photos (All)")
+        if leftover.media:
+            folders.append(leftover)
 
     total = sum(len(f.media) for f in folders)
     scraper_logger.info(
