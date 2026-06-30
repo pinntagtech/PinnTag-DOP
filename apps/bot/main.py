@@ -164,7 +164,11 @@ async def lifespan(app: FastAPI):
     logger.info(f'Max reviews: {MAX_REVIEWS}')
     logger.info(f'Max gallery per folder: {MAX_GALLERY}')
     logger.info(f'Headless mode: {HEADLESS}')
-    logger.info(f"Browser: {BOT_BROWSER_CHANNEL or 'bundled Chromium'}")
+    logger.info(
+        f"Browser: channel={BOT_BROWSER_CHANNEL or 'none'} "
+        f"CHROME_PATH={os.getenv('CHROME_PATH', '').strip() or 'unset'} "
+        f"system_chrome={_detect_system_chrome() or 'none'}"
+    )
     logger.info(f'Log level: {LOG_LEVEL}')
 
     # Self-update runs BEFORE we kick off the poll loops. If it finds a
@@ -218,18 +222,87 @@ CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "")
 CHROME_PROFILE = os.getenv("CHROME_PROFILE", "Default")
 
 
-# Browser engine: bundled Chromium everywhere (Mac + Ubuntu) by default.
-# Set BOT_BROWSER_CHANNEL=chrome ONLY on a box where bundled Chromium
-# genuinely can't run — otherwise leave it unset. No per-OS forking.
+# Browser engine selection. Priority:
+#   1) BOT_BROWSER_CHANNEL  (e.g. 'chrome') — explicit channel hatch
+#   2) CHROME_PATH          — explicit executable override
+#   3) bundled Chromium     — IF actually installed (Mac, older Ubuntu);
+#                             gallery code relies on its clean place-card
+#                             landing, so it stays the default where present
+#   4) system Google Chrome — auto-detected; required on Ubuntu 26.04 where
+#                             bundled Chromium cannot be installed
+#   5) loud failure         — nothing usable found
 BOT_BROWSER_CHANNEL = os.getenv("BOT_BROWSER_CHANNEL", "").strip()
+
+_SYS_CHROME_CANDIDATES = (
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/opt/google/chrome/chrome",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+)
+
+
+def _detect_system_chrome() -> Optional[str]:
+    """Return a system Google Chrome path if one exists, else None.
+    CHROME_PATH env (if set) always wins."""
+    env = os.getenv("CHROME_PATH", "").strip()
+    if env:
+        return env
+    for path in _SYS_CHROME_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+_LAUNCH_LOGGED = False
 
 
 async def launch_browser(p, *, headless: bool, args: list):
-    """Single launch path for every scrape. Bundled Chromium unless
-    BOT_BROWSER_CHANNEL is set (e.g. 'chrome')."""
+    """Single launch path for every scrape. Resolves the browser by the
+    priority documented above so the SAME code runs on Mac (bundled) and
+    Ubuntu 26.04 (system Chrome) with no per-machine config."""
+    global _LAUNCH_LOGGED
     kwargs = dict(headless=headless, args=args)
+    chosen = None
+
     if BOT_BROWSER_CHANNEL:
+        # 1) explicit channel hatch
         kwargs["channel"] = BOT_BROWSER_CHANNEL
+        chosen = f"channel={BOT_BROWSER_CHANNEL}"
+    else:
+        env_path = os.getenv("CHROME_PATH", "").strip()
+        if env_path:
+            # 2) explicit executable override
+            kwargs["executable_path"] = env_path
+            chosen = f"system Chrome (CHROME_PATH={env_path})"
+        else:
+            # 3) bundled Chromium only if it's actually on disk
+            bundled_ok = False
+            try:
+                bundled = p.chromium.executable_path
+                bundled_ok = bool(bundled) and os.path.exists(bundled)
+            except Exception:
+                bundled_ok = False
+            if bundled_ok:
+                chosen = "bundled Chromium"
+            else:
+                # 4) system Chrome fallback (Ubuntu 26.04)
+                sys_chrome = _detect_system_chrome()
+                if sys_chrome:
+                    kwargs["executable_path"] = sys_chrome
+                    chosen = f"system Chrome ({sys_chrome})"
+                else:
+                    # 5) loud fail — clearer than Playwright's stack trace
+                    raise RuntimeError(
+                        "No usable browser found: bundled Chromium is not "
+                        "installed and no system Google Chrome was detected. "
+                        "Install Google Chrome (Ubuntu 26.04) or run "
+                        "`playwright install chromium`."
+                    )
+
+    if not _LAUNCH_LOGGED:
+        logger.info(f"[BROWSER] using {chosen}")
+        _LAUNCH_LOGGED = True
+
     return await p.chromium.launch(**kwargs)
 
 SKIP_FOLDERS = {
