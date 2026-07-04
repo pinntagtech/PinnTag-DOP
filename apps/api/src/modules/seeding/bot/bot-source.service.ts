@@ -1,9 +1,6 @@
 import { Injectable, Logger, HttpException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  S3Client,
-  GetObjectCommand,
-} from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { createHash } from 'crypto';
 import { Readable } from 'stream';
 
@@ -18,6 +15,8 @@ export const BOT_SOURCE_WHITELIST = [
   'version.json',
   'update.sh',
   'update.ps1',
+  'install.sh',
+  'install.ps1',
 ] as const;
 
 export type BotSourceFile = (typeof BOT_SOURCE_WHITELIST)[number];
@@ -72,13 +71,8 @@ export class BotSourceService {
       version = String(parsed.version || '').trim();
       if (!version) throw new Error('empty version');
     } catch (err: any) {
-      this.logger.error(
-        `[BOT_SOURCE] version.json malformed: ${err.message}`,
-      );
-      throw new HttpException(
-        'Bot source version.json is malformed',
-        502,
-      );
+      this.logger.error(`[BOT_SOURCE] version.json malformed: ${err.message}`);
+      throw new HttpException('Bot source version.json is malformed', 502);
     }
 
     const files: { name: BotSourceFile; sha256: string }[] = [];
@@ -116,8 +110,7 @@ export class BotSourceService {
         new GetObjectCommand({ Bucket: this.bucket, Key: key }),
       );
       const body = await this.streamToBuffer(out.Body as Readable);
-      const contentType =
-        out.ContentType || this.guessContentType(name);
+      const contentType = out.ContentType || this.guessContentType(name);
       return { body, contentType };
     } catch (err: any) {
       const code = err?.name || err?.Code || '';

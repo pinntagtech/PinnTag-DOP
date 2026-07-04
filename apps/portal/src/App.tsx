@@ -14,8 +14,10 @@ import AuditLogsPage from './pages/AuditLogsPage';
 import LocationsPage from './pages/LocationsPage';
 import StagingToProdPage from './pages/StagingToProdPage';
 import DbSyncPage from './pages/DbSyncPage';
+import GatedMigrationPage from './pages/GatedMigrationPage';
 import DataRepairPage from './pages/DataRepairPage';
 import ResolveBusinessPage from './pages/ResolveBusinessPage';
+import MissingCoversPage from './pages/MissingCoversPage';
 
 export default function App() {
   return (
@@ -50,6 +52,16 @@ export default function App() {
                 requiredRole={['super_admin', 'admin']}
               >
                 <DbSyncPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="gated-migration"
+            element={
+              <ProtectedRoute
+                requiredRole={['super_admin', 'admin']}
+              >
+                <GatedMigrationPage />
               </ProtectedRoute>
             }
           />
@@ -100,6 +112,16 @@ export default function App() {
                 requiredRole={['super_admin', 'admin']}
               >
                 <ResolveBusinessPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="missing-covers"
+            element={
+              <ProtectedRoute
+                requiredRole={['super_admin', 'admin', 'operator']}
+              >
+                <MissingCoversPage />
               </ProtectedRoute>
             }
           />

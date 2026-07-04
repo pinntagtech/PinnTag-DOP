@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Layers, Building2, MapPin,
   Calendar, UtensilsCrossed, Image, ShieldCheck,
   Sparkles, Send, Server, Users, ClipboardList, Trophy,
-  ArrowRightLeft, Database, Wrench, Globe,
+  ArrowRightLeft, Database, Wrench, Globe, ImageOff,
 } from 'lucide-react';
 import { useEnvironment } from '../../contexts/EnvironmentContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -15,6 +15,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/coverage': 'Coverage',
   '/staging-to-prod': 'Staging → Prod',
   '/db-sync': 'DB Sync',
+  '/gated-migration': 'Gated Migration',
   '/sessions': 'Seeding sessions',
   '/businesses': 'Businesses',
   '/outlets': 'Outlets',
@@ -31,6 +32,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/audit-logs': 'Audit logs',
   '/data-repair': 'Data Repair',
   '/resolve-business': 'Resolve from Google',
+  '/missing-covers': 'Missing Covers',
 };
 
 const ENV_STYLES: Record<
@@ -299,6 +301,14 @@ export default function Layout() {
               label="DB Sync"
             />
           )}
+          {(user?.role === 'super_admin' ||
+            user?.role === 'admin') && (
+            <SidebarItem
+              to="/gated-migration"
+              icon={<ArrowRightLeft size={15} />}
+              label="Gated Migration"
+            />
+          )}
 
           <p style={sectionLabelStyle}>Data</p>
           <SidebarItem
@@ -391,6 +401,15 @@ export default function Layout() {
               to="/resolve-business"
               icon={<Globe size={15} />}
               label="Resolve from Google"
+            />
+          )}
+          {(user?.role === 'super_admin' ||
+            user?.role === 'admin' ||
+            user?.role === 'operator') && (
+            <SidebarItem
+              to="/missing-covers"
+              icon={<ImageOff size={15} />}
+              label="Missing Covers"
             />
           )}
         </nav>

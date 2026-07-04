@@ -472,12 +472,22 @@ export class SeedingController {
   @Post('sessions/:id/reset')
   async resetSession(
     @Param('id') id: string,
-    @Body('adminPassword') adminPassword: string,
+    @Body() body: { adminPassword: string; dryRun?: boolean },
     @Request() req: any,
   ) {
     const actor = req.user?.name || 'Operator';
-    await this.pipelineService.resetSession(id, actor, adminPassword);
-    return { message: 'Session reset to draft' };
+    const dryRun = !!body?.dryRun;
+    await this.pipelineService.resetSession(
+      id,
+      actor,
+      body?.adminPassword,
+      dryRun,
+    );
+    return {
+      message: dryRun
+        ? 'Dry-run complete — see [PURGE-DRYRUN] logs for counts'
+        : 'Session reset to draft',
+    };
   }
 
   @Post('sessions/:id/reset-bot')
@@ -748,6 +758,42 @@ export class SeedingController {
       actor,
       recordIds: body.recordIds,
       conflictResolution: body.conflictResolution,
+    });
+  }
+
+  // ── Gated cross-session migration (staging → target) ──────────────────
+  @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN)
+  @Post('migration/gated/preview')
+  async previewGatedMigration(
+    @Body() body: { targetEnvironment: string },
+    @Request() req: any,
+  ) {
+    const actor = req.user?.name || 'Operator';
+    return this.migrationService.previewGatedMigration(
+      body.targetEnvironment,
+      actor,
+    );
+  }
+
+  @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN)
+  @Post('migration/gated/apply')
+  async applyGatedMigration(
+    @Body()
+    body: {
+      targetEnvironment: string;
+      adminPassword?: string;
+      conflictMode?: 'skip' | 'overwrite';
+      limit?: number;
+    },
+    @Request() req: any,
+  ) {
+    const actor = req.user?.name || 'Operator';
+    return this.migrationService.migrateGated({
+      targetEnvironment: body.targetEnvironment,
+      actor,
+      adminPassword: body.adminPassword,
+      conflictMode: body.conflictMode,
+      limit: body.limit,
     });
   }
 

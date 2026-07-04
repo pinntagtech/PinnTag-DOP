@@ -78,6 +78,9 @@ export interface PreviewReport {
   environment: string;
   totals: {
     targeted: number;
+    eligible: number;
+    excluded: number;
+    excludedByReason: Record<string, number>;
     toPatch: number;
     alreadySynced: number;
     assertionFailed: number;
@@ -130,6 +133,439 @@ export class DbSyncService {
       throw new Error(`No URI configured for: ${environment}`);
     }
     return uri;
+  }
+
+  // ── Taxonomy remap (source-id → target-id by name) ────────────────────
+  // Business docs in pre-prod / prod may hold industry/category ObjectIds
+  // that only exist in the source (staging) taxonomy. At sync time we
+  // read the name behind each source id and find-or-create the same name
+  // in the target's taxonomy collections, then rewrite the business ids
+  // to the target's own. Mirrors PostPublishService's semantics.
+
+  private escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private getTaxonomyModels(conn: mongoose.Connection): {
+    IndustryModel: mongoose.Model<any>;
+    CategoryModel: mongoose.Model<any>;
+  } {
+    const IndustryModel: mongoose.Model<any> =
+      conn.models['BusinessIndustry'] ||
+      conn.model(
+        'BusinessIndustry',
+        new mongoose.Schema(
+          { name: String, title: String },
+          { collection: 'businessindustries', strict: false },
+        ),
+      );
+    const CategoryModel: mongoose.Model<any> =
+      conn.models['BusinessCategory'] ||
+      conn.model(
+        'BusinessCategory',
+        new mongoose.Schema(
+          {
+            name: String,
+            title: String,
+            industry: { type: mongoose.Schema.Types.ObjectId },
+          },
+          { collection: 'businesscategories', strict: false },
+        ),
+      );
+    return { IndustryModel, CategoryModel };
+  }
+
+  private async resolveTaxonomyForTarget(
+    live: Record<string, any>,
+    sourceConn: mongoose.Connection,
+    targetConn: mongoose.Connection,
+    opts: { dryRun?: boolean } = {},
+  ): Promise<{
+    businessIndustry?: mongoose.Types.ObjectId;
+    businessCategories?: mongoose.Types.ObjectId[];
+    pendingIndustryCreate?: string;
+    pendingCategoryCreates?: string[];
+  } | null> {
+    const dryRun = !!opts.dryRun;
+    const src = this.getTaxonomyModels(sourceConn);
+    const tgt = this.getTaxonomyModels(targetConn);
+
+    const result: {
+      businessIndustry?: mongoose.Types.ObjectId;
+      businessCategories?: mongoose.Types.ObjectId[];
+      pendingIndustryCreate?: string;
+      pendingCategoryCreates?: string[];
+    } = {};
+
+    // ── Industry ─────────────────────────────────────────────
+    let resolvedIndustryId: mongoose.Types.ObjectId | undefined;
+    const srcIndustryId = live.businessIndustry;
+    if (srcIndustryId) {
+      const srcDoc = (await src.IndustryModel.findById(
+        srcIndustryId,
+      ).lean()) as any;
+      if (!srcDoc) {
+        this.logger.warn(
+          `[SYNC-TAX] Source industry ${String(srcIndustryId)} not found for ` +
+            `business ${String(live._id)} — leaving field untouched`,
+        );
+      } else {
+        const name = String(srcDoc.name ?? srcDoc.title ?? '').trim();
+        if (!name) {
+          this.logger.warn(
+            `[SYNC-TAX] Source industry ${String(srcIndustryId)} has empty ` +
+              `name — leaving field untouched`,
+          );
+        } else {
+          const pattern = new RegExp(`^${this.escapeRegex(name)}$`, 'i');
+          const tgtDoc = (await tgt.IndustryModel.findOne({
+            $or: [{ name: pattern }, { title: pattern }],
+          }).lean()) as any;
+          if (tgtDoc) {
+            resolvedIndustryId = tgtDoc._id;
+          } else if (dryRun) {
+            result.pendingIndustryCreate = name;
+          } else {
+            const created = await tgt.IndustryModel.create({
+              name,
+              title: name,
+            });
+            resolvedIndustryId = created._id;
+            this.logger.warn(`[SYNC-TAX] Created target industry: ${name}`);
+          }
+          if (
+            resolvedIndustryId &&
+            String(resolvedIndustryId) !== String(srcIndustryId)
+          ) {
+            result.businessIndustry = resolvedIndustryId;
+          }
+        }
+      }
+    }
+
+    // ── Categories ───────────────────────────────────────────
+    if (
+      Array.isArray(live.businessCategories) &&
+      live.businessCategories.length
+    ) {
+      const resolvedIds: mongoose.Types.ObjectId[] = [];
+      const seen = new Set<string>();
+      const pendingCreates: string[] = [];
+      let anyChanged = false;
+      let anyUnresolved = false;
+
+      for (const srcId of live.businessCategories) {
+        const srcDoc = (await src.CategoryModel.findById(srcId).lean()) as any;
+        if (!srcDoc) {
+          this.logger.warn(
+            `[SYNC-TAX] Source category ${String(srcId)} not found for ` +
+              `business ${String(live._id)} — preserving original id`,
+          );
+          const key = String(srcId);
+          if (!seen.has(key)) {
+            seen.add(key);
+            resolvedIds.push(srcId);
+          }
+          continue;
+        }
+        const name = String(srcDoc.name ?? srcDoc.title ?? '').trim();
+        if (!name) {
+          this.logger.warn(
+            `[SYNC-TAX] Source category ${String(srcId)} has empty name — ` +
+              `preserving original id`,
+          );
+          const key = String(srcId);
+          if (!seen.has(key)) {
+            seen.add(key);
+            resolvedIds.push(srcId);
+          }
+          continue;
+        }
+
+        const pattern = new RegExp(`^${this.escapeRegex(name)}$`, 'i');
+        const tgtDoc = (await tgt.CategoryModel.findOne({
+          $or: [{ name: pattern }, { title: pattern }],
+        }).lean()) as any;
+
+        let targetCatId: mongoose.Types.ObjectId | undefined;
+        if (tgtDoc) {
+          targetCatId = tgtDoc._id;
+        } else if (dryRun) {
+          pendingCreates.push(name);
+          anyUnresolved = true;
+          const key = String(srcId);
+          if (!seen.has(key)) {
+            seen.add(key);
+            resolvedIds.push(srcId);
+          }
+          continue;
+        } else {
+          const createPayload: Record<string, any> = { name, title: name };
+          if (resolvedIndustryId) {
+            createPayload.industry = resolvedIndustryId;
+          }
+          const created = await tgt.CategoryModel.create(createPayload);
+          targetCatId = created._id;
+          this.logger.warn(`[SYNC-TAX] Created target category: ${name}`);
+        }
+
+        if (String(targetCatId) !== String(srcId)) anyChanged = true;
+        const key = String(targetCatId);
+        if (!seen.has(key)) {
+          seen.add(key);
+          resolvedIds.push(targetCatId as mongoose.Types.ObjectId);
+        }
+      }
+
+      // Only rewrite the array when all entries resolved cleanly. In dryRun
+      // with pending creates we can't produce a valid target array yet —
+      // report the pending creates and leave the field for apply.
+      if (!anyUnresolved && anyChanged) {
+        result.businessCategories = resolvedIds;
+      }
+      if (pendingCreates.length) {
+        result.pendingCategoryCreates = pendingCreates;
+      }
+    }
+
+    if (
+      !result.businessIndustry &&
+      !result.businessCategories &&
+      !result.pendingIndustryCreate &&
+      !(result.pendingCategoryCreates && result.pendingCategoryCreates.length)
+    ) {
+      return null;
+    }
+    return result;
+  }
+
+  // ── Prod-eligibility gate (read-only, batched) ────────────────────────
+  // Applied AFTER resolveScope + AFTER target conn open, BEFORE the
+  // per-business patch loop. Restricts sync to businesses that pass ALL
+  // of the criteria below; excluded ones report their first-failure
+  // reason so operators can see why the raw scope shrunk.
+  //
+  // Criteria (in evaluation order — first failure wins):
+  //   active_outlet     — isActive & activatedOutletsLength ≥ 1
+  //   real_cover        — cover matches media-staging.pinntag.com
+  //                       (not empty, not googleusercontent, not the
+  //                       SEED_DEFAULT_COVER placeholder)
+  //   real_hours        — resolveStatus.hours === 'done' AND hoursRaw
+  //                       array non-empty
+  //   taxonomy_present  — businessIndustry set AND businessCategories
+  //                       non-empty (the resolver remaps the ids at
+  //                       patch time — this only checks presence)
+  //   valid_address     — addressLine1 non-empty, not a URL/phone; city
+  //                       non-empty, not "*county*"
+  //   singleton_placeId — placeId present AND appears exactly once
+  //                       across the scope's target docs (dupes get
+  //                       ALL copies excluded)
+  //   domestic_coords   — coords finite, not (0,0); country == US (if
+  //                       set) AND within US bbox
+
+  private static readonly US_LAT_MIN = 24;
+  private static readonly US_LAT_MAX = 50;
+  private static readonly US_LNG_MIN = -125;
+  private static readonly US_LNG_MAX = -66;
+  private static readonly URL_RE = /^\s*(https?:\/\/|www\.)/i;
+  private static readonly PHONE_RE = /^\+?[\d\s\-().]{7,}$/;
+  private static readonly COUNTY_RE = /county/i;
+  private static readonly GOOGLE_HOST_RE = /googleusercontent/i;
+  private static readonly MEDIA_STAGING_RE = /media-staging\.pinntag\.com/i;
+
+  private isFiniteNumber(v: any): v is number {
+    return typeof v === 'number' && Number.isFinite(v);
+  }
+
+  private extractCoords(
+    doc: Record<string, any>,
+  ): { lat: number; lng: number } | null {
+    // Try common shapes: {latitude, longitude}, {lat, lng}, or
+    // location.coordinates = [lng, lat] (GeoJSON).
+    const lat =
+      this.isFiniteNumber(doc.latitude)
+        ? doc.latitude
+        : this.isFiniteNumber(doc.lat)
+          ? doc.lat
+          : this.isFiniteNumber(doc?.location?.coordinates?.[1])
+            ? doc.location.coordinates[1]
+            : null;
+    const lng =
+      this.isFiniteNumber(doc.longitude)
+        ? doc.longitude
+        : this.isFiniteNumber(doc.lng)
+          ? doc.lng
+          : this.isFiniteNumber(doc?.location?.coordinates?.[0])
+            ? doc.location.coordinates[0]
+            : null;
+    if (lat === null || lng === null) return null;
+    return { lat, lng };
+  }
+
+  private evaluateEligibility(
+    doc: Record<string, any> | undefined,
+    placeIdCounts: Map<string, number>,
+  ): { ok: true } | { ok: false; reason: string } {
+    if (!doc) return { ok: false, reason: 'missing_target_doc' };
+
+    // 1. active_outlet
+    if (
+      !(doc.isActive === true) ||
+      !(
+        typeof doc.activatedOutletsLength === 'number' &&
+        doc.activatedOutletsLength >= 1
+      )
+    ) {
+      return { ok: false, reason: 'active_outlet' };
+    }
+
+    // 2. real_cover
+    const cover = typeof doc.cover === 'string' ? doc.cover : '';
+    if (
+      !cover ||
+      cover === SEED_DEFAULT_COVER ||
+      DbSyncService.GOOGLE_HOST_RE.test(cover) ||
+      !DbSyncService.MEDIA_STAGING_RE.test(cover)
+    ) {
+      return { ok: false, reason: 'real_cover' };
+    }
+
+    // 3. real_hours
+    const rs = doc.resolveStatus;
+    if (
+      !rs ||
+      rs.hours !== 'done' ||
+      !Array.isArray(rs.hoursRaw) ||
+      rs.hoursRaw.length === 0
+    ) {
+      return { ok: false, reason: 'real_hours' };
+    }
+
+    // 4. taxonomy_present
+    if (
+      !doc.businessIndustry ||
+      !Array.isArray(doc.businessCategories) ||
+      doc.businessCategories.length === 0
+    ) {
+      return { ok: false, reason: 'taxonomy_present' };
+    }
+
+    // 5. valid_address
+    const rawAddr =
+      typeof doc.addressLine1 === 'string' ? doc.addressLine1.trim() : '';
+    if (
+      !rawAddr ||
+      DbSyncService.URL_RE.test(rawAddr) ||
+      DbSyncService.PHONE_RE.test(rawAddr)
+    ) {
+      return { ok: false, reason: 'valid_address' };
+    }
+    const city = typeof doc.city === 'string' ? doc.city.trim() : '';
+    if (!city || DbSyncService.COUNTY_RE.test(city)) {
+      return { ok: false, reason: 'valid_address' };
+    }
+
+    // 6. singleton_placeId
+    const placeId = typeof doc.placeId === 'string' ? doc.placeId.trim() : '';
+    if (!placeId) return { ok: false, reason: 'singleton_placeId' };
+    if ((placeIdCounts.get(placeId) ?? 0) > 1) {
+      return { ok: false, reason: 'singleton_placeId' };
+    }
+
+    // 7. domestic_coords
+    const coords = this.extractCoords(doc);
+    if (!coords) return { ok: false, reason: 'domestic_coords' };
+    if (coords.lat === 0 && coords.lng === 0) {
+      return { ok: false, reason: 'domestic_coords' };
+    }
+    const country =
+      typeof doc.country === 'string' ? doc.country.trim() : '';
+    if (country && country.toLowerCase() !== 'united states') {
+      return { ok: false, reason: 'domestic_coords' };
+    }
+    if (
+      coords.lat < DbSyncService.US_LAT_MIN ||
+      coords.lat > DbSyncService.US_LAT_MAX ||
+      coords.lng < DbSyncService.US_LNG_MIN ||
+      coords.lng > DbSyncService.US_LNG_MAX
+    ) {
+      return { ok: false, reason: 'domestic_coords' };
+    }
+
+    return { ok: true };
+  }
+
+  private async filterEligible(
+    scope: Array<{ publishedId: string; sessionId: string; recordId: string }>,
+    BusinessModel: Model<any>,
+  ): Promise<{
+    eligible: typeof scope;
+    excluded: { total: number; byReason: Record<string, number> };
+  }> {
+    const byReason: Record<string, number> = {};
+    const bump = (r: string) => {
+      byReason[r] = (byReason[r] ?? 0) + 1;
+    };
+
+    if (!scope.length) {
+      return { eligible: [], excluded: { total: 0, byReason } };
+    }
+
+    const objectIds = scope
+      .map((s) => s.publishedId)
+      .filter((id) => mongoose.isValidObjectId(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
+
+    // Single batched load — only the fields the gate reads.
+    const docs = (await BusinessModel.find(
+      { _id: { $in: objectIds } },
+      {
+        _id: 1,
+        isActive: 1,
+        activatedOutletsLength: 1,
+        cover: 1,
+        resolveStatus: 1,
+        businessIndustry: 1,
+        businessCategories: 1,
+        addressLine1: 1,
+        city: 1,
+        placeId: 1,
+        country: 1,
+        latitude: 1,
+        longitude: 1,
+        lat: 1,
+        lng: 1,
+        location: 1,
+      },
+    ).lean()) as any[];
+
+    const byId = new Map<string, Record<string, any>>();
+    for (const d of docs) byId.set(String(d._id), d);
+
+    // placeId → count map over the scope's target docs (dupes get ALL
+    // copies excluded).
+    const placeIdCounts = new Map<string, number>();
+    for (const d of docs) {
+      const p = typeof d.placeId === 'string' ? d.placeId.trim() : '';
+      if (!p) continue;
+      placeIdCounts.set(p, (placeIdCounts.get(p) ?? 0) + 1);
+    }
+
+    const eligible: typeof scope = [];
+    for (const item of scope) {
+      const doc = byId.get(item.publishedId);
+      const verdict = this.evaluateEligibility(doc, placeIdCounts);
+      if (verdict.ok) {
+        eligible.push(item);
+      } else {
+        bump(verdict.reason);
+      }
+    }
+
+    return {
+      eligible,
+      excluded: { total: scope.length - eligible.length, byReason },
+    };
   }
 
   // ── STEP 2 — scope resolver ───────────────────────────────────────────
@@ -410,6 +846,14 @@ export class DbSyncService {
 
     const targetUri = this.resolveTargetUri(environment);
     const conn = await mongoose.createConnection(targetUri).asPromise();
+    // Source (staging) conn — only needed when target ≠ staging, since
+    // staging ids are already target-correct for a staging→staging sync.
+    const sourceConn: mongoose.Connection | null =
+      environment === 'staging'
+        ? null
+        : await mongoose
+            .createConnection(this.resolveTargetUri('staging'))
+            .asPromise();
     const diffs: BusinessDiff[] = [];
 
     try {
@@ -426,6 +870,15 @@ export class DbSyncService {
         conn.models['BusinessUser'] ||
         conn.model('BusinessUser', LOOSE_SCHEMA, 'businessusers');
 
+      // Prod-eligibility gate — restricts the sync to businesses that
+      // pass the 7 quality criteria. Reports first-failure reasons in
+      // `excludedByReason` for operator visibility.
+      const { eligible: eligibleScope, excluded } = await this.filterEligible(
+        scope,
+        BusinessModel,
+      );
+      const eligibleScopeIds = eligibleScope.map((s) => s.publishedId);
+
       const pinntagEmail = this.configService.get<string>(
         'app.pinntagBusinessUserEmail',
       );
@@ -435,13 +888,13 @@ export class DbSyncService {
             .lean()
         : null;
 
-      // alreadySynced lookup in one query
+      // alreadySynced lookup in one query (over the eligible subset only)
       const stateRows = await this.stateModel
         .find({
           environment,
           syncVersion: DOP_SYNC_VERSION,
           businessId: {
-            $in: scopeIds
+            $in: eligibleScopeIds
               .filter((id) => mongoose.isValidObjectId(id))
               .map((id) => new mongoose.Types.ObjectId(id)),
           },
@@ -457,7 +910,7 @@ export class DbSyncService {
       let missing = 0;
       let toPatch = 0;
 
-      for (const item of scope) {
+      for (const item of eligibleScope) {
         const { publishedId, sessionId, recordId } = item;
 
         if (syncedSet.has(publishedId)) {
@@ -516,7 +969,43 @@ export class DbSyncService {
         const businessSet = systemUserId
           ? this.computeBusinessSet(live, systemUserId)
           : this.computeBusinessSet(live, live._id);
+
+        // Taxonomy remap (read-only in preview): if any source id needs
+        // to be rewritten to the target's own id (found or would-create),
+        // merge the target ids into businessSet so they surface in the diff.
+        let taxResult: Awaited<
+          ReturnType<typeof this.resolveTaxonomyForTarget>
+        > = null;
+        if (sourceConn) {
+          try {
+            taxResult = await this.resolveTaxonomyForTarget(
+              live,
+              sourceConn,
+              conn,
+              { dryRun: true },
+            );
+            if (taxResult?.businessIndustry) {
+              (businessSet as any).businessIndustry = taxResult.businessIndustry;
+            }
+            if (taxResult?.businessCategories) {
+              (businessSet as any).businessCategories =
+                taxResult.businessCategories;
+            }
+          } catch (err: any) {
+            this.logger.warn(
+              `[SYNC-TAX] preview resolver failed for ${publishedId}: ${err?.message}`,
+            );
+          }
+        }
         const changedFields = Object.keys(businessSet);
+        if (taxResult?.pendingIndustryCreate) {
+          changedFields.push('businessIndustry:create');
+        }
+        if (taxResult?.pendingCategoryCreates?.length) {
+          for (const n of taxResult.pendingCategoryCreates) {
+            changedFields.push(`category:create:${n}`);
+          }
+        }
 
         // Outlets diff
         const outlets = await OutletModel.find({
@@ -588,10 +1077,16 @@ export class DbSyncService {
         });
       }
 
-      const coverageGap = await this.coverageCheck(environment, scopeIds);
+      const coverageGap = await this.coverageCheck(
+        environment,
+        eligibleScopeIds,
+      );
 
       const totals = {
-        targeted: scope.length,
+        targeted: scope.length, // raw scope size (all published)
+        eligible: eligibleScope.length,
+        excluded: excluded.total,
+        excludedByReason: excluded.byReason,
         toPatch,
         alreadySynced,
         assertionFailed,
@@ -620,6 +1115,7 @@ export class DbSyncService {
       };
     } finally {
       await conn.close();
+      if (sourceConn) await sourceConn.close();
     }
   }
 
@@ -646,6 +1142,13 @@ export class DbSyncService {
 
     const targetUri = this.resolveTargetUri(environment);
     const conn = await mongoose.createConnection(targetUri).asPromise();
+    // Source (staging) conn — see previewSync for the reasoning.
+    const sourceConn: mongoose.Connection | null =
+      environment === 'staging'
+        ? null
+        : await mongoose
+            .createConnection(this.resolveTargetUri('staging'))
+            .asPromise();
 
     const results: ApplyReport['results'] = [];
     let patchedCount = 0;
@@ -677,6 +1180,13 @@ export class DbSyncService {
         conn.models['BusinessUser'] ||
         conn.model('BusinessUser', LOOSE_SCHEMA, 'businessusers');
 
+      // Prod-eligibility gate — same as previewSync, applied before the
+      // batched patch loop so we never write anything for excluded ids.
+      const { eligible: eligibleScope, excluded } = await this.filterEligible(
+        scope,
+        BusinessModel,
+      );
+
       const pinntagEmail = this.configService.get<string>(
         'app.pinntagBusinessUserEmail',
       );
@@ -686,8 +1196,8 @@ export class DbSyncService {
             .lean()
         : null;
 
-      for (let i = 0; i < scope.length; i += BATCH_SIZE) {
-        const batch = scope.slice(i, i + BATCH_SIZE);
+      for (let i = 0; i < eligibleScope.length; i += BATCH_SIZE) {
+        const batch = eligibleScope.slice(i, i + BATCH_SIZE);
 
         // Re-check synced state per batch so resumed runs see fresh markers.
         const batchIds = batch
@@ -756,6 +1266,32 @@ export class DbSyncService {
             const systemUserId =
               this.resolveSystemUserId(pinntagUser, live) || live._id;
             const businessSet = this.computeBusinessSet(live, systemUserId);
+
+            // Taxonomy remap (find-or-create on target). Runs before the
+            // $set below so remapped businessIndustry/businessCategories
+            // land in the same single updateOne call.
+            if (sourceConn) {
+              try {
+                const taxResult = await this.resolveTaxonomyForTarget(
+                  live,
+                  sourceConn,
+                  conn,
+                  { dryRun: false },
+                );
+                if (taxResult?.businessIndustry) {
+                  (businessSet as any).businessIndustry =
+                    taxResult.businessIndustry;
+                }
+                if (taxResult?.businessCategories) {
+                  (businessSet as any).businessCategories =
+                    taxResult.businessCategories;
+                }
+              } catch (err: any) {
+                this.logger.warn(
+                  `[SYNC-TAX] apply resolver failed for ${publishedId}: ${err?.message}`,
+                );
+              }
+            }
             const changedFields: string[] = Object.keys(businessSet);
 
             // Apply business $set if non-empty
@@ -894,18 +1430,21 @@ export class DbSyncService {
 
         this.logger.log(
           `[SYNC] Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(
-            scope.length / BATCH_SIZE,
+            eligibleScope.length / BATCH_SIZE,
           )} done`,
         );
       }
 
       const coverageGap = await this.coverageCheck(
         environment,
-        scope.map((s) => s.publishedId),
+        eligibleScope.map((s) => s.publishedId),
       );
 
       const totals = {
-        targeted: scope.length,
+        targeted: scope.length, // raw scope size (all published)
+        eligible: eligibleScope.length,
+        excluded: excluded.total,
+        excludedByReason: excluded.byReason,
         toPatch: patchedCount + failedCount, // attempted
         alreadySynced,
         assertionFailed,
@@ -935,6 +1474,7 @@ export class DbSyncService {
       throw err;
     } finally {
       await conn.close();
+      if (sourceConn) await sourceConn.close();
     }
   }
 

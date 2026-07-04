@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import mongoose from 'mongoose';
 import { SeedingSessionService } from './seeding-session.service';
@@ -732,12 +732,13 @@ export class SeedingPipelineService {
     sessionId: string,
     actor: string,
     adminPassword: string,
+    dryRun = false,
   ): Promise<void> {
     this.verifyAdminPassword(adminPassword);
 
     const session = await this.sessionService.findById(sessionId);
     const targetUri = this.resolveTargetUri(session.environment);
-    const targetConn = mongoose.createConnection(targetUri);
+    const targetConn = await mongoose.createConnection(targetUri).asPromise();
 
     try {
       const publishedRecords = await this.recordService.findBySession(
@@ -745,115 +746,34 @@ export class SeedingPipelineService {
         { status: SeedingRecordStatus.PUBLISHED },
       );
 
+      const businessOids: mongoose.Types.ObjectId[] = [];
+      const nonBusinessPublished: typeof publishedRecords = [];
       for (const record of publishedRecords) {
-        if (record.publishedId) {
-          const collectionName = MODULE_COLLECTION_MAP[record.module];
-          if (collectionName) {
-            const publishedOid = new mongoose.Types.ObjectId(
-              record.publishedId,
-            );
+        if (!record.publishedId) continue;
+        if (record.module === SeedingModules.BUSINESS) {
+          businessOids.push(new mongoose.Types.ObjectId(record.publishedId));
+        } else {
+          nonBusinessPublished.push(record);
+        }
+      }
 
-            if (record.module === SeedingModules.BUSINESS) {
-              // Bot-scraped data cleanup
-              const ReviewModel = targetConn.model(
-                'Review',
-                new mongoose.Schema({}, { strict: false }),
-                'reviews',
-              );
-              const MenuModel = targetConn.model(
-                'Menu',
-                new mongoose.Schema({}, { strict: false }),
-                'menus',
-              );
-              const FileModel = targetConn.model(
-                'File',
-                new mongoose.Schema({}, { strict: false }),
-                'files',
-              );
-              const FolderModel = targetConn.model(
-                'Folder',
-                new mongoose.Schema({}, { strict: false }),
-                'folders',
-              );
-              const DriveModel = targetConn.model(
-                'Drive',
-                new mongoose.Schema({}, { strict: false }),
-                'drives',
-              );
+      if (businessOids.length) {
+        await this.purgeBusinessData(targetConn, businessOids, { dryRun });
+      }
 
-              const businessDriveIds = await DriveModel
-                .find({
-                  owner: new mongoose.Types.ObjectId(record.publishedId),
-                })
-                .distinct('_id');
+      for (const record of nonBusinessPublished) {
+        const collectionName = MODULE_COLLECTION_MAP[record.module];
+        if (collectionName && !dryRun) {
+          const publishedOid = new mongoose.Types.ObjectId(record.publishedId);
+          await targetConn
+            .collection(collectionName)
+            .deleteOne({ _id: publishedOid });
+        }
+      }
 
-              await Promise.all([
-                targetConn
-                  .collection('outlets')
-                  .deleteMany({ business: publishedOid }),
-                targetConn
-                  .collection('events')
-                  .deleteMany({ businessProfile: publishedOid }),
-                targetConn
-                  .collection('eventlocations')
-                  .deleteMany({ businessProfile: publishedOid }),
-                targetConn
-                  .collection('eventschedules')
-                  .deleteMany({ businessId: publishedOid }),
-                targetConn
-                  .collection('follows')
-                  .deleteMany({ following: publishedOid }),
-                targetConn
-                  .collection('feeds')
-                  .deleteMany({ creator: publishedOid }),
-                targetConn
-                  .collection('drives')
-                  .deleteMany({ owner: publishedOid }),
-                targetConn
-                  .collection('folders')
-                  .deleteMany({ owner: publishedOid }),
-                targetConn
-                  .collection('subscriptions')
-                  .deleteMany({ business: publishedOid }),
-                targetConn
-                  .collection('creditwallets')
-                  .deleteMany({ business: publishedOid }),
-                ReviewModel.deleteMany({
-                  business: new mongoose.Types.ObjectId(record.publishedId),
-                }),
-                MenuModel.deleteMany({
-                  business: new mongoose.Types.ObjectId(record.publishedId),
-                }),
-                FileModel.deleteMany({
-                  parent: new mongoose.Types.ObjectId(record.publishedId),
-                }),
-                // Delete gallery subfolders (not the main Gallery folder
-                // which is deleted with the drive, but the bot-created
-                // subfolders inside it)
-                FolderModel.deleteMany({
-                  $and: [
-                    { drive: { $exists: true } },
-                    {
-                      folderName: {
-                        $nin: ['Gallery', 'Drive'],
-                      },
-                    },
-                    { drive: { $in: businessDriveIds } },
-                  ],
-                }),
-              ]);
-
-              this.logger.log(
-                `Cascade deleted bot data for business ${record.publishedId}: ` +
-                  `reviews, menus, files, gallery subfolders, credit wallet`,
-              );
-            }
-
-            await targetConn
-              .collection(collectionName)
-              .deleteOne({ _id: publishedOid });
-          }
-
+      if (!dryRun) {
+        for (const record of publishedRecords) {
+          if (!record.publishedId) continue;
           await this.logService.log({
             sessionId,
             recordId: String(record._id),
@@ -869,6 +789,8 @@ export class SeedingPipelineService {
     } finally {
       await targetConn.close();
     }
+
+    if (dryRun) return;
 
     await this.recordService.resetAllRecords(sessionId);
 
@@ -898,7 +820,7 @@ export class SeedingPipelineService {
   ): Promise<void> {
     this.verifyAdminPassword(adminPassword);
 
-    await this.resetSession(sessionId, actor, adminPassword);
+    await this.resetSession(sessionId, actor, adminPassword, false);
 
     await this.logService.deleteSessionLogs(sessionId);
     await this.recordService.deleteAllRecords(sessionId);
@@ -1057,6 +979,176 @@ export class SeedingPipelineService {
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Cascade-delete all data for the given target-DB business ids.
+   * Scoped strictly to businessObjectIds — cannot affect other businesses.
+   * Deviations from the main-app purgeBusinessData (intentional):
+   *   - Stripe cancellation is NOT called; instead we REFUSE to run if any
+   *     business is claimed or has a stripeSubscriptionId (DOP only deletes
+   *     seeded/unclaimed businesses with free subscriptions).
+   *   - Media (drives/folders/files) IS deleted here (main-app version omits
+   *     it); DOP must clean the publish + bot-scrape media it created.
+   *   - Files are deleted by drive/parentDirectory, not by `parent`
+   *     (file.parent is a BusinessUser, not the business).
+   */
+  private async purgeBusinessData(
+    targetConn: mongoose.Connection,
+    businessObjectIds: mongoose.Types.ObjectId[],
+    opts: { dryRun?: boolean } = {},
+  ): Promise<Record<string, number>> {
+    const dryRun = !!opts.dryRun;
+    const ids = businessObjectIds;
+    if (!ids.length) return {};
+
+    // ── SAFETY GUARD: refuse claimed / Stripe-backed businesses ──
+    const claimed = await targetConn
+      .collection('businesses')
+      .find(
+        { _id: { $in: ids }, isClaimed: true },
+        { projection: { _id: 1, name: 1 } },
+      )
+      .toArray();
+    const stripeBacked = await targetConn
+      .collection('subscriptions')
+      .find(
+        {
+          business: { $in: ids },
+          stripeSubscriptionId: { $exists: true, $nin: [null, ''] },
+        },
+        { projection: { business: 1, stripeSubscriptionId: 1 } },
+      )
+      .toArray();
+    if (claimed.length || stripeBacked.length) {
+      const cIds = claimed.map((b) => String(b._id));
+      const sIds = stripeBacked.map((s) => String(s.business));
+      throw new HttpException(
+        `purgeBusinessData refused: delete set contains claimed or ` +
+          `Stripe-backed businesses (claimed=[${cIds.join(',')}], ` +
+          `stripe=[${sIds.join(',')}]). DOP only deletes seeded/unclaimed ` +
+          `businesses. Aborting.`,
+        400,
+      );
+    }
+
+    // ── Media id gather (delete files/folders by these) ──
+    const driveIds = await targetConn
+      .collection('drives')
+      .distinct('_id', { owner: { $in: ids } });
+    const folderIds = await targetConn
+      .collection('folders')
+      .distinct('_id', {
+        $or: [{ owner: { $in: ids } }, { drive: { $in: driveIds } }],
+      });
+
+    // ── Collection + filter specs (audit this list against the real DB) ──
+    // PROVEN names (DOP already deletes these): events, eventlocations,
+    //   eventschedules, outlets, menus, reviews, subscriptions, creditwallets,
+    //   follows, feeds, drives, folders, files, businesses.
+    // INFERRED names (VERIFY before first real run): templates,
+    //   discardedschedules, pindrops, rewards, userrewards, rewardlocations,
+    //   rewardvisits, brands, businessactivations, businessinteractions,
+    //   creditledgers, departments, locationgroups, mobilespots,
+    //   ownershiptransferrecords, referralredemptions, regions, scratches,
+    //   transactions, consumerpurchases, referrals, checkins, checkinfeeds,
+    //   broadcasts, notifications, tempaititles, tokens, userrolemappings, roles.
+    const byBiz = { business: { $in: ids } };
+    const byBizProfile = { businessProfile: { $in: ids } };
+    const byBizId = { businessId: { $in: ids } };
+
+    const specs: { c: string; f: Record<string, any> }[] = [
+      // Event module
+      { c: 'events', f: byBizProfile },
+      { c: 'eventlocations', f: byBizProfile },
+      { c: 'eventschedules', f: byBizId },
+      { c: 'templates', f: byBizId },
+      { c: 'discardedschedules', f: byBizId },
+      { c: 'pindrops', f: byBiz },
+      // Outlet
+      { c: 'outlets', f: byBiz },
+      // Rewards
+      { c: 'rewards', f: byBizProfile },
+      { c: 'userrewards', f: byBizProfile },
+      { c: 'rewardlocations', f: byBiz },
+      { c: 'rewardvisits', f: byBiz },
+      // Business module
+      { c: 'brands', f: byBizId },
+      { c: 'businessactivations', f: byBiz },
+      { c: 'businessinteractions', f: byBiz },
+      { c: 'creditwallets', f: byBiz },
+      { c: 'creditledgers', f: byBiz },
+      { c: 'departments', f: byBiz },
+      { c: 'locationgroups', f: byBiz },
+      { c: 'menus', f: byBiz },
+      { c: 'mobilespots', f: byBiz },
+      { c: 'ownershiptransferrecords', f: byBiz },
+      { c: 'referralredemptions', f: byBiz },
+      { c: 'regions', f: byBiz },
+      { c: 'reviews', f: byBiz },
+      { c: 'scratches', f: byBiz },
+      // Subscription module
+      { c: 'subscriptions', f: byBiz },
+      { c: 'transactions', f: byBiz },
+      { c: 'consumerpurchases', f: byBiz },
+      { c: 'referrals', f: byBiz },
+      // Social
+      { c: 'follows', f: { following: { $in: ids } } },
+      { c: 'feeds', f: { creator: { $in: ids } } },
+      { c: 'checkins', f: byBiz },
+      { c: 'checkinfeeds', f: byBiz },
+      // Notifications
+      { c: 'broadcasts', f: byBiz },
+      { c: 'notifications', f: byBiz },
+      // AI
+      { c: 'tempaititles', f: byBiz },
+      // Auth
+      { c: 'tokens', f: byBizProfile },
+      // Roles (business-scoped)
+      { c: 'userrolemappings', f: byBiz },
+      { c: 'roles', f: byBiz },
+      // ── Media (RETAINED — main-app version omits these) ──
+      {
+        c: 'files',
+        f: {
+          $or: [
+            { drive: { $in: driveIds } },
+            { parentDirectory: { $in: folderIds } },
+          ],
+        },
+      },
+      {
+        c: 'folders',
+        f: { $or: [{ owner: { $in: ids } }, { drive: { $in: driveIds } }] },
+      },
+      { c: 'drives', f: { owner: { $in: ids } } },
+      // ── Business record itself (LAST) ──
+      { c: 'businesses', f: { _id: { $in: ids } } },
+    ];
+
+    const summary: Record<string, number> = {};
+    for (const { c, f } of specs) {
+      try {
+        if (dryRun) {
+          summary[c] = await targetConn.collection(c).countDocuments(f);
+        } else {
+          const res = await targetConn.collection(c).deleteMany(f);
+          summary[c] = res.deletedCount ?? 0;
+        }
+      } catch (err: any) {
+        this.logger.error(`[PURGE] ${c} failed: ${err?.message}`);
+        summary[c] = -1; // surface, don't silently swallow
+      }
+    }
+
+    this.logger.log(
+      `[PURGE${dryRun ? '-DRYRUN' : ''}] businesses=${ids.length} ` +
+        Object.entries(summary)
+          .filter(([, n]) => n !== 0)
+          .map(([c, n]) => `${c}=${n}`)
+          .join(' '),
+    );
+    return summary;
+  }
 
   private resolveTargetUri(environment: string): string {
     const uriKey =

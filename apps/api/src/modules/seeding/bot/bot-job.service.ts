@@ -78,11 +78,19 @@ export class BotJobService {
     // address-only search. For every other type, an absent placeId is
     // a scrape miss and we drop the record rather than enqueue a bad
     // job. The businessId requirement is universal.
+    const isResolve = payload.type === BotJobType.RESOLVE_BUSINESS;
     const docs = payload.records
-      .filter((r) =>
-        r.businessId &&
-        (r.placeId || payload.type === BotJobType.RESOLVE_BUSINESS),
-      )
+      .filter((r) => {
+        if (!r.businessId) return false;
+        if (isResolve) return true; // resolve runs from address alone
+        // Non-resolve jobs need a placeId + a non-empty name + environment;
+        // these are required by the dopBotJobs schema and by Maps lookup.
+        return (
+          !!r.placeId &&
+          !!(r.businessName && r.businessName.trim()) &&
+          !!(r.environment && r.environment.trim())
+        );
+      })
       .map((r) => ({
         placeId: r.placeId ?? '',
         businessId: r.businessId,
@@ -99,9 +107,23 @@ export class BotJobService {
         attempts: 0,
       }));
 
-    await this.botJobModel.insertMany(docs);
-    this.logger.log(`[JOBS] Created ${docs.length} ${payload.type} jobs`);
-    return { created: docs.length };
+    if (!docs.length) {
+      this.logger.warn(
+        `[JOBS] No eligible records for ${payload.type} — ` +
+          `${payload.records.length} submitted, 0 passed filter ` +
+          `(missing placeId/businessName/environment).`,
+      );
+      return { created: 0 };
+    }
+    const inserted = await this.botJobModel.insertMany(docs, {
+      ordered: false, // insert the good ones; don't abort on a single bad doc
+    });
+    const skipped = payload.records.length - inserted.length;
+    this.logger.log(
+      `[JOBS] Created ${inserted.length} ${payload.type} jobs` +
+        (skipped > 0 ? ` (${skipped} record(s) skipped)` : ''),
+    );
+    return { created: inserted.length };
   }
 
   async claimNextJob(

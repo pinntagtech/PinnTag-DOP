@@ -53,6 +53,8 @@ import { AddressParseController } from './address-parse/address-parse.controller
 import { FixBatchService } from './resolve/fix-batch.service';
 import { EmailNotifier } from './resolve/notifier';
 import { VerifyAndFixService } from './verify/verify-and-fix.service';
+import { CoverBackfillService } from './cover-backfill/cover-backfill.service';
+import { CoverBackfillController } from './cover-backfill/cover-backfill.controller';
 import { SeedingController } from './seeding.controller';
 import { AuthModule } from '../auth/auth.module';
 import { LocationsModule } from '../locations/locations.module';
@@ -81,6 +83,7 @@ import { LocationsModule } from '../locations/locations.module';
     CoverB2SyncController,
     AddressParseController,
     BotSourceController,
+    CoverBackfillController,
   ],
   providers: [
     SeedingLogService,
@@ -105,6 +108,7 @@ import { LocationsModule } from '../locations/locations.module';
     FixBatchService,
     EmailNotifier,
     VerifyAndFixService,
+    CoverBackfillService,
   ],
   exports: [
     SeedingSessionService,

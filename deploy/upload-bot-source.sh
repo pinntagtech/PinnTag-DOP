@@ -38,6 +38,8 @@ SOURCE_FILES=(
     version.json
     update.sh
     update.ps1
+    install.sh
+    install.ps1
 )
 
 for file in "${SOURCE_FILES[@]}"; do
