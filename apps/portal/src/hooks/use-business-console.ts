@@ -37,6 +37,17 @@ export type GateOverall =
   | 'failAny'
   | null;
 
+// Cohort segments map to seedProvenance.sources[] entries; server side
+// AND-s them into the seeded-only filter. The chip strip on the page
+// offers these plus an "All" that clears the field.
+export type CohortSource = 'crawler' | 'cvb' | 'manual_seeder';
+
+export const COHORT_LABELS: Record<CohortSource, string> = {
+  crawler: 'Crawler',
+  cvb: 'CVB',
+  manual_seeder: 'Manual seeder',
+};
+
 export interface ConsoleFilter {
   q?: string;
   state?: string[];
@@ -48,6 +59,7 @@ export interface ConsoleFilter {
   hasEmail?: boolean;
   duplicatePlaceIdOnly?: boolean;
   resolveHoursStatus?: string[];
+  cohort?: CohortSource;
   gateFails?: GateCriterion[];
   gatePasses?: GateCriterion[];
   gateOverall?: GateOverall;
@@ -178,5 +190,142 @@ export function useGateRecompute() {
         queryKey: ['console', 'freshness', vars.environment],
       });
     },
+  });
+}
+
+// ── Phase B: selection, actions, runs ─────────────────────────────────
+
+export type ConsoleSelection =
+  | { mode: 'ids'; ids: string[] }
+  | { mode: 'filter'; filter?: ConsoleFilter; excludeIds?: string[] };
+
+// Matches the API-side ConsoleActionType. Kept as a string union so the
+// URL / query-string / stringify roundtrip stays trivial. The presence
+// or absence of an entry here is the source of truth for "does the
+// portal know how to trigger this action" — server rejects unknowns.
+export type ConsoleActionType =
+  | 'resync_city'
+  | 'dedup_place_id'
+  | 'trigger_email_scrape'
+  | 'trigger_cover_sync'
+  | 'trigger_image_sync'
+  | 'trigger_gallery_menu'
+  | 'trigger_reviews'
+  | 're_resolve'
+  | 'activate'
+  | 'deactivate'
+  | 'gate_recompute'
+  | 'provenance_recompute';
+
+export type ConsoleRunStatus =
+  | 'queued'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
+
+export interface ConsoleRunSummary {
+  _id: string;
+  action: ConsoleActionType;
+  environment: string;
+  selectionSummary: Record<string, any>;
+  dryRun: boolean;
+  total: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  status: ConsoleRunStatus;
+  startedBy: string;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  createdAt: string;
+}
+
+export interface ConsoleRunDetail extends ConsoleRunSummary {
+  log: { ts: string; level: 'info' | 'warn' | 'error'; message: string }[];
+  result?: Record<string, any>;
+}
+
+export function useLaunchAction() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      environment: string;
+      action: ConsoleActionType;
+      selection: ConsoleSelection;
+      dryRun: boolean;
+      adminPassword?: string;
+      options?: Record<string, any>;
+    }) => {
+      const { data } = await apiClient.post<{ runId: string }>(
+        '/seeding/console/action',
+        input,
+      );
+      return data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['console', 'runs'] });
+    },
+  });
+}
+
+// One-shot preview of the exact selection count. Server never returns
+// the id list in filter mode — the whole point of that mode is to keep
+// the payload small.
+export function useSelectionPreview() {
+  return useMutation({
+    mutationFn: async (input: {
+      environment: string;
+      selection: ConsoleSelection;
+    }) => {
+      const { data } = await apiClient.post<{ total: number }>(
+        '/seeding/console/selection/preview',
+        input,
+      );
+      return data;
+    },
+  });
+}
+
+// Poll a single run every 2s while it's non-terminal, then stop.
+// Terminal statuses are done/failed/cancelled. Auto-stopping keeps the
+// drawer from hammering the API after a completed run scrolls into view.
+export function useConsoleRun(runId: string | null) {
+  return useQuery({
+    queryKey: ['console', 'run', runId],
+    enabled: !!runId,
+    queryFn: async () => {
+      const { data } = await apiClient.get<ConsoleRunDetail>(
+        `/seeding/console/runs/${runId}`,
+      );
+      return data;
+    },
+    refetchInterval: (q) => {
+      const d = q.state.data;
+      if (!d) return 2000;
+      return d.status === 'done' ||
+        d.status === 'failed' ||
+        d.status === 'cancelled'
+        ? false
+        : 2000;
+    },
+  });
+}
+
+export function useConsoleRuns() {
+  return useQuery({
+    queryKey: ['console', 'runs'],
+    queryFn: async () => {
+      const { data } = await apiClient.get<{
+        items: ConsoleRunSummary[];
+        total: number;
+        page: number;
+        pageSize: number;
+      }>('/seeding/console/runs', { params: { pageSize: 25 } });
+      return data;
+    },
+    refetchInterval: 5000,
   });
 }

@@ -99,7 +99,15 @@ function CopyIdButton({ id }: { id: string }) {
   );
 }
 
-export function BusinessRow({ row }: { row: ConsoleBusinessRow }) {
+export function BusinessRow({
+  row,
+  selected,
+  onSelectChange,
+}: {
+  row: ConsoleBusinessRow;
+  selected?: boolean;
+  onSelectChange?: (id: string, next: boolean) => void;
+}) {
   const cover = row.coverThumbnail ?? row.cover ?? null;
   const emailTier =
     row.emailVerification?.confidence &&
@@ -108,6 +116,15 @@ export function BusinessRow({ row }: { row: ConsoleBusinessRow }) {
       : null;
   return (
     <tr>
+      {onSelectChange && (
+        <td style={{ ...cellStyle, width: '32px' }}>
+          <input
+            type="checkbox"
+            checked={!!selected}
+            onChange={(e) => onSelectChange(row._id, e.target.checked)}
+          />
+        </td>
+      )}
       <td style={{ ...cellStyle, width: '52px' }}>
         {cover ? (
           <img

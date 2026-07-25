@@ -1,18 +1,29 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { ChevronLeft, ChevronRight, RefreshCcw } from 'lucide-react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  History,
+  RefreshCcw,
+} from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { useEnvironment } from '../contexts/EnvironmentContext';
 import { FilterBar } from '../components/console/FilterBar';
 import { GateFacets } from '../components/console/GateFacets';
 import { BusinessRow } from '../components/console/BusinessRow';
+import { SelectionBar } from '../components/console/SelectionBar';
+import { ActionMenu } from '../components/console/ActionMenu';
+import { RunsDrawer } from '../components/console/RunsDrawer';
 import {
   useConsoleFacets,
   useConsoleSearch,
   useGateFreshness,
   useGateRecompute,
+  COHORT_LABELS,
+  type CohortSource,
   type ConsoleFilter,
+  type ConsoleSelection,
   type ConsoleSort,
   type GateCriterion,
   type GateOverall,
@@ -39,6 +50,7 @@ function filterToParams(f: ConsoleFilter, sort: ConsoleSort, page: number) {
   if (f.gateFails?.length) p.set('gateFails', f.gateFails.join(','));
   if (f.gatePasses?.length) p.set('gatePasses', f.gatePasses.join(','));
   if (f.gateOverall) p.set('gateOverall', f.gateOverall);
+  if (f.cohort) p.set('cohort', f.cohort);
   if (sort.field !== DEFAULT_SORT.field) p.set('sortField', sort.field);
   if (sort.dir !== DEFAULT_SORT.dir) p.set('sortDir', sort.dir);
   if (page !== 1) p.set('page', String(page));
@@ -77,6 +89,7 @@ function paramsToState(p: URLSearchParams): {
         | GateCriterion[]
         | undefined,
       gateOverall: (p.get('gateOverall') as GateOverall) || null,
+      cohort: (p.get('cohort') as CohortSource) || undefined,
     },
     sort: {
       field: (p.get('sortField') as ConsoleSort['field']) || DEFAULT_SORT.field,
@@ -181,6 +194,13 @@ export default function BusinessConsolePage() {
     [filter, updateFilter],
   );
 
+  const setCohort = useCallback(
+    (cohort: CohortSource | undefined) => {
+      updateFilter({ ...filter, cohort });
+    },
+    [filter, updateFilter],
+  );
+
   const searchQuery = useConsoleSearch({
     environment,
     page,
@@ -191,6 +211,73 @@ export default function BusinessConsolePage() {
   const facetsQuery = useConsoleFacets({ environment, filter });
   const freshnessQuery = useGateFreshness(environment);
   const recompute = useGateRecompute();
+
+  // ── Selection state ─────────────────────────────────────────────────
+  //
+  // Two modes:
+  //   'ids'    — hand-picked rows. Concrete list. Survives filter changes
+  //              (the operator picked specific records, so we keep them).
+  //   'filter' — "select all N matching this filter". Server iterates a
+  //              cursor server-side; excludeIds trims individual rows off.
+  //              Cleared automatically on filter change because semantics
+  //              would drift.
+  const [selection, setSelection] = useState<ConsoleSelection | null>(null);
+  const [runsOpen, setRunsOpen] = useState(false);
+  const [focusRunId, setFocusRunId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (selection?.mode === 'filter') setSelection(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(filter)]);
+
+  const pageIds = useMemo(
+    () => searchQuery.data?.items.map((i) => i._id) ?? [],
+    [searchQuery.data],
+  );
+
+  const isRowSelected = useCallback(
+    (id: string): boolean => {
+      if (!selection) return false;
+      if (selection.mode === 'ids') return selection.ids.includes(id);
+      const excluded = new Set(selection.excludeIds ?? []);
+      return !excluded.has(id);
+    },
+    [selection],
+  );
+
+  const toggleRow = useCallback((id: string, next: boolean) => {
+    setSelection((prev) => {
+      if (!prev || prev.mode === 'ids') {
+        const cur = new Set(prev?.ids ?? []);
+        if (next) cur.add(id);
+        else cur.delete(id);
+        return { mode: 'ids', ids: Array.from(cur) };
+      }
+      // filter mode — unchecking a row adds to excludeIds; re-checking
+      // removes it. Never widens the filter beyond its original set.
+      const ex = new Set(prev.excludeIds ?? []);
+      if (next) ex.delete(id);
+      else ex.add(id);
+      return { ...prev, excludeIds: Array.from(ex) };
+    });
+  }, []);
+
+  const selectAllOnPage = useCallback(() => {
+    setSelection({ mode: 'ids', ids: pageIds });
+  }, [pageIds]);
+
+  const selectAllMatching = useCallback(() => {
+    setSelection({ mode: 'filter', filter, excludeIds: [] });
+  }, [filter]);
+
+  const clearSelection = useCallback(() => setSelection(null), []);
+
+  const isStaging = environment === 'staging';
+  const matchingTotal = searchQuery.data?.total ?? 0;
+  const showSelectAllMatching =
+    selection?.mode === 'ids' &&
+    selection.ids.length > 0 &&
+    matchingTotal > selection.ids.length;
 
   const totalPages = Math.max(
     1,
@@ -367,6 +454,107 @@ export default function BusinessConsolePage() {
         />
       </Card>
 
+      {/* Cohort chips — All / Crawler / CVB / Manual seeder */}
+      <Card>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            flexWrap: 'wrap',
+          }}
+        >
+          <span
+            style={{
+              fontSize: '11px',
+              fontWeight: 600,
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              color: 'var(--text-muted)',
+              marginRight: '6px',
+            }}
+          >
+            Cohort
+          </span>
+          {(
+            [
+              [undefined, 'All'],
+              ['crawler', COHORT_LABELS.crawler],
+              ['cvb', COHORT_LABELS.cvb],
+              ['manual_seeder', COHORT_LABELS.manual_seeder],
+            ] as const
+          ).map(([value, label]) => {
+            const active = filter.cohort === value;
+            return (
+              <button
+                key={label}
+                onClick={() =>
+                  setCohort(value as CohortSource | undefined)
+                }
+                style={{
+                  padding: '5px 10px',
+                  border: `1px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
+                  borderRadius: 'var(--radius)',
+                  background: active
+                    ? 'var(--accent-subtle)'
+                    : 'var(--surface-elevated)',
+                  color: active ? 'var(--accent)' : 'var(--text-secondary)',
+                  fontSize: '11px',
+                  fontWeight: active ? 600 : 500,
+                  cursor: 'pointer',
+                }}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Selection + actions */}
+      <SelectionBar
+        environment={environment}
+        selection={selection}
+        onClear={clearSelection}
+        onSelectAllOnPage={selectAllOnPage}
+        onSelectAllMatching={selectAllMatching}
+        showSelectAllMatching={showSelectAllMatching}
+        matchingTotal={matchingTotal}
+        currentPageIds={pageIds}
+      >
+        {isStaging ? (
+          <ActionMenu
+            environment={environment}
+            selection={selection}
+            onLaunched={(runId) => {
+              setFocusRunId(runId);
+              setRunsOpen(true);
+            }}
+          />
+        ) : (
+          <span
+            style={{
+              fontSize: '11px',
+              color: 'var(--text-muted)',
+              fontStyle: 'italic',
+            }}
+          >
+            Actions are locked to <strong>staging</strong>. Switch environment
+            to enable.
+          </span>
+        )}
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => {
+            setFocusRunId(null);
+            setRunsOpen(true);
+          }}
+        >
+          <History size={12} style={{ marginRight: '4px' }} /> Runs
+        </Button>
+      </SelectionBar>
+
       {/* Table */}
       <Card padding={false}>
         <div style={{ overflowX: 'auto' }}>
@@ -388,6 +576,20 @@ export default function BusinessConsolePage() {
                 >
                   Cover
                 </th>
+                <th style={{ ...headerCell, width: '32px' }}>
+                  <input
+                    type="checkbox"
+                    aria-label="Select all on this page"
+                    checked={
+                      pageIds.length > 0 &&
+                      pageIds.every((id) => isRowSelected(id))
+                    }
+                    onChange={(e) => {
+                      if (e.target.checked) selectAllOnPage();
+                      else clearSelection();
+                    }}
+                  />
+                </th>
                 <th style={headerCell}>{sortHeader('name', 'Name')}</th>
                 <th style={headerCell}>{sortHeader('city', 'City / State')}</th>
                 <th style={headerCell}>Gate</th>
@@ -402,7 +604,7 @@ export default function BusinessConsolePage() {
               {searchQuery.isLoading && (
                 <tr>
                   <td
-                    colSpan={9}
+                    colSpan={10}
                     style={{
                       padding: '32px',
                       textAlign: 'center',
@@ -417,7 +619,7 @@ export default function BusinessConsolePage() {
               {searchQuery.isError && (
                 <tr>
                   <td
-                    colSpan={9}
+                    colSpan={10}
                     style={{
                       padding: '32px',
                       textAlign: 'center',
@@ -434,7 +636,7 @@ export default function BusinessConsolePage() {
                 searchQuery.data?.items.length === 0 && (
                   <tr>
                     <td
-                      colSpan={9}
+                      colSpan={10}
                       style={{
                         padding: '32px',
                         textAlign: 'center',
@@ -447,7 +649,12 @@ export default function BusinessConsolePage() {
                   </tr>
                 )}
               {searchQuery.data?.items.map((row) => (
-                <BusinessRow key={row._id} row={row} />
+                <BusinessRow
+                  key={row._id}
+                  row={row}
+                  selected={isRowSelected(row._id)}
+                  onSelectChange={toggleRow}
+                />
               ))}
             </tbody>
           </table>
@@ -489,6 +696,13 @@ export default function BusinessConsolePage() {
           </div>
         </div>
       </Card>
+
+      <RunsDrawer
+        open={runsOpen}
+        onClose={() => setRunsOpen(false)}
+        focusRunId={focusRunId}
+        onFocus={setFocusRunId}
+      />
     </div>
   );
 }
