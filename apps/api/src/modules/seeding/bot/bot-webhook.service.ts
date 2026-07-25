@@ -94,7 +94,24 @@ export class BotWebhookService {
       cover?: string | null;
       logo?: string | null;
     };
+    emailScrape?: {
+      email?: string | null;
+      confidence?: 'A' | 'B' | 'C' | null;
+      sourceUrl?: string | null;
+      domainMatch?: boolean;
+      alternates?: string[];
+      pagesVisited?: number;
+      skipped?: string | null;
+    };
   }): Promise<void> {
+    // email_scrape webhooks carry no gallery/menu/reviews work — they
+    // land here to write the emailVerification subdoc and go. Handled up
+    // front so we don't spin up the media pipeline for them.
+    if (payload.emailScrape || payload.type === 'email_scrape') {
+      await this.handleEmailScrape(payload);
+      return;
+    }
+
     const {
       placeId, businessId, environment,
       sessionId, error, reviews, gallery, menu,
@@ -1337,6 +1354,142 @@ export class BotWebhookService {
         );
       }
       throw err;
+    } finally {
+      await conn.close();
+    }
+  }
+
+  // ── email_scrape ──────────────────────────────────────────────────
+  //
+  // Write the scraped email into a `emailVerification` subdoc on the
+  // target business. If the business already has a `email` value that
+  // did NOT come from website_scrape, DO NOT overwrite it — keep the
+  // operator/original value on `email`, record the scrape into
+  // `emailVerification`, and log the conflict. The count of these is
+  // surfaced in the trigger endpoint response so we can decide the
+  // overwrite policy from real numbers, not a guess.
+  //
+  // Environment lock: this is only useful against staging. We reject
+  // any other value up front so a misrouted webhook can't touch prod.
+  async handleEmailScrape(payload: {
+    businessId: string;
+    environment: string;
+    sessionId?: string;
+    emailScrape?: {
+      email?: string | null;
+      confidence?: 'A' | 'B' | 'C' | null;
+      sourceUrl?: string | null;
+      domainMatch?: boolean;
+      alternates?: string[];
+      pagesVisited?: number;
+      skipped?: string | null;
+    };
+    error?: string;
+  }): Promise<void> {
+    const { businessId, environment, emailScrape, error } = payload;
+
+    if (environment !== 'staging') {
+      this.logger.warn(
+        `[EMAIL_SCRAPE] Rejected webhook for env=${environment} ` +
+          `(business ${businessId}) — email scrape is staging-only`,
+      );
+      return;
+    }
+
+    if (error) {
+      this.logger.warn(
+        `[EMAIL_SCRAPE] Bot reported error for ${businessId}: ${error}`,
+      );
+      return;
+    }
+
+    // Bot may report "skipped: no_website" as a legitimate outcome —
+    // completes the job but records nothing on the business.
+    if (emailScrape?.skipped) {
+      this.logger.log(
+        `[EMAIL_SCRAPE] ${businessId} skipped: ${emailScrape.skipped}`,
+      );
+      return;
+    }
+
+    const email = emailScrape?.email?.trim();
+    const confidence = emailScrape?.confidence;
+    if (!email || !confidence) {
+      this.logger.log(
+        `[EMAIL_SCRAPE] ${businessId} no email extracted`,
+      );
+      return;
+    }
+
+    const targetUri = this.resolveTargetUri(environment);
+    const conn = await mongoose.createConnection(targetUri).asPromise();
+    try {
+      const BusinessModel = conn.model(
+        'Business',
+        new mongoose.Schema<any>({}, { strict: false, timestamps: true }),
+        'businesses',
+      );
+      const businessOid = new mongoose.Types.ObjectId(businessId);
+
+      const existing = (await BusinessModel.findById(businessOid)
+        .select('email emailVerification')
+        .lean()) as any;
+
+      if (!existing) {
+        this.logger.warn(
+          `[EMAIL_SCRAPE] Business ${businessId} not found in ${environment}`,
+        );
+        return;
+      }
+
+      const verification = {
+        source: 'website_scrape',
+        email,
+        confidence,
+        sourceUrl: emailScrape?.sourceUrl ?? null,
+        domainMatch: !!emailScrape?.domainMatch,
+        scrapedAt: new Date(),
+        alternates: emailScrape?.alternates ?? [],
+        pagesVisited: emailScrape?.pagesVisited ?? 0,
+      };
+
+      // Decide whether to also update the top-level `email` field.
+      // Rules:
+      //   - no existing email → set it
+      //   - existing came from a prior website_scrape → refresh it
+      //     (idempotent re-runs, higher confidence wins)
+      //   - existing came from anywhere else → DO NOT overwrite;
+      //     just write emailVerification and log the conflict
+      const existingSource = existing?.emailVerification?.source;
+      const canOverwriteEmail =
+        !existing.email ||
+        !String(existing.email).trim() ||
+        existingSource === 'website_scrape';
+
+      const setFields: Record<string, any> = {
+        emailVerification: verification,
+      };
+      if (canOverwriteEmail) {
+        setFields.email = email;
+      } else {
+        this.logger.warn(
+          `[EMAIL_SCRAPE] ${businessId} conflict: existing email ` +
+            `${JSON.stringify(existing.email)} came from source=` +
+            `${existingSource ?? 'unknown'} — kept, scrape stored in ` +
+            `emailVerification only.`,
+        );
+      }
+
+      await BusinessModel.updateOne(
+        { _id: businessOid },
+        { $set: setFields },
+      );
+
+      this.logger.log(
+        `[EMAIL_SCRAPE] ${businessId} ${email} (tier ${confidence}) ` +
+          `domainMatch=${verification.domainMatch} pages=${verification.pagesVisited}` +
+          `${canOverwriteEmail ? '' : ' [email conflict, kept prior]'}`,
+      );
     } finally {
       await conn.close();
     }

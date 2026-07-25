@@ -135,6 +135,48 @@ export class SocialMediaTokenDetails {
 export const SocialMediaTokenDetailsSchema =
   SchemaFactory.createForClass(SocialMediaTokenDetails);
 
+// Verified email captured by the email_scrape bot stage. `email` on
+// Business itself remains the display address (may be operator-set); this
+// subdoc records provenance of the SCRAPED address alongside so we can
+// distinguish "operator typed it in" from "found on the business's own
+// website". Confidence tiers:
+//   A — mailto: on a contact/about page
+//   B — mailto: elsewhere, OR plain text on a contact/about page
+//   C — plain text elsewhere, or de-obfuscated
+@Schema({ _id: false })
+export class BusinessEmailVerification {
+  // Provenance. Only 'website_scrape' is written today; the field is
+  // present so future stages (e.g. operator-verified) can share the shape.
+  @Prop({ type: String, default: 'website_scrape' })
+  source: string;
+
+  @Prop({ type: String })
+  email: string;
+
+  @Prop({ type: String, enum: ['A', 'B', 'C'] })
+  confidence: 'A' | 'B' | 'C';
+
+  @Prop({ type: String })
+  sourceUrl: string;
+
+  // True when the extracted email's domain matches the website's domain.
+  // Not a filter — small businesses often use free-mail addresses.
+  @Prop({ type: Boolean, default: false })
+  domainMatch: boolean;
+
+  @Prop({ type: Date })
+  scrapedAt: Date;
+
+  @Prop({ type: [String], default: [] })
+  alternates: string[];
+
+  // How many pages the scraper visited before landing on this result.
+  @Prop({ type: Number, default: 0 })
+  pagesVisited: number;
+}
+export const BusinessEmailVerificationSchema =
+  SchemaFactory.createForClass(BusinessEmailVerification);
+
 // ─── Main Business schema ────────────────────────────────────────────────────
 
 @Schema({ timestamps: true })
@@ -561,6 +603,9 @@ export class Business {
 
   @Prop({ type: String })
   scraperSession: string;
+
+  @Prop({ type: BusinessEmailVerificationSchema })
+  emailVerification: BusinessEmailVerification;
 }
 
 export type BusinessDocument = Business & Document;
@@ -587,3 +632,5 @@ BusinessSchema.pre('save', function () {
 // Indexes
 BusinessSchema.index({ name: 'text', tags: 'text' });
 BusinessSchema.index({ isActive: 1 });
+BusinessSchema.index({ 'emailVerification.source': 1 });
+BusinessSchema.index({ 'emailVerification.confidence': 1 });

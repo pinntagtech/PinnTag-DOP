@@ -323,6 +323,7 @@ VERSION_PATH = BOT_DIR / 'version.json'
 UPDATE_FILES = (
     'main.py',
     'scraper_bulk.py',
+    'email_scraper.py',
     'auto_setup_cookies.py',
     'requirements.txt',
     'version.json',
@@ -442,6 +443,7 @@ async def poll_and_execute():
             city=job.get('city', '') or '',
             state=job.get('state', '') or '',
             postalCode=job.get('postalCode', '') or '',
+            website=job.get('website', '') or '',
         )
 
         try:
@@ -451,6 +453,8 @@ async def poll_and_execute():
                 await run_cover_sync(req)
             elif job_type == 'resolve_business':
                 await run_resolve_business(req)
+            elif job_type == 'email_scrape':
+                await run_email_scrape_job(req)
             else:
                 await run_scrape(req)
 
@@ -491,6 +495,9 @@ class ScrapeRequest(BaseModel):
     city: Optional[str] = ""
     state: Optional[str] = ""
     postalCode: Optional[str] = ""
+    # Website URL carried for email_scrape — the business's own site
+    # that we fetch to extract a literally-present email.
+    website: Optional[str] = ""
 
 
 class ScrapeStatusResponse(BaseModel):
@@ -2769,6 +2776,82 @@ async def make_progress_callback(business_id: str, session_id: str):
             folder_name=folder_name,
         )
     return callback
+
+
+async def run_email_scrape_job(req: ScrapeRequest) -> None:
+    """Visit the business's own website and extract a literally-present
+    email. Never infers, never uses a third party. Posts the result
+    back via the regular /bot/webhook — the API side inspects
+    payload.emailScrape and routes to its email handler.
+
+    Missing/empty `website` is a legitimate outcome, not an error. We
+    complete the job successfully with skipped:'no_website' so the
+    trigger endpoint can re-run only businesses that were re-resolved.
+    """
+    from email_scraper import run_email_scrape
+
+    website = (req.website or "").strip()
+    logger.info(
+        f"[email_scrape] {req.businessId} website={website or '(none)'}"
+    )
+
+    if not website:
+        payload = {
+            "businessId": req.businessId,
+            "environment": req.environment,
+            "sessionId": req.sessionId,
+            "scrapedAt": datetime.now(timezone.utc).isoformat(),
+            "type": "email_scrape",
+            "reviews": [],
+            "gallery": [],
+            "menu": [],
+            "emailScrape": {
+                "email": None,
+                "confidence": None,
+                "sourceUrl": None,
+                "domainMatch": False,
+                "alternates": [],
+                "pagesVisited": 0,
+                "skipped": "no_website",
+            },
+        }
+        await post_webhook(payload)
+        return
+
+    try:
+        result = await run_email_scrape(
+            website=website,
+            launch_browser=launch_browser,
+        )
+    except Exception as e:
+        import traceback
+        logger.error(
+            f"[email_scrape] {req.businessId} failed: "
+            f"{e}\n{traceback.format_exc()}"
+        )
+        raise
+
+    logger.info(
+        f"[email_scrape] {req.businessId} -> "
+        f"email={result.get('email')!r} tier={result.get('confidence')} "
+        f"pages={result.get('pagesVisited')} "
+        f"skipped={result.get('skipped') or 'no'}"
+    )
+
+    payload = {
+        "businessId": req.businessId,
+        "environment": req.environment,
+        "sessionId": req.sessionId,
+        "scrapedAt": datetime.now(timezone.utc).isoformat(),
+        "type": "email_scrape",
+        # Empty media arrays for shape compatibility — the API webhook
+        # handler branches on emailScrape early and never inspects these.
+        "reviews": [],
+        "gallery": [],
+        "menu": [],
+        "emailScrape": result,
+    }
+    await post_webhook(payload)
 
 
 async def post_webhook(data: dict):

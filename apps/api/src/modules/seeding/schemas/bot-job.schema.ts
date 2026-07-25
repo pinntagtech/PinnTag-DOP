@@ -14,6 +14,10 @@ export enum BotJobType {
   IMAGE_SYNC = 'image_sync',
   COVER_SYNC = 'cover_sync',
   RESOLVE_BUSINESS = 'resolve_business',
+  // Visits the business's own website and extracts a literally-present
+  // email address. No inference, no third-party enrichment. Backs the
+  // c10_verified_email gate criterion.
+  EMAIL_SCRAPE = 'email_scrape',
 }
 
 @Schema({ timestamps: true, collection: 'dopBotJobs' })
@@ -58,6 +62,11 @@ export class BotJob {
 
   @Prop({ type: String, default: '' })
   postalCode: string;
+
+  // Website URL carried for email_scrape — the bot fetches this page
+  // (plus a few contact/about links) to extract a literally-present email.
+  @Prop({ type: String, default: '' })
+  website: string;
 
   @Prop({ type: Date, default: null })
   claimedAt?: Date;

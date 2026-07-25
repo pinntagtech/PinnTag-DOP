@@ -1068,4 +1068,175 @@ export class SeedingController {
       actor,
     });
   }
+
+  // ── Trigger: email_scrape ─────────────────────────────────────────────
+  //
+  // Enqueue email_scrape bot jobs for seeded businesses with a website
+  // and no prior website-sourced emailVerification. Staging only —
+  // rejected for any other environment at the controller. dryRun is the
+  // default; a live run only fires when the caller explicitly opts in.
+  //
+  // Selection order (deterministic, so re-runs pick up where the prior
+  // dry-run left off):
+  //   1. explicit businessIds (validated against staging + gate) if given
+  //   2. otherwise: seeded, has website, no emailVerification.source ==
+  //      'website_scrape', ordered by _id, capped by `limit`
+  @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN)
+  @Post('trigger/email-scrape')
+  async triggerEmailScrape(
+    @Body()
+    body: {
+      environment: string;
+      businessIds?: string[];
+      limit?: number;
+      dryRun?: boolean;
+    },
+  ): Promise<{
+    environment: string;
+    dryRun: boolean;
+    totals: {
+      candidates: number;
+      queued: number;
+      skippedNoWebsite: number;
+      skippedAlreadyVerified: number;
+    };
+    sample: Array<{ businessId: string; website: string; name: string }>;
+  }> {
+    const environment = body?.environment;
+    if (environment !== 'staging') {
+      throw new HttpException(
+        `email_scrape only runs against staging (got: ${environment})`,
+        400,
+      );
+    }
+    const dryRun = body?.dryRun !== false;
+    const limit = Math.max(1, Math.min(10_000, body?.limit ?? 1000));
+
+    const uriKey =
+      EnvironmentUriKey[environment as keyof typeof EnvironmentUriKey];
+    const uri = uriKey ? this.configService.get<string>(uriKey) : undefined;
+    if (!uri) {
+      throw new HttpException(
+        `No database URI configured for ${environment}`,
+        400,
+      );
+    }
+
+    const conn = await mongoose.createConnection(uri).asPromise();
+    try {
+      const businesses = conn.collection('businesses');
+
+      // Seeded-only + website present + not already scraped from website.
+      // If the caller passed explicit ids, honour them AND the same gate;
+      // this stops a stray id list from writing to unrelated businesses.
+      const baseMatch: Record<string, any> = {
+        $or: [{ isCvb: true }, { isFromCrawler: true }],
+      };
+      if (body.businessIds?.length) {
+        const oids = body.businessIds
+          .filter((id) => mongoose.isValidObjectId(id))
+          .map((id) => new mongoose.Types.ObjectId(id));
+        baseMatch._id = { $in: oids };
+      }
+
+      // Count breakdowns before filtering, so the dry-run response is
+      // useful (operator sees WHY they got the number they got).
+      const scoped = { ...baseMatch };
+      const totalScoped = await businesses.countDocuments(scoped);
+      const skippedNoWebsite = await businesses.countDocuments({
+        ...scoped,
+        $and: [
+          {
+            $or: [
+              { website: { $exists: false } },
+              { website: null },
+              { website: '' },
+            ],
+          },
+        ],
+      });
+      const skippedAlreadyVerified = await businesses.countDocuments({
+        ...scoped,
+        website: { $exists: true, $nin: [null, ''] },
+        'emailVerification.source': 'website_scrape',
+      });
+
+      const candidateFilter: Record<string, any> = {
+        ...scoped,
+        website: { $exists: true, $nin: [null, ''] },
+        $and: [
+          {
+            $or: [
+              { emailVerification: { $exists: false } },
+              { 'emailVerification.source': { $ne: 'website_scrape' } },
+            ],
+          },
+        ],
+      };
+
+      const candidateDocs = (await businesses
+        .find(candidateFilter, {
+          projection: { _id: 1, name: 1, website: 1 },
+        })
+        .sort({ _id: 1 })
+        .limit(limit)
+        .toArray()) as any[];
+
+      const sample = candidateDocs.slice(0, 20).map((d) => ({
+        businessId: String(d._id),
+        website: String(d.website ?? ''),
+        name: String(d.name ?? ''),
+      }));
+
+      if (dryRun) {
+        this.logger.log(
+          `[EMAIL_SCRAPE] dryRun candidates=${candidateDocs.length} ` +
+            `noWebsite=${skippedNoWebsite} ` +
+            `alreadyVerified=${skippedAlreadyVerified} ` +
+            `(total scoped: ${totalScoped})`,
+        );
+        return {
+          environment,
+          dryRun,
+          totals: {
+            candidates: candidateDocs.length,
+            queued: 0,
+            skippedNoWebsite,
+            skippedAlreadyVerified,
+          },
+          sample,
+        };
+      }
+
+      const { created } = await this.botJobService.createJobs({
+        type: BotJobType.EMAIL_SCRAPE,
+        records: candidateDocs.map((d) => ({
+          placeId: '',
+          businessId: String(d._id),
+          businessName: String(d.name ?? ''),
+          environment,
+          website: String(d.website ?? ''),
+        })),
+      });
+
+      this.logger.log(
+        `[EMAIL_SCRAPE] queued=${created} of candidates=${candidateDocs.length} ` +
+          `(noWebsite=${skippedNoWebsite}, alreadyVerified=${skippedAlreadyVerified})`,
+      );
+
+      return {
+        environment,
+        dryRun,
+        totals: {
+          candidates: candidateDocs.length,
+          queued: created,
+          skippedNoWebsite,
+          skippedAlreadyVerified,
+        },
+        sample,
+      };
+    } finally {
+      await conn.close();
+    }
+  }
 }

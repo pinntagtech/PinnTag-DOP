@@ -17,7 +17,11 @@ const BOT_JOB_TYPE_TO_BUCKET: Record<
   [BotJobType.REVIEWS]: 'reviews',
   [BotJobType.IMAGE_SYNC]: 'imageSync',
   [BotJobType.COVER_SYNC]: 'coverSync',
+  // RESOLVE_BUSINESS and EMAIL_SCRAPE both run out-of-session — the
+  // bucket is only consulted when job.sessionId is set, so the fallback
+  // value is never actually incremented for them.
   [BotJobType.RESOLVE_BUSINESS]: 'reviews',
+  [BotJobType.EMAIL_SCRAPE]: 'reviews',
 };
 
 @Injectable()
@@ -65,6 +69,9 @@ export class BotJobService {
       city?: string;
       state?: string;
       postalCode?: string;
+      // Website URL is required for EMAIL_SCRAPE — the bot fetches this
+      // page (plus a few contact/about links) to extract emails.
+      website?: string;
     }[];
     // Optional: RESOLVE_BUSINESS jobs aren't bound to a seeding session
     // (they run from the operator-triggered resolve queue), so they
@@ -79,10 +86,20 @@ export class BotJobService {
     // a scrape miss and we drop the record rather than enqueue a bad
     // job. The businessId requirement is universal.
     const isResolve = payload.type === BotJobType.RESOLVE_BUSINESS;
+    const isEmailScrape = payload.type === BotJobType.EMAIL_SCRAPE;
     const docs = payload.records
       .filter((r) => {
         if (!r.businessId) return false;
         if (isResolve) return true; // resolve runs from address alone
+        if (isEmailScrape) {
+          // email_scrape needs businessId + businessName + environment.
+          // placeId is not needed. website may be empty — the bot
+          // reports skipped:'no_website' rather than failing.
+          return (
+            !!(r.businessName && r.businessName.trim()) &&
+            !!(r.environment && r.environment.trim())
+          );
+        }
         // Non-resolve jobs need a placeId + a non-empty name + environment;
         // these are required by the dopBotJobs schema and by Maps lookup.
         return (
@@ -104,6 +121,7 @@ export class BotJobService {
         city: r.city ?? '',
         state: r.state ?? '',
         postalCode: r.postalCode ?? '',
+        website: r.website ?? '',
         attempts: 0,
       }));
 
