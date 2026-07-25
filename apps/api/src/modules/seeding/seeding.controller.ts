@@ -491,6 +491,73 @@ export class SeedingController {
     };
   }
 
+  // Cascade-delete "loser" copies of businesses that share a placeId in
+  // staging. Same request body drives all three operator phases:
+  //   dryRun:true                    → preview cascade counts, no writes
+  //   dryRun:false + placeIds:[…]    → apply on a hand-picked sample (verify
+  //                                    in Mongo before running the full batch)
+  //   dryRun:false + limit:N (opt)   → apply, capped at N groups; loop until
+  //                                    the response reports 0 processed
+  // Locked to staging inside the service. Cohort filter reads the shared
+  // buildSeededFilter so both legacy-flagged and manual-seeder docs are in
+  // scope; see the service for details.
+  @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN)
+  @Post('dedup/place-id')
+  async dedupBusinessesByPlaceId(
+    @Body()
+    body: {
+      environment: string;
+      adminPassword: string;
+      dryRun?: boolean;
+      placeIds?: string[];
+      limit?: number;
+    },
+  ) {
+    if (!body?.environment) {
+      throw new HttpException('environment is required', 400);
+    }
+    return this.pipelineService.dedupBusinessesByPlaceId({
+      environment: body.environment,
+      adminPassword: body.adminPassword,
+      dryRun: body.dryRun !== false, // default dry
+      placeIds: body.placeIds,
+      limit: body.limit,
+    });
+  }
+
+  // Re-derive `city` from the trusted `addressLine1` for seeded businesses
+  // in staging where the two have drifted apart — county names, township/
+  // village splits, truncated multi-word names.
+  // Same request body drives the three operator phases (see service doc):
+  //   dryRun:true                    → preview mismatch counts + samples
+  //   dryRun:false + businessIds:[…] → apply on a hand-picked sample
+  //   dryRun:false + limit:N (opt)   → apply, capped at N writes; loop until
+  //                                    the response reports 0 corrected
+  // Locked to staging inside the service. Cohort filter shared, as above.
+  @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN)
+  @Post('resync/city-from-address')
+  async resyncCityFromAddress(
+    @Body()
+    body: {
+      environment: string;
+      adminPassword: string;
+      dryRun?: boolean;
+      businessIds?: string[];
+      limit?: number;
+    },
+  ) {
+    if (!body?.environment) {
+      throw new HttpException('environment is required', 400);
+    }
+    return this.pipelineService.resyncCityFromAddressLine1({
+      environment: body.environment,
+      adminPassword: body.adminPassword,
+      dryRun: body.dryRun !== false, // default dry
+      businessIds: body.businessIds,
+      limit: body.limit,
+    });
+  }
+
   @Post('sessions/:id/reset-bot')
   async resetBotStages(
     @Param('id') id: string,

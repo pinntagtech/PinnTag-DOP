@@ -58,6 +58,11 @@ import { CoverBackfillController } from './cover-backfill/cover-backfill.control
 import { GateService } from './console/gate.service';
 import { ConsoleService } from './console/console.service';
 import { ProvenanceService } from './console/provenance.service';
+import { RunService } from './console/run.service';
+import {
+  ConsoleRun,
+  ConsoleRunSchema,
+} from './console/console-run.schema';
 import { ConsoleController } from './console/console.controller';
 import { SeedingController } from './seeding.controller';
 import { AuthModule } from '../auth/auth.module';
@@ -74,6 +79,7 @@ import { LocationsModule } from '../locations/locations.module';
       { name: DopSyncRun.name, schema: DopSyncRunSchema },
       { name: DopSyncState.name, schema: DopSyncStateSchema },
       { name: CoverageSnapshot.name, schema: CoverageSnapshotSchema },
+      { name: ConsoleRun.name, schema: ConsoleRunSchema },
     ]),
     AuthModule,
     LocationsModule,
@@ -117,6 +123,7 @@ import { LocationsModule } from '../locations/locations.module';
     GateService,
     ConsoleService,
     ProvenanceService,
+    RunService,
   ],
   exports: [
     SeedingSessionService,

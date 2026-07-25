@@ -10,6 +10,7 @@ import {
   ConsoleFilter,
   ConsoleSearchRequest,
   ConsoleSearchResponse,
+  ConsoleSelection,
 } from './console.types';
 
 const MAX_PAGE_SIZE = 200;
@@ -208,6 +209,31 @@ export class ConsoleService {
       });
     }
 
+    if (filter.cohort) {
+      // Cohort narrows the seeded set to a single provenance source.
+      // Legacy-flag fields are checked too so pre-provenance-recompute
+      // docs still surface under their intrinsic cohort — otherwise the
+      // "Crawler" chip would show 0 until every doc had been recomputed.
+      if (filter.cohort === 'crawler') {
+        clauses.push({
+          $or: [
+            { 'seedProvenance.sources': 'crawler' },
+            { isFromCrawler: true },
+          ],
+        });
+      } else if (filter.cohort === 'cvb') {
+        clauses.push({
+          $or: [{ 'seedProvenance.sources': 'cvb' }, { isCvb: true }],
+        });
+      } else if (filter.cohort === 'manual_seeder') {
+        // No legacy flag corresponds to manual_seeder — before the
+        // provenance recompute lands in an env this chip will show 0.
+        // That's honest: pre-recompute we cannot identify manual-seeder
+        // docs cheaply, so we don't pretend we can.
+        clauses.push({ 'seedProvenance.sources': 'manual_seeder' });
+      }
+    }
+
     if (filter.gateFails?.length) {
       for (const c of this.filterGateCriteria(filter.gateFails)) {
         clauses.push({
@@ -275,6 +301,91 @@ export class ConsoleService {
       )
       .toArray()) as Array<{ _id: string }>;
     return groups.map((g) => g._id).filter(Boolean);
+  }
+
+  // ── Selection resolution (Phase B) ──────────────────────────────────
+  //
+  // Two shapes:
+  //   { mode: 'ids', ids }               → concrete list, validated + streamed
+  //   { mode: 'filter', filter, exclude } → cursor over the same query used
+  //                                         by console search; never
+  //                                         materializes the id list.
+  //
+  // The filter path always AND-s the seeded-only cohort (via
+  // buildMongoFilter → buildSeededFilter). excludeIds is applied via
+  // `_id: {$nin}` so a user who unchecks a few rows after select-all
+  // still targets the correct set without the client resending 20k ids.
+  async *iterateSelectionIds(
+    environment: string,
+    selection: ConsoleSelection,
+  ): AsyncGenerator<mongoose.Types.ObjectId> {
+    if (selection.mode === 'ids') {
+      for (const id of selection.ids ?? []) {
+        if (!mongoose.isValidObjectId(id)) continue;
+        yield new mongoose.Types.ObjectId(id);
+      }
+      return;
+    }
+    const conn = await this.gateService.openConnection(environment);
+    try {
+      const businesses = conn.collection('businesses');
+      const mongoFilter = await this.buildMongoFilter(
+        businesses,
+        selection.filter ?? {},
+      );
+      if (selection.excludeIds?.length) {
+        const oids = selection.excludeIds
+          .filter((id) => mongoose.isValidObjectId(id))
+          .map((id) => new mongoose.Types.ObjectId(id));
+        if (oids.length) {
+          mongoFilter.$and = [
+            ...(mongoFilter.$and ?? []),
+            { _id: { $nin: oids } },
+          ];
+        }
+      }
+      const cursor = businesses.find(mongoFilter, {
+        projection: { _id: 1 },
+      });
+      for await (const doc of cursor) {
+        yield doc._id as unknown as mongoose.Types.ObjectId;
+      }
+    } finally {
+      await conn.close();
+    }
+  }
+
+  async countSelection(
+    environment: string,
+    selection: ConsoleSelection,
+  ): Promise<number> {
+    if (selection.mode === 'ids') {
+      return (selection.ids ?? []).filter((id) =>
+        mongoose.isValidObjectId(id),
+      ).length;
+    }
+    const conn = await this.gateService.openConnection(environment);
+    try {
+      const businesses = conn.collection('businesses');
+      const mongoFilter = await this.buildMongoFilter(
+        businesses,
+        selection.filter ?? {},
+      );
+      if (selection.excludeIds?.length) {
+        const oids = selection.excludeIds
+          .filter((id) => mongoose.isValidObjectId(id))
+          .map((id) => new mongoose.Types.ObjectId(id));
+        if (oids.length) {
+          mongoFilter.$and = [
+            ...(mongoFilter.$and ?? []),
+            { _id: { $nin: oids } },
+          ];
+        }
+      }
+      return businesses.countDocuments(mongoFilter);
+    } finally {
+      await conn.close();
+    }
   }
 
   private toRow(d: any): ConsoleBusinessRow {

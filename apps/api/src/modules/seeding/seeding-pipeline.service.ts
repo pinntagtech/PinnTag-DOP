@@ -23,6 +23,8 @@ import { EnrichmentEngine } from './engines/enrichment.engine';
 import { PostPublishService } from './activation/post-publish.service';
 import { fullStateName } from './common/us-states';
 import { computeDominant } from './common/dominant';
+import { SEED_DEFAULT_COVER } from './activation/seed-defaults';
+import { buildSeededFilter } from './common/seeded-cohort';
 
 const MODULE_COLLECTION_MAP: Record<string, string> = {
   [SeedingModules.BUSINESS]: 'businesses',
@@ -976,6 +978,488 @@ export class SeedingPipelineService {
     } finally {
       await conn.close();
     }
+  }
+
+  // ── Admin: Dedup businesses by placeId ───────────────────────────────────
+  //
+  // Historical duplicates in the seeded corpus (isCvb || isFromCrawler) that
+  // share a placeId cause the gated-migration `singleton_placeId` gate to
+  // exclude ALL copies. This method finds each duplicate group, picks a
+  // canonical using the same priority the eligibility gate rewards (real B2
+  // cover → resolved hours → taxonomy → active outlet → oldest), and cascade-
+  // deletes the losers via purgeBusinessData. The purge helper already
+  // enforces the claimed/Stripe-backed safety guard; if it throws for a
+  // group, that group is recorded as `flaggedForReview` (no delete) and the
+  // batch continues.
+  //
+  // Environment is locked to `staging` — the task fixes only pinntagStaging.
+  // The payoff (more prod-eligible businesses) surfaces automatically the
+  // next time the gated-migration preview is re-run against pre-prod.
+  private static readonly DEDUP_MEDIA_STAGING_RE =
+    /media-staging\.pinntag\.com/i;
+  private static readonly DEDUP_GOOGLE_HOST_RE = /googleusercontent/i;
+
+  async dedupBusinessesByPlaceId(opts: {
+    environment: string;
+    adminPassword: string;
+    dryRun?: boolean;
+    placeIds?: string[];
+    limit?: number;
+  }): Promise<{
+    environment: string;
+    dryRun: boolean;
+    totals: {
+      duplicateGroupsFound: number;
+      groupsProcessed: number;
+      losersDeleted: number;
+      groupsFlaggedForReview: number;
+    };
+    perGroup: Array<{
+      placeId: string;
+      canonicalId: string;
+      loserIds: string[];
+      loserCount: number;
+      purgeSummary?: Record<string, number>;
+      flaggedReason?: string;
+    }>;
+  }> {
+    this.verifyAdminPassword(opts.adminPassword);
+    const dryRun = opts.dryRun !== false; // default dry
+    const environment = opts.environment;
+    if (environment !== 'staging') {
+      throw new HttpException(
+        'dedupBusinessesByPlaceId only runs against staging',
+        400,
+      );
+    }
+
+    const targetUri = this.resolveTargetUri(environment);
+    const targetConn = await mongoose.createConnection(targetUri).asPromise();
+
+    try {
+      const businesses = targetConn.collection('businesses');
+
+      // ── 1. Identify duplicate groups (seeded-only + non-empty placeId) ──
+      // Cohort filter uses the shared buildSeededFilter so this pass sees
+      // the union of legacy-flagged (isCvb/isFromCrawler) AND manual-seeder
+      // (seedProvenance.isSeeded) businesses. The prior hardcoded $or
+      // silently skipped the manual-seeder cohort.
+      const match: Record<string, any> = {
+        ...buildSeededFilter(),
+        placeId: { $nin: [null, ''] },
+      };
+      if (opts.placeIds?.length) {
+        match.placeId = { $in: opts.placeIds };
+      }
+
+      const groups = (await businesses
+        .aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: '$placeId',
+              ids: { $push: '$_id' },
+              count: { $sum: 1 },
+            },
+          },
+          { $match: { count: { $gt: 1 } } },
+        ])
+        .toArray()) as Array<{
+        _id: string;
+        ids: mongoose.Types.ObjectId[];
+        count: number;
+      }>;
+
+      const duplicateGroupsFound = groups.length;
+      const capped = opts.limit
+        ? groups.slice(0, Math.max(0, opts.limit))
+        : groups;
+
+      // ── 2/3. Score & pick canonical, then attempt purge (or dry-run) ──
+      const seenCanonicalIds = new Set<string>();
+      const perGroup: Array<{
+        placeId: string;
+        canonicalId: string;
+        loserIds: string[];
+        loserCount: number;
+        purgeSummary?: Record<string, number>;
+        flaggedReason?: string;
+      }> = [];
+
+      let losersDeleted = 0;
+      let groupsFlaggedForReview = 0;
+      let groupsProcessed = 0;
+
+      for (const group of capped) {
+        const docs = (await businesses
+          .find(
+            { _id: { $in: group.ids } },
+            {
+              projection: {
+                _id: 1,
+                cover: 1,
+                resolveStatus: 1,
+                businessIndustry: 1,
+                businessCategories: 1,
+                activatedOutletsLength: 1,
+                createdAt: 1,
+                placeId: 1,
+              },
+            },
+          )
+          .toArray()) as any[];
+
+        if (docs.length < 2) continue; // group changed under us
+
+        const scored = docs.map((d) => ({
+          id: d._id as mongoose.Types.ObjectId,
+          createdAt:
+            d.createdAt instanceof Date
+              ? d.createdAt.getTime()
+              : Number.MAX_SAFE_INTEGER,
+          score: this.scoreDedupCandidate(d),
+        }));
+
+        // Highest score wins; tiebreak: oldest createdAt.
+        scored.sort((a, b) =>
+          b.score - a.score !== 0
+            ? b.score - a.score
+            : a.createdAt - b.createdAt,
+        );
+
+        const canonical = scored[0];
+        const losers = scored.slice(1);
+        const canonicalIdStr = String(canonical.id);
+        const loserIdsStr = losers.map((l) => String(l.id));
+
+        // Guard 3c: a loser id must not be a canonical for another group.
+        // (Impossible with placeId grouping since each doc has one placeId,
+        // but we assert for defense.)
+        const collision = loserIdsStr.find((id) =>
+          seenCanonicalIds.has(id),
+        );
+        if (collision) {
+          perGroup.push({
+            placeId: group._id,
+            canonicalId: canonicalIdStr,
+            loserIds: loserIdsStr,
+            loserCount: loserIdsStr.length,
+            flaggedReason: `loser ${collision} is also canonical for a prior group`,
+          });
+          groupsFlaggedForReview += 1;
+          continue;
+        }
+        seenCanonicalIds.add(canonicalIdStr);
+
+        try {
+          const purgeSummary = await this.purgeBusinessData(
+            targetConn,
+            losers.map((l) => l.id),
+            { dryRun },
+          );
+          perGroup.push({
+            placeId: group._id,
+            canonicalId: canonicalIdStr,
+            loserIds: loserIdsStr,
+            loserCount: loserIdsStr.length,
+            purgeSummary,
+          });
+          groupsProcessed += 1;
+          // purgeSummary.businesses is either the count (dry-run) or the
+          // deletedCount (live). Both are meaningful for the total.
+          losersDeleted += Math.max(0, purgeSummary.businesses ?? 0);
+        } catch (err: any) {
+          perGroup.push({
+            placeId: group._id,
+            canonicalId: canonicalIdStr,
+            loserIds: loserIdsStr,
+            loserCount: loserIdsStr.length,
+            flaggedReason: err?.message ?? String(err),
+          });
+          groupsFlaggedForReview += 1;
+        }
+      }
+
+      this.logger.log(
+        `[DEDUP${dryRun ? '-DRYRUN' : ''}] env=${environment} ` +
+          `groupsFound=${duplicateGroupsFound} processed=${groupsProcessed} ` +
+          `losersDeleted=${losersDeleted} flagged=${groupsFlaggedForReview}`,
+      );
+
+      return {
+        environment,
+        dryRun,
+        totals: {
+          duplicateGroupsFound,
+          groupsProcessed,
+          losersDeleted,
+          groupsFlaggedForReview,
+        },
+        perGroup,
+      };
+    } finally {
+      await targetConn.close();
+    }
+  }
+
+  // Higher score = more likely to be the useful copy. Weights are ordered
+  // to match the eligibility gate's evaluation order (real_cover first,
+  // real_hours next, taxonomy_present, active_outlet) — the canonical we
+  // keep should be the one most likely to pass the gate on its own.
+  private scoreDedupCandidate(doc: Record<string, any>): number {
+    let score = 0;
+    const cover = typeof doc.cover === 'string' ? doc.cover : '';
+    const coverIsReal =
+      !!cover &&
+      cover !== SEED_DEFAULT_COVER &&
+      !SeedingPipelineService.DEDUP_GOOGLE_HOST_RE.test(cover) &&
+      SeedingPipelineService.DEDUP_MEDIA_STAGING_RE.test(cover);
+    if (coverIsReal) score += 16;
+
+    const rs = doc.resolveStatus;
+    if (
+      rs &&
+      rs.hours === 'done' &&
+      Array.isArray(rs.hoursRaw) &&
+      rs.hoursRaw.length > 0
+    ) {
+      score += 8;
+    }
+
+    if (
+      doc.businessIndustry &&
+      Array.isArray(doc.businessCategories) &&
+      doc.businessCategories.length > 0
+    ) {
+      score += 4;
+    }
+
+    if (
+      typeof doc.activatedOutletsLength === 'number' &&
+      doc.activatedOutletsLength >= 1
+    ) {
+      score += 2;
+    }
+    return score;
+  }
+
+  // ── Admin: Resync city from addressLine1 ─────────────────────────────────
+  //
+  // Seeded businesses (isCvb || isFromCrawler) where `city` has drifted from
+  // the value implied by `addressLine1` — county names in place of borough,
+  // township/village splits in NY, truncated multi-word names — get excluded
+  // by the gated-migration `valid_address` gate. This method re-derives city
+  // from the already-trusted `addressLine1`: strip trailing country, split
+  // on commas, take the second-to-last segment (the one immediately before
+  // the state/zip). Same derivation as parseAddress in scraper-adapter.ts,
+  // applied to the stored address instead of a raw scrape.
+  //
+  // Only the `city` field is touched. Any record whose addressLine1 has
+  // fewer than 2 segments after country stripping, or whose derived
+  // candidate is empty or purely numeric, is skipped and surfaced as
+  // `skippedAmbiguousSample` for operator review. Environment is locked to
+  // `staging` — the task fixes only pinntagStaging.
+  //
+  // Same request body drives all three operator phases:
+  //   dryRun:true                    → report scans, mismatches, samples
+  //   dryRun:false + businessIds:[…] → apply on hand-picked sample only
+  //   dryRun:false + limit:N (opt)   → apply, capped at N writes; loop until
+  //                                    the response reports 0 corrected
+  async resyncCityFromAddressLine1(opts: {
+    environment: string;
+    adminPassword: string;
+    dryRun?: boolean;
+    businessIds?: string[];
+    limit?: number;
+  }): Promise<{
+    environment: string;
+    dryRun: boolean;
+    totals: {
+      scanned: number;
+      mismatchCount: number;
+      corrected: number;
+      skippedAmbiguous: number;
+    };
+    mismatchSample: Array<{
+      businessId: string;
+      currentCity: string;
+      derivedCity: string;
+      addressLine1: string;
+    }>;
+    skippedAmbiguousSample: Array<{
+      businessId: string;
+      currentCity: string;
+      addressLine1: string;
+      reason: string;
+    }>;
+  }> {
+    this.verifyAdminPassword(opts.adminPassword);
+    const dryRun = opts.dryRun !== false; // default dry
+    const environment = opts.environment;
+    if (environment !== 'staging') {
+      throw new HttpException(
+        'resyncCityFromAddressLine1 only runs against staging',
+        400,
+      );
+    }
+
+    const targetUri = this.resolveTargetUri(environment);
+    const targetConn = await mongoose.createConnection(targetUri).asPromise();
+
+    try {
+      const businesses = targetConn.collection('businesses');
+      // Cohort filter uses the shared buildSeededFilter so this pass sees
+      // the union of legacy-flagged AND manual-seeder businesses. The
+      // prior hardcoded $or silently skipped the manual-seeder cohort.
+      const match: Record<string, any> = {
+        ...buildSeededFilter(),
+        addressLine1: { $nin: [null, ''] },
+        city: { $nin: [null, ''] },
+      };
+      if (opts.businessIds?.length) {
+        match._id = {
+          $in: opts.businessIds.map(
+            (id) => new mongoose.Types.ObjectId(id),
+          ),
+        };
+      }
+
+      const cursor = businesses.find(match, {
+        projection: { _id: 1, addressLine1: 1, city: 1 },
+      });
+
+      const SAMPLE_CAP = 30;
+      const writeCap =
+        opts.limit && opts.limit > 0
+          ? opts.limit
+          : Number.POSITIVE_INFINITY;
+
+      let scanned = 0;
+      let mismatchCount = 0;
+      let corrected = 0;
+      let skippedAmbiguous = 0;
+      const mismatchSample: Array<{
+        businessId: string;
+        currentCity: string;
+        derivedCity: string;
+        addressLine1: string;
+      }> = [];
+      const skippedAmbiguousSample: Array<{
+        businessId: string;
+        currentCity: string;
+        addressLine1: string;
+        reason: string;
+      }> = [];
+
+      while (await cursor.hasNext()) {
+        if (!dryRun && corrected >= writeCap) break;
+        const doc = (await cursor.next()) as any;
+        if (!doc) break;
+        scanned += 1;
+
+        const addressLine1 = String(doc.addressLine1 || '');
+        const currentCity = String(doc.city || '');
+        const { derivedCity, ambiguousReason } =
+          this.deriveCityFromAddressLine1(addressLine1);
+
+        if (!derivedCity) {
+          skippedAmbiguous += 1;
+          if (skippedAmbiguousSample.length < SAMPLE_CAP) {
+            skippedAmbiguousSample.push({
+              businessId: String(doc._id),
+              currentCity,
+              addressLine1,
+              reason: ambiguousReason ?? 'unknown',
+            });
+          }
+          continue;
+        }
+
+        // Case- and whitespace-insensitive equality: skip records that only
+        // differ in casing/whitespace — nothing has actually drifted.
+        if (
+          derivedCity.trim().toLowerCase() ===
+          currentCity.trim().toLowerCase()
+        ) {
+          continue;
+        }
+
+        mismatchCount += 1;
+        if (mismatchSample.length < SAMPLE_CAP) {
+          mismatchSample.push({
+            businessId: String(doc._id),
+            currentCity,
+            derivedCity,
+            addressLine1,
+          });
+        }
+
+        if (!dryRun) {
+          await businesses.updateOne(
+            { _id: doc._id },
+            { $set: { city: derivedCity } },
+          );
+          corrected += 1;
+        }
+      }
+
+      this.logger.log(
+        `[RESYNC-CITY${dryRun ? '-DRYRUN' : ''}] env=${environment} ` +
+          `scanned=${scanned} mismatchCount=${mismatchCount} ` +
+          `corrected=${corrected} skippedAmbiguous=${skippedAmbiguous}`,
+      );
+
+      return {
+        environment,
+        dryRun,
+        totals: { scanned, mismatchCount, corrected, skippedAmbiguous },
+        mismatchSample,
+        skippedAmbiguousSample,
+      };
+    } finally {
+      await targetConn.close();
+    }
+  }
+
+  // Re-derive city from the trusted addressLine1: strip trailing country,
+  // split on commas, take the second-to-last segment. Returns null with a
+  // reason when the address is too malformed to safely derive from — caller
+  // flags these as skippedAmbiguous rather than writing.
+  private deriveCityFromAddressLine1(addressLine1: string): {
+    derivedCity: string | null;
+    ambiguousReason?: string;
+  } {
+    const raw = (addressLine1 ?? '').toString().trim();
+    if (!raw) {
+      return { derivedCity: null, ambiguousReason: 'empty addressLine1' };
+    }
+    const withoutCountry = raw
+      .replace(/,\s*(USA|United States(?: of America)?)\s*$/i, '')
+      .trim();
+    const parts = withoutCountry
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parts.length < 2) {
+      return {
+        derivedCity: null,
+        ambiguousReason: 'fewer than 2 segments after country strip',
+      };
+    }
+    const candidate = parts[parts.length - 2].trim();
+    if (!candidate) {
+      return {
+        derivedCity: null,
+        ambiguousReason: 'derived segment empty/whitespace',
+      };
+    }
+    if (/^\d+$/.test(candidate)) {
+      return {
+        derivedCity: null,
+        ambiguousReason: 'derived segment is purely numeric',
+      };
+    }
+    return { derivedCity: candidate };
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
