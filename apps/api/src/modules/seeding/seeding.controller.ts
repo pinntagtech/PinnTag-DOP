@@ -36,6 +36,7 @@ import { PublishSessionDto } from './dto/publish-session.dto';
 import { adaptScraperData } from './engines/scraper-adapter';
 import { computeDominant } from './common/dominant';
 import { GOOGLE_IMAGE_HOST_REGEX } from './common/google-url';
+import { buildSeededFilter } from './common/seeded-cohort';
 import {
   SeedingModules,
   SeedingRecordStatus,
@@ -1129,9 +1130,7 @@ export class SeedingController {
       // Seeded-only + website present + not already scraped from website.
       // If the caller passed explicit ids, honour them AND the same gate;
       // this stops a stray id list from writing to unrelated businesses.
-      const baseMatch: Record<string, any> = {
-        $or: [{ isCvb: true }, { isFromCrawler: true }],
-      };
+      const baseMatch: Record<string, any> = buildSeededFilter();
       if (body.businessIds?.length) {
         const oids = body.businessIds
           .filter((id) => mongoose.isValidObjectId(id))

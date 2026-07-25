@@ -229,6 +229,31 @@ export class BusinessGateStatus {
 export const BusinessGateStatusSchema =
   SchemaFactory.createForClass(BusinessGateStatus);
 
+// Materialized cohort provenance. Written by the provenance-recompute
+// endpoint so filters, gate passes, and dedup can select the seeded
+// corpus without $lookup into businessusers on every query. `sources`
+// is an array because a single business can legitimately be both a
+// crawler-seeded record and a manual-seeder record (rare but possible).
+// `isSeeded` is the union: true iff any of `isCvb`, `isFromCrawler`,
+// or a manual-seeder link is present. Never set to false on a doc that
+// currently carries a legacy flag — recompute widens, never shrinks.
+@Schema({ _id: false })
+export class BusinessSeedProvenance {
+  @Prop({ type: Boolean, default: false })
+  isSeeded: boolean;
+
+  @Prop({ type: [String], default: [] })
+  sources: string[];
+
+  @Prop({ type: String, default: null })
+  seederEmail: string | null;
+
+  @Prop({ type: Date })
+  computedAt: Date;
+}
+export const BusinessSeedProvenanceSchema =
+  SchemaFactory.createForClass(BusinessSeedProvenance);
+
 // ─── Main Business schema ────────────────────────────────────────────────────
 
 @Schema({ timestamps: true })
@@ -661,6 +686,9 @@ export class Business {
 
   @Prop({ type: BusinessGateStatusSchema })
   gateStatus: BusinessGateStatus;
+
+  @Prop({ type: BusinessSeedProvenanceSchema })
+  seedProvenance: BusinessSeedProvenance;
 }
 
 export type BusinessDocument = Business & Document;
@@ -706,3 +734,6 @@ BusinessSchema.index({ 'gateStatus.c7_domestic_coords': 1 });
 BusinessSchema.index({ 'gateStatus.c9_verified_placeId': 1 });
 BusinessSchema.index({ 'gateStatus.c10_verified_email': 1 });
 BusinessSchema.index({ 'gateStatus.c11_verified_name': 1 });
+BusinessSchema.index({ 'seedProvenance.isSeeded': 1 });
+BusinessSchema.index({ 'seedProvenance.sources': 1 });
+BusinessSchema.index({ 'seedProvenance.seederEmail': 1 });

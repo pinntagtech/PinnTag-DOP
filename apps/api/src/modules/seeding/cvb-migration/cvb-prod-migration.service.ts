@@ -13,6 +13,7 @@ import {
   EnvironmentUriKey,
 } from '../../../common/constants';
 import { fullStateName } from '../common/us-states';
+import { seededCohortOrClause } from '../common/seeded-cohort';
 
 // Schemaless + timestamped: writes get fresh createdAt/updatedAt.
 const LOOSE_SCHEMA = new mongoose.Schema<any>(
@@ -20,10 +21,11 @@ const LOOSE_SCHEMA = new mongoose.Schema<any>(
   { strict: false, timestamps: true },
 );
 
-// Same widened CVB pool used elsewhere in the seeding module:
-// isCvb OR isFromCrawler, excluding soft-deleted docs.
+// Same widened CVB pool used elsewhere in the seeding module: delegates
+// to seededCohortOrClause so the manual-seeder cohort (materialized as
+// seedProvenance.isSeeded) is included alongside isCvb/isFromCrawler.
 const CVB_BASE_FILTER = {
-  $or: [{ isCvb: true }, { isFromCrawler: true }],
+  $or: seededCohortOrClause(),
   isDeleted: { $ne: true },
 };
 
@@ -643,7 +645,7 @@ export class CvbProdMigrationService {
       isDeleted: { $ne: true },
       $and: [
         {
-          $or: [{ isCvb: true }, { isFromCrawler: true }],
+          $or: seededCohortOrClause(),
         },
       ],
     };

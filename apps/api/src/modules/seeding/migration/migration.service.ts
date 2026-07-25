@@ -20,6 +20,7 @@ import {
   SeedingRecordDocument,
 } from '../schemas/seeding-record.schema';
 import { fullStateName } from '../common/us-states';
+import { seededCohortOrClause } from '../common/seeded-cohort';
 import {
   buildSeededBusinessFields,
   hasRealBotCover,
@@ -821,7 +822,7 @@ export class MigrationService {
       // count queries for cost reasons.
       const filter: Record<string, any> = {
         $and: [
-          { $or: [{ isFromCrawler: true }, { isCvb: true }] },
+          { $or: seededCohortOrClause() },
           { isActive: true },
           { activatedOutletsLength: { $gte: 1 } },
           { cover: /media-staging\.pinntag\.com/ },

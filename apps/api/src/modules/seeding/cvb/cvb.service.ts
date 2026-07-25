@@ -9,6 +9,7 @@ import {
   SeedingRecordStatus,
 } from '../../../common/constants';
 import { validateCvbBusiness } from './cvb-validator';
+import { seededCohortOrClause, buildSeededFilter } from '../common/seeded-cohort';
 
 @Injectable()
 export class CvbService {
@@ -69,7 +70,7 @@ export class CvbService {
       const query: Record<string, any> = {
         isDeleted: { $ne: true },
         $and: [
-          { $or: [{ isCvb: true }, { isFromCrawler: true }] },
+          { $or: seededCohortOrClause() },
         ],
       };
 
@@ -272,7 +273,7 @@ export class CvbService {
               (id) => new mongoose.Types.ObjectId(id),
             ),
           },
-          $or: [{ isCvb: true }, { isFromCrawler: true }],
+          $or: seededCohortOrClause(),
         })
         .lean() as any[];
 
@@ -390,11 +391,11 @@ export class CvbService {
       const db = conn.db!;
       const [cities, states, industries, categories] = await Promise.all([
         BusinessModel.distinct('city', {
-          $or: [{ isCvb: true }, { isFromCrawler: true }],
+          ...buildSeededFilter(),
           city: { $nin: [null, ''] },
         }),
         BusinessModel.distinct('state', {
-          $or: [{ isCvb: true }, { isFromCrawler: true }],
+          ...buildSeededFilter(),
           state: { $nin: [null, ''] },
         }),
         db

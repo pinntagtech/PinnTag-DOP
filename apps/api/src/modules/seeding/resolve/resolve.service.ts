@@ -8,6 +8,7 @@ import {
 import { BotJobService } from '../bot/bot-job.service';
 import { BotJobType } from '../schemas/bot-job.schema';
 import { defaultRegularTiming } from '../data-repair/data-repair.constants';
+import { seededCohortOrClause } from '../common/seeded-cohort';
 import { parseHoursRaw } from './hours-parser';
 import {
   canonicalCategoryIds,
@@ -179,7 +180,7 @@ export class ResolveService {
 
       const query: Record<string, any> = {
         $and: [
-          { $or: [{ isCvb: true }, { isFromCrawler: true }] },
+          { $or: seededCohortOrClause() },
           { isDeleted: { $ne: true } },
           { addressLine1: { $nin: [null, ''] } },
           { city: { $nin: [null, ''] } },

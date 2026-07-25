@@ -7,6 +7,7 @@ import {
   GATE_CRITERIA,
   GateBooleans,
 } from './gate-predicates';
+import { buildSeededFilter } from '../common/seeded-cohort';
 
 const RECOMPUTE_BATCH_SIZE = 500;
 
@@ -32,13 +33,6 @@ const RECOMPUTE_PROJECTION = {
   country: 1,
   emailVerification: 1,
 } as const;
-
-function seededFilter(): Record<string, any> {
-  // Kept as a function returning a fresh mutable object because Mongo's
-  // Filter<T> types reject a `readonly` literal. Trivial cost, avoids a
-  // sprinkle of `as any` throughout the service.
-  return { $or: [{ isCvb: true }, { isFromCrawler: true }] };
-}
 
 export interface GateRecomputeResult {
   environment: string;
@@ -102,7 +96,7 @@ export class GateService {
       const businesses = conn.collection('businesses');
       const [agg] = (await businesses
         .aggregate([
-          { $match: seededFilter() },
+          { $match: buildSeededFilter() },
           {
             $group: {
               _id: null,
@@ -171,7 +165,7 @@ export class GateService {
         [
           {
             $match: {
-              ...seededFilter(),
+              ...buildSeededFilter(),
               placeId: { $type: 'string', $ne: '' },
             },
           },
@@ -195,7 +189,7 @@ export class GateService {
       const failByCriterion: Record<string, number> = {};
       for (const c of GATE_CRITERIA) failByCriterion[c] = 0;
 
-      const cursor = businesses.find(seededFilter(), {
+      const cursor = businesses.find(buildSeededFilter(), {
         projection: RECOMPUTE_PROJECTION,
       });
       const computedAt = new Date();

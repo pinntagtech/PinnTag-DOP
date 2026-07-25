@@ -10,18 +10,19 @@ import {
   SeedingSessionType,
 } from '../../../common/constants';
 import { Exceptions } from '../../../common/errors';
+import { seededCohortOrClause } from '../common/seeded-cohort';
 
 const BACKFILL_ENV = SeedingEnvironments.STAGING;
 const BACKFILL_BATCH = 500;
 const BACKFILL_CANDIDATE_WINDOW = 1500;
 const BACKFILL_SESSION_NAME = 'Cover Backfill';
 
-// Coverless = isCvb or isFromCrawler, missing/empty cover, has a placeId.
+// Coverless = seeded cohort, missing/empty cover, has a placeId.
 // Reused by getStats() and queueBatch() so the two endpoints can never
 // disagree on what "coverless" means.
 const coverlessFilter: Record<string, any> = {
   $and: [
-    { $or: [{ isCvb: true }, { isFromCrawler: true }] },
+    { $or: seededCohortOrClause() },
     { $or: [{ cover: { $exists: false } }, { cover: '' }, { cover: null }] },
     { placeId: { $exists: true, $nin: ['', null] } },
   ],

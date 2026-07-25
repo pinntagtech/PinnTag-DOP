@@ -23,6 +23,7 @@ import {
   DopSyncStateDocument,
 } from '../schemas/dop-sync-run.schema';
 import { DopLinkService } from '../activation/dop-link.service';
+import { buildSeededFilter } from '../common/seeded-cohort';
 import {
   BUSINESS_FILTER_ARRAY_KEYS,
   OUTLET_FILTER_ARRAY_KEYS,
@@ -622,9 +623,9 @@ export class DbSyncService {
       const BusinessModel =
         conn.models['Business'] ||
         conn.model('Business', LOOSE_SCHEMA, 'businesses');
-      const targetCount = await BusinessModel.countDocuments({
-        $or: [{ isFromCrawler: true }, { isCvb: true }],
-      });
+      const targetCount = await BusinessModel.countDocuments(
+        buildSeededFilter(),
+      );
       return Math.max(0, targetCount - scopeIds.length);
     } finally {
       await conn.close();

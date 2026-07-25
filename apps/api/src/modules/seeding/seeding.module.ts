@@ -57,6 +57,7 @@ import { CoverBackfillService } from './cover-backfill/cover-backfill.service';
 import { CoverBackfillController } from './cover-backfill/cover-backfill.controller';
 import { GateService } from './console/gate.service';
 import { ConsoleService } from './console/console.service';
+import { ProvenanceService } from './console/provenance.service';
 import { ConsoleController } from './console/console.controller';
 import { SeedingController } from './seeding.controller';
 import { AuthModule } from '../auth/auth.module';
@@ -115,6 +116,7 @@ import { LocationsModule } from '../locations/locations.module';
     CoverBackfillService,
     GateService,
     ConsoleService,
+    ProvenanceService,
   ],
   exports: [
     SeedingSessionService,

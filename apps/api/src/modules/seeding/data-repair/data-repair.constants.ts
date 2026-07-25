@@ -50,12 +50,13 @@ export const DATA_REPAIR_BATCH_SIZE = 50;
 // opening-hours, missing-outlets, activate-inactive, fix-taxonomy,
 // fix-address). DOP must NEVER read or write an organically-created /
 // owner-onboarded business — only ones the seeding pipeline produced.
-// Both flags can identify a seeded business: `isCvb` (Convention &
-// Visitors Bureau import) and `isFromCrawler` (Google-grid crawler).
-// An OR between them captures all seeded sources.
-export const SEEDED_ONLY: Record<string, any> = {
-  $or: [{ isCvb: true }, { isFromCrawler: true }],
-};
+// Delegates to the shared buildSeededFilter so this scope stays aligned
+// with the console / gate / migration / cover-backfill call-sites and
+// picks up the manual-seeder cohort (materialized as
+// `seedProvenance.isSeeded`) automatically.
+import { buildSeededFilter } from '../common/seeded-cohort';
+
+export const SEEDED_ONLY: Record<string, any> = buildSeededFilter();
 
 // AND the seeded-only scope into an existing filter. Appends to the
 // caller's $and array (creating it if absent) so any prior $and / $or

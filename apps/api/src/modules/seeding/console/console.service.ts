@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import mongoose from 'mongoose';
 import { GateService } from './gate.service';
 import { GATE_CRITERIA } from './gate-predicates';
+import { buildSeededFilter } from '../common/seeded-cohort';
 import {
   ConsoleBusinessRow,
   ConsoleFacetsRequest,
@@ -35,10 +36,6 @@ const ROW_PROJECTION = {
   createdAt: 1,
   updatedAt: 1,
 } as const;
-
-function seededFilter(): Record<string, any> {
-  return { $or: [{ isCvb: true }, { isFromCrawler: true }] };
-}
 
 @Injectable()
 export class ConsoleService {
@@ -149,7 +146,7 @@ export class ConsoleService {
     businesses: mongoose.mongo.Collection,
     filter: ConsoleFilter,
   ): Promise<Record<string, any>> {
-    const clauses: any[] = [seededFilter()];
+    const clauses: any[] = [buildSeededFilter()];
 
     if (filter.q) {
       const q = filter.q.trim();
@@ -266,7 +263,7 @@ export class ConsoleService {
         [
           {
             $match: {
-              ...seededFilter(),
+              ...buildSeededFilter(),
               placeId: { $type: 'string', $ne: '' },
             },
           },

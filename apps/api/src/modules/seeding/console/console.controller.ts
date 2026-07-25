@@ -15,6 +15,7 @@ import { Roles } from '../../auth/decorators/roles.decorator';
 import { DopUserRole } from '../../auth/schemas/dop-user.schema';
 import { ConsoleService } from './console.service';
 import { GateService } from './gate.service';
+import { ProvenanceService } from './provenance.service';
 import type {
   ConsoleFacetsRequest,
   ConsoleSearchRequest,
@@ -32,6 +33,7 @@ export class ConsoleController {
   constructor(
     private readonly consoleService: ConsoleService,
     private readonly gateService: GateService,
+    private readonly provenanceService: ProvenanceService,
   ) {}
 
   @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN, DopUserRole.OPERATOR)
@@ -72,5 +74,23 @@ export class ConsoleController {
       throw new HttpException('environment is required', 400);
     }
     return this.gateService.recompute(body.environment);
+  }
+
+  // Materialize Business.seedProvenance across the seeded corpus. Locked
+  // to staging in the service. `dryRun` defaults to true — the endpoint
+  // reports the breakdown without touching a doc unless the caller
+  // explicitly opts in with `dryRun: false`.
+  @Roles(DopUserRole.ADMIN, DopUserRole.SUPER_ADMIN)
+  @Post('provenance/recompute')
+  async provenanceRecompute(
+    @Body() body: { environment: string; dryRun?: boolean },
+  ) {
+    if (!body?.environment) {
+      throw new HttpException('environment is required', 400);
+    }
+    return this.provenanceService.recompute({
+      environment: body.environment,
+      dryRun: body.dryRun,
+    });
   }
 }
