@@ -18,6 +18,7 @@ import GatedMigrationPage from './pages/GatedMigrationPage';
 import DataRepairPage from './pages/DataRepairPage';
 import ResolveBusinessPage from './pages/ResolveBusinessPage';
 import MissingCoversPage from './pages/MissingCoversPage';
+import BusinessConsolePage from './pages/BusinessConsolePage';
 
 export default function App() {
   return (
@@ -122,6 +123,16 @@ export default function App() {
                 requiredRole={['super_admin', 'admin', 'operator']}
               >
                 <MissingCoversPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="businesses"
+            element={
+              <ProtectedRoute
+                requiredRole={['super_admin', 'admin', 'operator']}
+              >
+                <BusinessConsolePage />
               </ProtectedRoute>
             }
           />
