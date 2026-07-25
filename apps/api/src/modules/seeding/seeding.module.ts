@@ -55,6 +55,9 @@ import { EmailNotifier } from './resolve/notifier';
 import { VerifyAndFixService } from './verify/verify-and-fix.service';
 import { CoverBackfillService } from './cover-backfill/cover-backfill.service';
 import { CoverBackfillController } from './cover-backfill/cover-backfill.controller';
+import { GateService } from './console/gate.service';
+import { ConsoleService } from './console/console.service';
+import { ConsoleController } from './console/console.controller';
 import { SeedingController } from './seeding.controller';
 import { AuthModule } from '../auth/auth.module';
 import { LocationsModule } from '../locations/locations.module';
@@ -84,6 +87,7 @@ import { LocationsModule } from '../locations/locations.module';
     AddressParseController,
     BotSourceController,
     CoverBackfillController,
+    ConsoleController,
   ],
   providers: [
     SeedingLogService,
@@ -109,6 +113,8 @@ import { LocationsModule } from '../locations/locations.module';
     EmailNotifier,
     VerifyAndFixService,
     CoverBackfillService,
+    GateService,
+    ConsoleService,
   ],
   exports: [
     SeedingSessionService,

@@ -26,6 +26,16 @@ import {
   SEED_DEFAULT_COVER,
   stripManagedFields,
 } from '../activation/seed-defaults';
+import {
+  evaluateGateShortCircuit as sharedEvaluateGateShortCircuit,
+  extractCoords as sharedExtractCoords,
+  URL_RE as GATE_URL_RE,
+  PHONE_RE as GATE_PHONE_RE,
+  US_LAT_MIN as GATE_US_LAT_MIN,
+  US_LAT_MAX as GATE_US_LAT_MAX,
+  US_LNG_MIN as GATE_US_LNG_MIN,
+  US_LNG_MAX as GATE_US_LNG_MAX,
+} from '../console/gate-predicates';
 
 // Strip Mongoose-managed fields from a spread of a lean source doc so
 // that target creates get fresh stamps (migration time) and a fresh _id.
@@ -745,143 +755,15 @@ export class MigrationService {
   // SOURCE (staging) docs, and reuses migrateOneBusiness for the actual
   // per-business create/activate/media work.
 
-  private static readonly GATED_US_LAT_MIN = 24;
-  private static readonly GATED_US_LAT_MAX = 50;
-  private static readonly GATED_US_LNG_MIN = -125;
-  private static readonly GATED_US_LNG_MAX = -66;
-  private static readonly GATED_URL_RE = /^\s*(https?:\/\/|www\.)/i;
-  private static readonly GATED_PHONE_RE = /^\+?[\d\s\-().]{7,}$/;
-  private static readonly GATED_COUNTY_RE = /county/i;
-  private static readonly GATED_GOOGLE_HOST_RE = /googleusercontent/i;
-  private static readonly GATED_MEDIA_STAGING_RE =
-    /media-staging\.pinntag\.com/i;
-
-  private gatedIsFiniteNumber(v: any): v is number {
-    return typeof v === 'number' && Number.isFinite(v);
-  }
-
-  private gatedExtractCoords(
-    doc: Record<string, any>,
-  ): { lat: number; lng: number } | null {
-    const lat = this.gatedIsFiniteNumber(doc.latitude)
-      ? doc.latitude
-      : this.gatedIsFiniteNumber(doc.lat)
-        ? doc.lat
-        : this.gatedIsFiniteNumber(doc?.location?.coordinates?.[1])
-          ? doc.location.coordinates[1]
-          : null;
-    const lng = this.gatedIsFiniteNumber(doc.longitude)
-      ? doc.longitude
-      : this.gatedIsFiniteNumber(doc.lng)
-        ? doc.lng
-        : this.gatedIsFiniteNumber(doc?.location?.coordinates?.[0])
-          ? doc.location.coordinates[0]
-          : null;
-    if (lat === null || lng === null) return null;
-    return { lat, lng };
-  }
-
+  // Gate predicates now live in ../console/gate-predicates.ts — one
+  // source of truth shared with the Business Console. This wrapper
+  // preserves the historical {ok, reason} shape the migration callers
+  // expect (see buildGatedMigrationScope and previewGatedMigration).
   private gatedEvaluate(
     doc: Record<string, any> | undefined,
     placeIdCounts: Map<string, number>,
   ): { ok: true } | { ok: false; reason: string } {
-    if (!doc) return { ok: false, reason: 'missing_source_doc' };
-
-    // 1. active_outlet
-    if (
-      !(doc.isActive === true) ||
-      !(
-        typeof doc.activatedOutletsLength === 'number' &&
-        doc.activatedOutletsLength >= 1
-      )
-    ) {
-      return { ok: false, reason: 'active_outlet' };
-    }
-
-    // 1b. verified_placeId — exclude only PROVEN-wrong placeIds
-    // (confidence.match === false). Never-scored businesses are already
-    // gated out by real_hours (bot_error != 'done') and real_cover;
-    // a real B2 cover is itself proof the placeId resolved to a real
-    // business, since cover_sync scrapes per-placeId. So absent
-    // confidence PASSES here; only an explicit false fails.
-    if (doc?.resolveStatus?.confidence?.match === false) {
-      return { ok: false, reason: 'unverified_placeId' };
-    }
-
-    // 2. real_cover
-    const cover = typeof doc.cover === 'string' ? doc.cover : '';
-    if (
-      !cover ||
-      cover === SEED_DEFAULT_COVER ||
-      MigrationService.GATED_GOOGLE_HOST_RE.test(cover) ||
-      !MigrationService.GATED_MEDIA_STAGING_RE.test(cover)
-    ) {
-      return { ok: false, reason: 'real_cover' };
-    }
-
-    // 3. real_hours
-    const rs = doc.resolveStatus;
-    if (
-      !rs ||
-      rs.hours !== 'done' ||
-      !Array.isArray(rs.hoursRaw) ||
-      rs.hoursRaw.length === 0
-    ) {
-      return { ok: false, reason: 'real_hours' };
-    }
-
-    // 4. taxonomy_present
-    if (
-      !doc.businessIndustry ||
-      !Array.isArray(doc.businessCategories) ||
-      doc.businessCategories.length === 0
-    ) {
-      return { ok: false, reason: 'taxonomy_present' };
-    }
-
-    // 5. valid_address
-    const rawAddr =
-      typeof doc.addressLine1 === 'string' ? doc.addressLine1.trim() : '';
-    if (
-      !rawAddr ||
-      MigrationService.GATED_URL_RE.test(rawAddr) ||
-      MigrationService.GATED_PHONE_RE.test(rawAddr)
-    ) {
-      return { ok: false, reason: 'valid_address' };
-    }
-    const city = typeof doc.city === 'string' ? doc.city.trim() : '';
-    if (!city || MigrationService.GATED_COUNTY_RE.test(city)) {
-      return { ok: false, reason: 'valid_address' };
-    }
-
-    // 6. singleton_placeId
-    const placeId = typeof doc.placeId === 'string' ? doc.placeId.trim() : '';
-    if (!placeId) return { ok: false, reason: 'singleton_placeId' };
-    if ((placeIdCounts.get(placeId) ?? 0) > 1) {
-      return { ok: false, reason: 'singleton_placeId' };
-    }
-
-    // 7. domestic_coords
-    const coords = this.gatedExtractCoords(doc);
-    if (!coords) return { ok: false, reason: 'domestic_coords' };
-    if (coords.lat === 0 && coords.lng === 0) {
-      return { ok: false, reason: 'domestic_coords' };
-    }
-    const country =
-      typeof doc.country === 'string' ? doc.country.trim() : '';
-    if (country && country.toLowerCase() !== 'united states') {
-      return { ok: false, reason: 'domestic_coords' };
-    }
-    if (
-      coords.lat < MigrationService.GATED_US_LAT_MIN ||
-      coords.lat > MigrationService.GATED_US_LAT_MAX ||
-      coords.lng < MigrationService.GATED_US_LNG_MIN ||
-      coords.lng > MigrationService.GATED_US_LNG_MAX
-    ) {
-      return { ok: false, reason: 'domestic_coords' };
-    }
-
-    return { ok: true };
+    return sharedEvaluateGateShortCircuit(doc, placeIdCounts);
   }
 
   private async buildGatedMigrationScope(sourceEnv: string): Promise<{
@@ -975,8 +857,8 @@ export class MigrationService {
           typeof d.addressLine1 === 'string' ? d.addressLine1.trim() : '';
         if (
           !rawAddr ||
-          MigrationService.GATED_URL_RE.test(rawAddr) ||
-          MigrationService.GATED_PHONE_RE.test(rawAddr)
+          GATE_URL_RE.test(rawAddr) ||
+          GATE_PHONE_RE.test(rawAddr)
         ) {
           bump('valid_address');
           continue;
@@ -997,7 +879,7 @@ export class MigrationService {
 
         // domestic_coords — finite, not (0,0), country US (if present),
         // within US bbox.
-        const coords = this.gatedExtractCoords(d);
+        const coords = sharedExtractCoords(d);
         if (!coords || (coords.lat === 0 && coords.lng === 0)) {
           bump('domestic_coords');
           continue;
@@ -1009,10 +891,10 @@ export class MigrationService {
           continue;
         }
         if (
-          coords.lat < MigrationService.GATED_US_LAT_MIN ||
-          coords.lat > MigrationService.GATED_US_LAT_MAX ||
-          coords.lng < MigrationService.GATED_US_LNG_MIN ||
-          coords.lng > MigrationService.GATED_US_LNG_MAX
+          coords.lat < GATE_US_LAT_MIN ||
+          coords.lat > GATE_US_LAT_MAX ||
+          coords.lng < GATE_US_LNG_MIN ||
+          coords.lng > GATE_US_LNG_MAX
         ) {
           bump('domestic_coords');
           continue;

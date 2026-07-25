@@ -177,6 +177,58 @@ export class BusinessEmailVerification {
 export const BusinessEmailVerificationSchema =
   SchemaFactory.createForClass(BusinessEmailVerification);
 
+// Persisted per-doc snapshot of the 11-criterion quality gate. Written
+// only by GateService.recompute(); reads are cheap because everything is
+// already boolean on the doc. c1-c7 mirror the migration service's
+// gate exactly (via the shared gate-predicates module — no duplication).
+// c9 mirrors the migration service's "1b. verified_placeId" check.
+// c10 checks the emailVerification subdoc above. c11 has no backing
+// stage yet and is always false — remove that hard-coding once the
+// verified-name stage lands.
+@Schema({ _id: false })
+export class BusinessGateStatus {
+  @Prop({ type: Boolean, default: false })
+  c1_active_outlet: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c2_real_cover: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c3_real_hours: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c4_taxonomy_present: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c5_valid_address: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c6_singleton_placeId: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c7_domestic_coords: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c9_verified_placeId: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c10_verified_email: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  c11_verified_name: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  passLegacy9: boolean;
+
+  @Prop({ type: Boolean, default: false })
+  passPerfect11: boolean;
+
+  @Prop({ type: Date })
+  computedAt: Date;
+}
+export const BusinessGateStatusSchema =
+  SchemaFactory.createForClass(BusinessGateStatus);
+
 // ─── Main Business schema ────────────────────────────────────────────────────
 
 @Schema({ timestamps: true })
@@ -606,6 +658,9 @@ export class Business {
 
   @Prop({ type: BusinessEmailVerificationSchema })
   emailVerification: BusinessEmailVerification;
+
+  @Prop({ type: BusinessGateStatusSchema })
+  gateStatus: BusinessGateStatus;
 }
 
 export type BusinessDocument = Business & Document;
@@ -634,3 +689,20 @@ BusinessSchema.index({ name: 'text', tags: 'text' });
 BusinessSchema.index({ isActive: 1 });
 BusinessSchema.index({ 'emailVerification.source': 1 });
 BusinessSchema.index({ 'emailVerification.confidence': 1 });
+BusinessSchema.index({ placeId: 1 });
+BusinessSchema.index({ city: 1 });
+BusinessSchema.index({ state: 1 });
+BusinessSchema.index({ isCvb: 1 });
+BusinessSchema.index({ isFromCrawler: 1 });
+BusinessSchema.index({ 'gateStatus.passLegacy9': 1 });
+BusinessSchema.index({ 'gateStatus.passPerfect11': 1 });
+BusinessSchema.index({ 'gateStatus.c1_active_outlet': 1 });
+BusinessSchema.index({ 'gateStatus.c2_real_cover': 1 });
+BusinessSchema.index({ 'gateStatus.c3_real_hours': 1 });
+BusinessSchema.index({ 'gateStatus.c4_taxonomy_present': 1 });
+BusinessSchema.index({ 'gateStatus.c5_valid_address': 1 });
+BusinessSchema.index({ 'gateStatus.c6_singleton_placeId': 1 });
+BusinessSchema.index({ 'gateStatus.c7_domestic_coords': 1 });
+BusinessSchema.index({ 'gateStatus.c9_verified_placeId': 1 });
+BusinessSchema.index({ 'gateStatus.c10_verified_email': 1 });
+BusinessSchema.index({ 'gateStatus.c11_verified_name': 1 });
