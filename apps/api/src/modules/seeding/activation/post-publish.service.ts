@@ -22,7 +22,6 @@ import {
   buildSeededCreditWallet,
   buildSeededOutletFields,
   hasRealBotCover,
-  SEED_DEFAULT_COVER,
   stripManagedFields,
 } from './seed-defaults';
 import { SeedingRecordService } from '../seeding-record.service';
@@ -321,10 +320,14 @@ export class PostPublishService {
       // service always returns a usable string (long-URL fallback), so
       // this never throws and never produces a null field.
       if (!isMultiLocation) {
+        // No placeholder fallback — empty string tells AppsOnAir to
+        // render the share card without an image, which is honest for a
+        // record that has no cover yet. Once cover_sync lands a real B2
+        // cover, re-minting the share link would pick it up.
         const shareImage =
           (business as any).coverThumbnail ||
           (business as any).cover ||
-          SEED_DEFAULT_COVER;
+          '';
         const appRedirectLink =
           await this.dopLinkService.generateBusinessShareLink(
             String((business as any)._id),

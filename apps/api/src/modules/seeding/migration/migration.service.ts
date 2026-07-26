@@ -24,7 +24,6 @@ import { seededCohortOrClause } from '../common/seeded-cohort';
 import {
   buildSeededBusinessFields,
   hasRealBotCover,
-  SEED_DEFAULT_COVER,
   stripManagedFields,
 } from '../activation/seed-defaults';
 import {
@@ -424,12 +423,16 @@ export class MigrationService {
             publishedBusinessId,
         );
 
-        // Mint a FRESH consumer share link for the target env.
+        // Mint a FRESH consumer share link for the target env. No
+        // placeholder fallback — see post-publish.service.ts for the
+        // same treatment. AppsOnAir renders the share card without an
+        // image when imageUrl is empty; that is preferable to embedding
+        // the Defaults/* placeholder URL in the OG card.
         const shareImage =
           created.coverThumbnail ||
           created.cover ||
           businessDoc.cover ||
-          SEED_DEFAULT_COVER;
+          '';
         const appRedirectLink =
           await this.dopLinkService.generateBusinessShareLink(
             publishedBusinessId,

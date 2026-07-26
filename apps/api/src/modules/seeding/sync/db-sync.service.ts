@@ -34,8 +34,10 @@ import {
   SEED_BUSINESS_STATUS_COVER_ADDED,
   SEED_CONNECT_STATUS,
   SEED_CREATOR_TYPE_ADMIN,
+  // SEED_DEFAULT_COVER retained: gateEvaluate at ~L427 uses it as a
+  // READ (recognizing legacy placeholder-covered docs as failing c2).
+  // SEED_DEFAULT_LOGO dropped along with its writes; no read path.
   SEED_DEFAULT_COVER,
-  SEED_DEFAULT_LOGO,
   SEED_PROFILE_COMPLETION_LOGO,
   SEED_PROFILE_COMPLETION_PERCENTAGE,
   SEED_TEMPLATE_STATUS,
@@ -691,11 +693,12 @@ export class DbSyncService {
     this.maybeSetMissing(set, 'verificationStatus', live.verificationStatus, SEED_VERIFICATION_STATUS);
     this.maybeSetMissing(set, 'showVerificationBanner', live.showVerificationBanner, true);
 
-    // media defaults — protected; only fill if absent
-    this.maybeSetMissing(set, 'logo', live.logo, SEED_DEFAULT_LOGO);
-    this.maybeSetMissing(set, 'logoThumbnail', live.logoThumbnail, SEED_DEFAULT_LOGO);
-    this.maybeSetMissing(set, 'cover', live.cover, SEED_DEFAULT_COVER);
-    this.maybeSetMissing(set, 'coverThumbnail', live.coverThumbnail, SEED_DEFAULT_COVER);
+    // media defaults — the placeholder is deliberately NOT filled here
+    // (see stripPlaceholderCovers). A missing cover/logo stays missing;
+    // Cover Backfill / logo backfill discover the record precisely
+    // because it is missing, and the frontend renders its own fallback.
+    // logoUploaded still initializes to false because it's a boolean
+    // flag, not a URL, and its absence would be observably different.
     this.maybeSetMissing(set, 'logoUploaded', live.logoUploaded, false);
 
     // profile completion baseline
@@ -1374,10 +1377,13 @@ export class DbSyncService {
             // protected list for "real" overwrite, but it's the very field
             // we're trying to fill — set-if-missing applies).
             if (this.isEmpty(live.appRedirectLink)) {
+              // No placeholder fallback — see post-publish.service.ts
+              // for the same treatment. AppsOnAir renders the share
+              // card without an image when imageUrl is empty.
               const shareImage =
                 live.coverThumbnail ||
                 live.cover ||
-                SEED_DEFAULT_COVER;
+                '';
               const appRedirectLink =
                 await this.dopLinkService.generateBusinessShareLink(
                   publishedId,

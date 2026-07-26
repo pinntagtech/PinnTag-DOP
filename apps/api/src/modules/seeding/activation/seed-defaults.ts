@@ -140,13 +140,19 @@ export function buildSeededBusinessFields(
     showVerificationBanner: true,
     isCvb: base.isCvb ?? false,
 
-    logo: base.logo ?? SEED_DEFAULT_LOGO,
-    logoThumbnail: base.logoThumbnail ?? SEED_DEFAULT_LOGO,
+    // Cover / logo — never substitute the pinntag-assets Defaults/*
+    // placeholder. A null field is honest: the frontend renders its own
+    // fallback and Cover Backfill can discover the record. The placeholder
+    // would only hide it. See stripPlaceholderCovers for the cleanup pass
+    // that removed the old ones. `opts.hasBotCover` is retained on the
+    // signature for the small number of call-sites that still pass it,
+    // but it no longer affects the emitted value — with the placeholder
+    // gone both branches converge on `base.cover ?? null`.
+    logo: base.logo ?? null,
+    logoThumbnail: base.logoThumbnail ?? null,
     logoUploaded: base.logoUploaded ?? false,
-    cover: opts.hasBotCover ? base.cover : (base.cover ?? SEED_DEFAULT_COVER),
-    coverThumbnail: opts.hasBotCover
-      ? base.coverThumbnail
-      : (base.coverThumbnail ?? SEED_DEFAULT_COVER),
+    cover: base.cover ?? null,
+    coverThumbnail: base.coverThumbnail ?? null,
 
     profileCompletionStatus: SEED_PROFILE_COMPLETION_LOGO,
     profileCompletionPercentage: SEED_PROFILE_COMPLETION_PERCENTAGE,
