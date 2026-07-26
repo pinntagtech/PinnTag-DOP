@@ -1279,7 +1279,16 @@ export class SeedingPipelineService {
       mismatchCount: number;
       corrected: number;
       skippedAmbiguous: number;
+      // Categorical breakdown of the skippedAmbiguous total, so an
+      // operator can see how many records the state+ZIP guard caught
+      // vs. the earlier structural skips. Keys are stable tokens.
+      skippedAmbiguousByReason: Record<string, number>;
     };
+    // Top 10 states by mismatch count. Present because the initial
+    // dry-run was heavy on Georgia/Atlanta, suggesting cohort-specific
+    // addressLine1 formats. This makes concentration visible without
+    // a separate query.
+    stateDistribution: Array<{ state: string; count: number }>;
     mismatchSample: Array<{
       businessId: string;
       currentCity: string;
@@ -1325,7 +1334,9 @@ export class SeedingPipelineService {
       }
 
       const cursor = businesses.find(match, {
-        projection: { _id: 1, addressLine1: 1, city: 1 },
+        // `state` added so we can report top-10-by-mismatch. Nothing
+        // else is projected — city is the only write target.
+        projection: { _id: 1, addressLine1: 1, city: 1, state: 1 },
       });
 
       const SAMPLE_CAP = 30;
@@ -1338,6 +1349,8 @@ export class SeedingPipelineService {
       let mismatchCount = 0;
       let corrected = 0;
       let skippedAmbiguous = 0;
+      const skippedAmbiguousByReason: Record<string, number> = {};
+      const mismatchByState = new Map<string, number>();
       const mismatchSample: Array<{
         businessId: string;
         currentCity: string;
@@ -1359,17 +1372,21 @@ export class SeedingPipelineService {
 
         const addressLine1 = String(doc.addressLine1 || '');
         const currentCity = String(doc.city || '');
+        const state = String(doc.state || '');
         const { derivedCity, ambiguousReason } =
           this.deriveCityFromAddressLine1(addressLine1);
 
         if (!derivedCity) {
           skippedAmbiguous += 1;
+          const reasonKey = ambiguousReason ?? 'unknown';
+          skippedAmbiguousByReason[reasonKey] =
+            (skippedAmbiguousByReason[reasonKey] ?? 0) + 1;
           if (skippedAmbiguousSample.length < SAMPLE_CAP) {
             skippedAmbiguousSample.push({
               businessId: String(doc._id),
               currentCity,
               addressLine1,
-              reason: ambiguousReason ?? 'unknown',
+              reason: reasonKey,
             });
           }
           continue;
@@ -1385,6 +1402,11 @@ export class SeedingPipelineService {
         }
 
         mismatchCount += 1;
+        const stateKey = state.trim() || '(unknown)';
+        mismatchByState.set(
+          stateKey,
+          (mismatchByState.get(stateKey) ?? 0) + 1,
+        );
         if (mismatchSample.length < SAMPLE_CAP) {
           mismatchSample.push({
             businessId: String(doc._id),
@@ -1403,16 +1425,29 @@ export class SeedingPipelineService {
         }
       }
 
+      const stateDistribution = Array.from(mismatchByState.entries())
+        .map(([state, count]) => ({ state, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
+
       this.logger.log(
         `[RESYNC-CITY${dryRun ? '-DRYRUN' : ''}] env=${environment} ` +
           `scanned=${scanned} mismatchCount=${mismatchCount} ` +
-          `corrected=${corrected} skippedAmbiguous=${skippedAmbiguous}`,
+          `corrected=${corrected} skippedAmbiguous=${skippedAmbiguous} ` +
+          `skippedByReason=${JSON.stringify(skippedAmbiguousByReason)}`,
       );
 
       return {
         environment,
         dryRun,
-        totals: { scanned, mismatchCount, corrected, skippedAmbiguous },
+        totals: {
+          scanned,
+          mismatchCount,
+          corrected,
+          skippedAmbiguous,
+          skippedAmbiguousByReason,
+        },
+        stateDistribution,
         mismatchSample,
         skippedAmbiguousSample,
       };
@@ -1421,17 +1456,39 @@ export class SeedingPipelineService {
     }
   }
 
-  // Re-derive city from the trusted addressLine1: strip trailing country,
-  // split on commas, take the second-to-last segment. Returns null with a
-  // reason when the address is too malformed to safely derive from — caller
-  // flags these as skippedAmbiguous rather than writing.
+  // Re-derive city from the trusted addressLine1.
+  //
+  // Only derive when the address looks like a real US postal-format
+  // string: after the trailing country segment is stripped, the FINAL
+  // remaining segment must be a US state code + ZIP (e.g. "NY 10004" or
+  // "NJ 07747-1234"). Only then is the second-to-last segment safe to
+  // interpret as the city.
+  //
+  // Without this anchor, strings that happen to contain a comma but are
+  // not postal addresses (e.g. "The Ritz-Carlton, Atlanta 181 Peachtree
+  // Street Northwest") derive nonsense like a business name and would
+  // overwrite the correct `city`. The dry-run that surfaced this bug
+  // had roughly 10% of proposed corrections corrupting a good city with
+  // a business name or service description; the state+ZIP guard rejects
+  // those as `no_state_zip_segment`.
+  //
+  // Reason tokens are stable snake_case so the operator's counters
+  // (`skippedAmbiguousByReason`) stay consistent across runs:
+  //   - fewer_than_2_segments  : structural — comma missing or trailing
+  //   - no_state_zip_segment   : NEW — the state+ZIP anchor is absent
+  //   - empty_derived          : second-to-last segment blank
+  //   - numeric_derived        : second-to-last segment is digits only
+  //   - empty_addressLine1     : addressLine1 was empty/whitespace
+  private static readonly STATE_ZIP_RE =
+    /^[A-Za-z]{2}\s+\d{5}(-\d{4})?$/;
+
   private deriveCityFromAddressLine1(addressLine1: string): {
     derivedCity: string | null;
     ambiguousReason?: string;
   } {
     const raw = (addressLine1 ?? '').toString().trim();
     if (!raw) {
-      return { derivedCity: null, ambiguousReason: 'empty addressLine1' };
+      return { derivedCity: null, ambiguousReason: 'empty_addressLine1' };
     }
     const withoutCountry = raw
       .replace(/,\s*(USA|United States(?: of America)?)\s*$/i, '')
@@ -1443,20 +1500,32 @@ export class SeedingPipelineService {
     if (parts.length < 2) {
       return {
         derivedCity: null,
-        ambiguousReason: 'fewer than 2 segments after country strip',
+        ambiguousReason: 'fewer_than_2_segments',
       };
     }
+
+    // The postal-format anchor. If the final segment isn't "XX 12345"
+    // (optionally "-1234"), the address is not a comma-delimited postal
+    // string; the second-to-last segment is not safely a city.
+    const lastSegment = parts[parts.length - 1];
+    if (!SeedingPipelineService.STATE_ZIP_RE.test(lastSegment)) {
+      return {
+        derivedCity: null,
+        ambiguousReason: 'no_state_zip_segment',
+      };
+    }
+
     const candidate = parts[parts.length - 2].trim();
     if (!candidate) {
       return {
         derivedCity: null,
-        ambiguousReason: 'derived segment empty/whitespace',
+        ambiguousReason: 'empty_derived',
       };
     }
     if (/^\d+$/.test(candidate)) {
       return {
         derivedCity: null,
-        ambiguousReason: 'derived segment is purely numeric',
+        ambiguousReason: 'numeric_derived',
       };
     }
     return { derivedCity: candidate };
