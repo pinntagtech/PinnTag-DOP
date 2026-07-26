@@ -18,6 +18,23 @@ import { fullStateName } from '../common/us-states';
 export const SEED_DEFAULT_LOGO = DEFAULT_IMAGES.BUSINESS_LOGO;
 export const SEED_DEFAULT_COVER = DEFAULT_IMAGES.BUSINESS_COVER;
 
+// Matches any pinntag-assets Defaults/* asset URL — cover, logo, user
+// avatar, and anything future. Path-based on purpose so
+// `default+cover.svg`, `Default+Business+logo.png`, and any new default
+// dropped in the same bucket all get caught. The [.-][^/]*amazonaws.com
+// slot tolerates S3 URL variants (`s3.us-east-1.amazonaws.com`,
+// `s3-us-east-1.amazonaws.com`, `s3.amazonaws.com`).
+//
+// Use isPlaceholderAsset() rather than reaching for this constant
+// directly — it centralizes the null/empty guard.
+export const PLACEHOLDER_COVER_REGEX =
+  /pinntag-assets\.s3[.-][^/]*amazonaws\.com\/Defaults\//i;
+
+export function isPlaceholderAsset(url?: string | null): boolean {
+  if (!url || typeof url !== 'string') return false;
+  return PLACEHOLDER_COVER_REGEX.test(url);
+}
+
 // Bumped whenever the parity contract changes. dopSyncState rows pin the
 // version they were synced under; a bump invalidates every existing row and
 // forces a re-sync on the next applySync run.

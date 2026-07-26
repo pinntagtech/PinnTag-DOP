@@ -26,6 +26,7 @@ const BOT_TRIGGER_BATCH = 100;
 const ADMIN_PASSWORD_ACTIONS = new Set<ConsoleActionType>([
   'resync_city',
   'dedup_place_id',
+  'strip_placeholder_covers',
   'activate',
   'deactivate',
 ]);
@@ -265,6 +266,9 @@ export class RunService {
           break;
         case 'dedup_place_id':
           await this.runDedup(runId, input);
+          break;
+        case 'strip_placeholder_covers':
+          await this.runStripPlaceholderCovers(runId, input);
           break;
         case 'trigger_cover_sync':
           await this.runTriggerBot(runId, input, BotJobType.COVER_SYNC);
@@ -535,6 +539,61 @@ export class RunService {
         `groupsFound=${result.totals.duplicateGroupsFound} ` +
         `losersDeleted=${result.totals.losersDeleted} ` +
         `flagged=${result.totals.groupsFlaggedForReview}`,
+    );
+  }
+
+  // ── Action: strip_placeholder_covers ──────────────────────────────────
+  //
+  // Removes the pinntag-assets Defaults/* placeholder from `cover`,
+  // `coverThumbnail`, `coverUploaded`, and `logo` (only where the field
+  // itself is a placeholder). Never touches a real B2 cover — the
+  // pipeline guard checks isPlaceholderAsset() per field before every
+  // $unset. Resolves the selection to ids so ids-mode and filter-mode
+  // both narrow the pipeline's own scan.
+  private async runStripPlaceholderCovers(
+    runId: string,
+    input: Parameters<RunService['launch']>[0],
+  ): Promise<void> {
+    if (!input.dryRun && !input.adminPassword) {
+      throw new HttpException(
+        'strip_placeholder_covers requires adminPassword on a live run',
+        400,
+      );
+    }
+    const ids: string[] = [];
+    for await (const oid of this.consoleService.iterateSelectionIds(
+      input.environment,
+      input.selection,
+    )) {
+      ids.push(String(oid));
+    }
+
+    const result = await this.pipelineService.stripPlaceholderCovers({
+      environment: input.environment,
+      adminPassword: input.adminPassword ?? '',
+      dryRun: input.dryRun,
+      businessIds: ids,
+    });
+
+    // processed = scanned; succeeded = stripped; skipped = docs the
+    // Mongo match returned but which no longer matched the per-field
+    // guard (typically 0 — belt-and-braces).
+    await this.incrementCounters(runId, {
+      processed: result.totals.scanned,
+      succeeded: result.totals.stripped,
+      skipped: result.totals.scanned - result.totals.stripped,
+    });
+    await this.patch(runId, { result });
+    await this.appendLog(
+      runId,
+      'info',
+      `strip_placeholder_covers dryRun=${input.dryRun}: ` +
+        `scanned=${result.totals.scanned} ` +
+        `placeholderCovers=${result.totals.placeholderCovers} ` +
+        `placeholderLogos=${result.totals.placeholderLogos} ` +
+        `coverSyncEligible=${result.totals.coverSyncEligible} ` +
+        `unrecoverable=${result.totals.unrecoverable} ` +
+        `stripped=${result.totals.stripped}`,
     );
   }
 

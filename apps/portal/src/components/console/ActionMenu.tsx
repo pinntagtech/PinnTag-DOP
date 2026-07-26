@@ -28,6 +28,10 @@ interface ActionDef {
 const ACTIONS: ActionDef[] = [
   { key: 'resync_city', label: 'Resync city from address', needsAdminPassword: true },
   { key: 'dedup_place_id', label: 'Dedup by placeId', needsAdminPassword: true, danger: true },
+  // Strips the pinntag-assets Defaults/* placeholder so Cover Backfill
+  // discovery can queue the record for a real cover_sync. Never
+  // modifies a real B2 cover; guarded per-doc in the pipeline.
+  { key: 'strip_placeholder_covers', label: 'Strip placeholder covers', needsAdminPassword: true },
   { key: 'trigger_cover_sync', label: 'Trigger cover sync', needsAdminPassword: false },
   { key: 'trigger_image_sync', label: 'Trigger image sync', needsAdminPassword: false },
   { key: 'trigger_gallery_menu', label: 'Trigger gallery + menu', needsAdminPassword: false },

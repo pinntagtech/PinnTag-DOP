@@ -108,6 +108,7 @@ export type ConsoleSelection =
 export type ConsoleActionType =
   | 'resync_city'
   | 'dedup_place_id'
+  | 'strip_placeholder_covers'
   | 'trigger_email_scrape'
   | 'trigger_cover_sync'
   | 'trigger_image_sync'

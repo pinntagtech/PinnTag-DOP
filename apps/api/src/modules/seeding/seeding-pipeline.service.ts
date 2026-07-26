@@ -23,7 +23,11 @@ import { EnrichmentEngine } from './engines/enrichment.engine';
 import { PostPublishService } from './activation/post-publish.service';
 import { fullStateName } from './common/us-states';
 import { computeDominant } from './common/dominant';
-import { SEED_DEFAULT_COVER } from './activation/seed-defaults';
+import {
+  SEED_DEFAULT_COVER,
+  PLACEHOLDER_COVER_REGEX,
+  isPlaceholderAsset,
+} from './activation/seed-defaults';
 import { buildSeededFilter } from './common/seeded-cohort';
 
 const MODULE_COLLECTION_MAP: Record<string, string> = {
@@ -1529,6 +1533,198 @@ export class SeedingPipelineService {
       };
     }
     return { derivedCity: candidate };
+  }
+
+  // Strip the pinntag-assets Defaults/* placeholder from seeded
+  // businesses so Cover Backfill discovery can queue them for real
+  // cover_sync. The frontend already renders its own null-fallback,
+  // so storing the placeholder in the DB adds nothing and actively
+  // hides the record from backfill.
+  //
+  // Field surface is intentionally narrow: only `cover`,
+  // `coverThumbnail`, `coverUploaded`, and `logo` (only when logo
+  // itself matches the placeholder). Real B2 covers
+  // (`media-staging.pinntag.com`) MUST never be stripped — guarded
+  // per-doc via isPlaceholderAsset() before every $unset.
+  //
+  // Dry-run reports:
+  //   - placeholderCovers            : count of seeded docs whose cover
+  //                                    is a placeholder
+  //   - coverSyncEligible            : subset with a placeId (backfill
+  //                                    can queue them)
+  //   - unrecoverable                : subset with no placeId (nothing
+  //                                    to scrape — flag only, no write)
+  //   - placeholderLogos             : count of seeded docs whose logo
+  //                                    is a Defaults/* asset
+  //   - stripped                     : docs actually modified (0 in dry)
+  async stripPlaceholderCovers(opts: {
+    environment: string;
+    adminPassword: string;
+    dryRun?: boolean;
+    businessIds?: string[];
+    limit?: number;
+  }): Promise<{
+    environment: string;
+    dryRun: boolean;
+    totals: {
+      scanned: number;
+      placeholderCovers: number;
+      placeholderLogos: number;
+      coverSyncEligible: number;
+      unrecoverable: number;
+      stripped: number;
+    };
+    sample: Array<{
+      businessId: string;
+      hasPlaceId: boolean;
+      strippedCover: boolean;
+      strippedLogo: boolean;
+    }>;
+  }> {
+    this.verifyAdminPassword(opts.adminPassword);
+    const dryRun = opts.dryRun !== false; // default dry
+    const environment = opts.environment;
+    if (environment !== 'staging') {
+      throw new HttpException(
+        'stripPlaceholderCovers only runs against staging',
+        400,
+      );
+    }
+
+    const targetUri = this.resolveTargetUri(environment);
+    const targetConn = await mongoose
+      .createConnection(targetUri)
+      .asPromise();
+
+    try {
+      const businesses = targetConn.collection('businesses');
+      // Seeded-only scope; match anything with a Defaults/* cover OR
+      // Defaults/* logo. Either is enough to select the doc; the
+      // per-doc guards decide which fields to actually $unset.
+      const match: Record<string, any> = {
+        ...buildSeededFilter(),
+        $or: [
+          { cover: PLACEHOLDER_COVER_REGEX },
+          { logo: PLACEHOLDER_COVER_REGEX },
+        ],
+      };
+      if (opts.businessIds?.length) {
+        match._id = {
+          $in: opts.businessIds.map(
+            (id) => new mongoose.Types.ObjectId(id),
+          ),
+        };
+      }
+
+      const cursor = businesses.find(match, {
+        projection: {
+          _id: 1,
+          cover: 1,
+          logo: 1,
+          placeId: 1,
+        },
+      });
+
+      const SAMPLE_CAP = 30;
+      const writeCap =
+        opts.limit && opts.limit > 0
+          ? opts.limit
+          : Number.POSITIVE_INFINITY;
+
+      let scanned = 0;
+      let placeholderCovers = 0;
+      let placeholderLogos = 0;
+      let coverSyncEligible = 0;
+      let unrecoverable = 0;
+      let stripped = 0;
+      const sample: Array<{
+        businessId: string;
+        hasPlaceId: boolean;
+        strippedCover: boolean;
+        strippedLogo: boolean;
+      }> = [];
+
+      while (await cursor.hasNext()) {
+        if (!dryRun && stripped >= writeCap) break;
+        const doc = (await cursor.next()) as any;
+        if (!doc) break;
+        scanned += 1;
+
+        const cover = typeof doc.cover === 'string' ? doc.cover : '';
+        const logo = typeof doc.logo === 'string' ? doc.logo : '';
+        const placeId =
+          typeof doc.placeId === 'string' ? doc.placeId.trim() : '';
+
+        const coverIsPlaceholder = isPlaceholderAsset(cover);
+        const logoIsPlaceholder = isPlaceholderAsset(logo);
+        if (coverIsPlaceholder) placeholderCovers += 1;
+        if (logoIsPlaceholder) placeholderLogos += 1;
+        if (coverIsPlaceholder) {
+          if (placeId) coverSyncEligible += 1;
+          else unrecoverable += 1;
+        }
+
+        // Belt-and-braces: never touch a doc whose current cover is a
+        // real B2 URL. The Mongo match already excludes those, but a
+        // fresh scrape could have landed between the query and this
+        // check.
+        if (coverIsPlaceholder === false && logoIsPlaceholder === false) {
+          continue;
+        }
+
+        if (sample.length < SAMPLE_CAP) {
+          sample.push({
+            businessId: String(doc._id),
+            hasPlaceId: !!placeId,
+            strippedCover: coverIsPlaceholder,
+            strippedLogo: logoIsPlaceholder,
+          });
+        }
+
+        if (!dryRun) {
+          const unset: Record<string, ''> = {};
+          if (coverIsPlaceholder) {
+            unset.cover = '';
+            unset.coverThumbnail = '';
+            unset.coverUploaded = '';
+          }
+          if (logoIsPlaceholder) {
+            unset.logo = '';
+          }
+          if (Object.keys(unset).length > 0) {
+            await businesses.updateOne(
+              { _id: doc._id },
+              { $unset: unset },
+            );
+            stripped += 1;
+          }
+        }
+      }
+
+      this.logger.log(
+        `[STRIP-PLACEHOLDER${dryRun ? '-DRYRUN' : ''}] env=${environment} ` +
+          `scanned=${scanned} placeholderCovers=${placeholderCovers} ` +
+          `placeholderLogos=${placeholderLogos} ` +
+          `coverSyncEligible=${coverSyncEligible} ` +
+          `unrecoverable=${unrecoverable} stripped=${stripped}`,
+      );
+
+      return {
+        environment,
+        dryRun,
+        totals: {
+          scanned,
+          placeholderCovers,
+          placeholderLogos,
+          coverSyncEligible,
+          unrecoverable,
+          stripped,
+        },
+        sample,
+      };
+    } finally {
+      await targetConn.close();
+    }
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────

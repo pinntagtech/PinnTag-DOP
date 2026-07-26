@@ -11,19 +11,31 @@ import {
 } from '../../../common/constants';
 import { Exceptions } from '../../../common/errors';
 import { seededCohortOrClause } from '../common/seeded-cohort';
+import { PLACEHOLDER_COVER_REGEX } from '../activation/seed-defaults';
 
 const BACKFILL_ENV = SeedingEnvironments.STAGING;
 const BACKFILL_BATCH = 500;
 const BACKFILL_CANDIDATE_WINDOW = 1500;
 const BACKFILL_SESSION_NAME = 'Cover Backfill';
 
-// Coverless = seeded cohort, missing/empty cover, has a placeId.
+// Coverless = seeded cohort, has a placeId, AND cover is one of:
+//   - missing / empty / null
+//   - a pinntag-assets Defaults/* placeholder URL (previously blocked
+//     these from ever earning a real cover because the backend supplies
+//     the placeholder at seed time, so `cover` was non-empty).
 // Reused by getStats() and queueBatch() so the two endpoints can never
 // disagree on what "coverless" means.
 const coverlessFilter: Record<string, any> = {
   $and: [
     { $or: seededCohortOrClause() },
-    { $or: [{ cover: { $exists: false } }, { cover: '' }, { cover: null }] },
+    {
+      $or: [
+        { cover: { $exists: false } },
+        { cover: '' },
+        { cover: null },
+        { cover: PLACEHOLDER_COVER_REGEX },
+      ],
+    },
     { placeId: { $exists: true, $nin: ['', null] } },
   ],
 };
