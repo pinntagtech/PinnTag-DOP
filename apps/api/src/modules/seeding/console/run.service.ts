@@ -529,7 +529,9 @@ export class RunService {
     await this.incrementCounters(runId, {
       processed: result.totals.groupsProcessed,
       succeeded: result.totals.losersDeleted,
-      skipped: result.totals.groupsFlaggedForReview,
+      skipped:
+        result.totals.groupsFlaggedForReview +
+        result.totals.groupsFlaggedManualReview,
     });
     await this.patch(runId, { result });
     await this.appendLog(
@@ -538,7 +540,8 @@ export class RunService {
       `dedup_place_id dryRun=${input.dryRun}: ` +
         `groupsFound=${result.totals.duplicateGroupsFound} ` +
         `losersDeleted=${result.totals.losersDeleted} ` +
-        `flagged=${result.totals.groupsFlaggedForReview}`,
+        `flagged=${result.totals.groupsFlaggedForReview} ` +
+        `manualReview=${result.totals.groupsFlaggedManualReview}`,
     );
   }
 

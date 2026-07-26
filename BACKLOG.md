@@ -8,15 +8,18 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
 
 ---
 
-## 1. Cover recovery — IN PROGRESS
+## 1. Cover recovery — IN PROGRESS (code done; queueing is operator-paced)
 
 3,971 seeded businesses hold placeholder `Defaults/*` covers, all with placeId.
 
 - [x] Widen `coverlessFilter`, add `strip_placeholder_covers` action (f268555)
-- [ ] Stop emitting placeholder at 4 source sites (seed-defaults,
-      post-publish, db-sync, migration)
-- [ ] Run strip, verify `countDocuments({cover:/Defaults\//})` → 0
-- [ ] Queue `cover_sync` for the 3,971; bot throughput is the constraint
+- [x] Stop emitting placeholder at 4 source sites (seed-defaults,
+      post-publish, db-sync, migration) — 2e71a8c
+- [x] Run strip, verify `countDocuments({cover:/Defaults\//})` → 0
+      Confirmed on staging 2026-07-27: placeholderCoverSeeded=0.
+- [ ] Queue `cover_sync` for the 3,971; bot throughput is the constraint.
+      Coverless-with-placeId now 4,376 (includes docs that were always null).
+      Operator runs `POST /seeding/cover-backfill/queue` in a loop.
       Target: `real_cover` fails 11,282 → ~7,300
 
 ## 2. Dedup — TODO
@@ -104,6 +107,21 @@ Treat as compromised. Rotate.
 `auto_setup_cookies.py` needs `channel="chrome"` + explicit `headless=False`
 for Ubuntu 26.04 operator machines (Sumit, Abhishek). `main.py` already
 patched.
+
+BLOCKED until item 2 (dedup) reports groupsProcessed: 0. Whichever session
+finishes item 2 should then pick this up automatically — verify duplicates
+are 0 first, then proceed.
+
+## 10. Schema hardening — stop the bleed
+
+These cleanups exist because writes were unguarded. After items 1-4 land,
+enforce at schema level so the next seed wave can't recreate them:
+
+- unique sparse index on Business.placeId
+- addressLine1 validator: reject phone/URL/hours-text, require postal shape
+- reject /Defaults/ placeholder covers on write
+- derive city from addressLine1 at write time, never accept free-text
+  Retires items 1, 2, and most of 4 permanently.
 
 ---
 

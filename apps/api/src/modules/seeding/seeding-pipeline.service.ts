@@ -1017,6 +1017,7 @@ export class SeedingPipelineService {
       groupsProcessed: number;
       losersDeleted: number;
       groupsFlaggedForReview: number;
+      groupsFlaggedManualReview: number;
     };
     perGroup: Array<{
       placeId: string;
@@ -1025,6 +1026,10 @@ export class SeedingPipelineService {
       loserCount: number;
       purgeSummary?: Record<string, number>;
       flaggedReason?: string;
+      dependentContent?: Array<{
+        loserId: string;
+        buckets: string[];
+      }>;
     }>;
   }> {
     this.verifyAdminPassword(opts.adminPassword);
@@ -1088,10 +1093,15 @@ export class SeedingPipelineService {
         loserCount: number;
         purgeSummary?: Record<string, number>;
         flaggedReason?: string;
+        dependentContent?: Array<{
+          loserId: string;
+          buckets: string[];
+        }>;
       }> = [];
 
       let losersDeleted = 0;
       let groupsFlaggedForReview = 0;
+      let groupsFlaggedManualReview = 0;
       let groupsProcessed = 0;
 
       for (const group of capped) {
@@ -1108,12 +1118,18 @@ export class SeedingPipelineService {
                 activatedOutletsLength: 1,
                 createdAt: 1,
                 placeId: 1,
+                description: 1,
+                bio: 1,
               },
             },
           )
           .toArray()) as any[];
 
         if (docs.length < 2) continue; // group changed under us
+
+        const docById = new Map<string, any>(
+          docs.map((d) => [String(d._id), d]),
+        );
 
         const scored = docs.map((d) => ({
           id: d._id as mongoose.Types.ObjectId,
@@ -1155,6 +1171,32 @@ export class SeedingPipelineService {
         }
         seenCanonicalIds.add(canonicalIdStr);
 
+        // ── ABORT GUARD: dependent content on losers the winner lacks ──
+        // If any loser carries menus, gallery/menu files (via folders/drives),
+        // reviews, or a non-empty custom description/bio that the winner is
+        // empty on, do NOT delete — a hand-curator likely worked on the loser.
+        // Flag the whole group and skip; operator picks it up manually.
+        const contentGuard = await this.checkDedupDependentContent(
+          targetConn,
+          canonical.id,
+          losers.map((l) => l.id),
+          docById,
+        );
+        if (contentGuard.blocked) {
+          perGroup.push({
+            placeId: group._id,
+            canonicalId: canonicalIdStr,
+            loserIds: loserIdsStr,
+            loserCount: loserIdsStr.length,
+            flaggedReason:
+              'dependent content on loser(s) that winner lacks — ' +
+              'manual review required',
+            dependentContent: contentGuard.perLoser,
+          });
+          groupsFlaggedManualReview += 1;
+          continue;
+        }
+
         try {
           const purgeSummary = await this.purgeBusinessData(
             targetConn,
@@ -1187,7 +1229,8 @@ export class SeedingPipelineService {
       this.logger.log(
         `[DEDUP${dryRun ? '-DRYRUN' : ''}] env=${environment} ` +
           `groupsFound=${duplicateGroupsFound} processed=${groupsProcessed} ` +
-          `losersDeleted=${losersDeleted} flagged=${groupsFlaggedForReview}`,
+          `losersDeleted=${losersDeleted} flagged=${groupsFlaggedForReview} ` +
+          `manualReview=${groupsFlaggedManualReview}`,
       );
 
       return {
@@ -1198,12 +1241,79 @@ export class SeedingPipelineService {
           groupsProcessed,
           losersDeleted,
           groupsFlaggedForReview,
+          groupsFlaggedManualReview,
         },
         perGroup,
       };
     } finally {
       await targetConn.close();
     }
+  }
+
+  // Dedup abort guard. Returns blocked=true if ANY loser holds dependent
+  // content that the winner is empty on, in any of these buckets:
+  //   menus, gallery/menu files (via folders), reviews, custom text
+  //   (description / bio).
+  //
+  // Rationale: crawler records usually score higher (better cover / hours /
+  // taxonomy) and legitimately win — the risk is silently destroying
+  // hand-curated content that a seeder deliberately added on the losing
+  // doc. A per-bucket asymmetry (loser>0 AND winner==0) is the signal.
+  //
+  // Files live on drives/folders, not directly on the business, so we use
+  // `folders.owner=$business` as the gallery/menu-media proxy. A business
+  // with real gallery images always has at least one folder.
+  private async checkDedupDependentContent(
+    conn: mongoose.Connection,
+    winnerId: mongoose.Types.ObjectId,
+    loserIds: mongoose.Types.ObjectId[],
+    docById: Map<string, Record<string, any>>,
+  ): Promise<{
+    blocked: boolean;
+    perLoser: Array<{ loserId: string; buckets: string[] }>;
+  }> {
+    const menus = conn.collection('menus');
+    const reviews = conn.collection('reviews');
+    const folders = conn.collection('folders');
+
+    const textNonEmpty = (v: unknown): boolean =>
+      typeof v === 'string' && v.trim().length > 0;
+
+    const winnerDoc = docById.get(String(winnerId)) ?? {};
+    const [winnerMenus, winnerReviews, winnerFolders] = await Promise.all([
+      menus.countDocuments({ business: winnerId }),
+      reviews.countDocuments({ business: winnerId }),
+      folders.countDocuments({ owner: winnerId }),
+    ]);
+    const winnerHasText =
+      textNonEmpty(winnerDoc.description) || textNonEmpty(winnerDoc.bio);
+
+    const perLoser: Array<{ loserId: string; buckets: string[] }> = [];
+    let blocked = false;
+
+    for (const lid of loserIds) {
+      const loserDoc = docById.get(String(lid)) ?? {};
+      const [loserMenus, loserReviews, loserFolders] = await Promise.all([
+        menus.countDocuments({ business: lid }),
+        reviews.countDocuments({ business: lid }),
+        folders.countDocuments({ owner: lid }),
+      ]);
+      const loserHasText =
+        textNonEmpty(loserDoc.description) || textNonEmpty(loserDoc.bio);
+
+      const buckets: string[] = [];
+      if (loserMenus > 0 && winnerMenus === 0) buckets.push('menus');
+      if (loserReviews > 0 && winnerReviews === 0) buckets.push('reviews');
+      if (loserFolders > 0 && winnerFolders === 0) buckets.push('gallery');
+      if (loserHasText && !winnerHasText) buckets.push('description');
+
+      if (buckets.length) {
+        blocked = true;
+        perLoser.push({ loserId: String(lid), buckets });
+      }
+    }
+
+    return { blocked, perLoser };
   }
 
   // Higher score = more likely to be the useful copy. Weights are ordered
