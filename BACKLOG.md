@@ -22,11 +22,11 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
       Operator runs `POST /seeding/cover-backfill/queue` in a loop.
       Target: `real_cover` fails 11,282 → ~7,300
 
-## 2. Dedup — TODO
+## 2. Dedup — DONE (guard-blocked residue = 31 groups)
 
 157 duplicate placeId groups in staging (was 621; partially run in July).
 
-- [ ] Dry-run `dedup_place_id` from the Console, confirm ~157
+- [x] Dry-run `dedup_place_id` from the Console, confirmed 157
 - [x] POLICY DECIDED — do not ask again.
       Keep existing scoring (cover 16 > hours 8 > taxonomy 4 > outlet 2 >
       oldest createdAt). Data quality wins; the record that renders best for
@@ -39,10 +39,16 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
       correct. The real risk is silently destroying hand-curated content a
       seeder deliberately added. The guard catches that without blocking the
       other ~150 groups.
-- [ ] Still show me 5 sample cross-cohort groups in the dry-run output for
-      sanity, but proceed without waiting for approval.
-- [ ] Loop to `groupsProcessed: 0`
+- [x] 5 sample cross-cohort groups printed at apply time (see session log)
+- [x] Loop to `groupsProcessed: 0`
+      Applied 2026-07-27. 12-sample apply (25 losers deleted) → full apply
+      (114 groups processed, 208 losers deleted). Second dry-run reports
+      groupsProcessed=0. totalSeeded 24,602 → 24,369.
 - [ ] Add unique sparse index on `Business.placeId` AFTER dedup clears
+      Blocked: 31 groups remain — 30 flagged `groupsFlaggedManualReview`
+      (dependent content on loser; buckets in `perGroup[i].dependentContent`)
+      + 1 flagged because a loser is claimed/Stripe-backed. Operator must
+      manually resolve these 31 before the unique index can be added.
       Target: `singleton_placeId` fails 471 → 0
 
 ## 3. Missing outlets — BLOCKED
