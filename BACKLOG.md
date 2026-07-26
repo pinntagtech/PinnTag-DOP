@@ -62,20 +62,41 @@ the outlet. Outlets are distinct physical locations — that is wrong.
 - [ ] Wire `create_missing_outlet` to it
 - [ ] Sample 10, verify outlet addresses are correct, then batch
 
-## 4. Re-resolve — CORRECTED NUMBERS
+## 4. Re-resolve hours — CORRECTED (diagnostic done)
 
-resolveStatus.hours distribution (24,602 seeded):
-null 14,999 (NEVER RESOLVED — the real lever)
+Real distribution (24,602 seeded), BACKLOG's old 8,341 figure was stale:
+null 14,999 ← the actual lever, never resolved
 done 7,472
 review:no_hours_captured 1,965
-bot_error:no_search_match 107
+review:bot_error:no_search_match 107
 other 59
 
-- [ ] Queue resolve_business for the 14,999 nulls
-- [ ] Strategy (a) libpostal-normalize addressLine1 — build it, ~51% clean parse
-- [ ] Strategy (b) phone as retry — cheap, add it
-- [ ] Strategy (c) name artifacts — 1% actionable, SKIP
-- [ ] addressLine1 sanitizer (URLs/hours-strings in address slot) → folds into item 10
+TWO TRACKS, run both in parallel:
+
+### 4a. Places API (fast path — hours only)
+
+- [ ] Verify how many of the 14,999 nulls have a placeId
+- [ ] Build PlacesApiResolveService: Place Details by placeId,
+      field mask limited to opening_hours / current_opening_hours /
+      business_status (Pro tier, ~$17 per 1,000)
+- [ ] Concurrency ~50, staging-scoped, dry-run first, batched
+- [ ] Records without a placeId fall through to Text Search (costlier)
+- [ ] Write via the SAME hours encoding as the bot parser:
+      0:00-23:59 = open all day, 0:00-0:00 + isClosed = closed
+- Est. ~$300, ~30 min runtime for 15,000
+
+### 4b. Bot (covers — API can't replace this cheaply)
+
+- [ ] cover_sync for the 3,971
+- [ ] Needs 8 operator machines to clear in 24h
+- [ ] BLOCKED: fix item 9 first (Sumit's box failing on Chrome path)
+
+### Also found
+
+27 records have scraper garbage in addressLine1 ("cozyautomotive.com",
+"Open 24 hours", "Your Maps history"). Sanitizer folds into item 10.
+Strategy notes: libpostal-normalize is the winner (~51% clean parse);
+phone as retry is cheap; name-artifact stripping is ~1% actionable, skip it.
 
 ## 5. Email scrape — TODO
 
@@ -140,7 +161,7 @@ enforce at schema level so the next seed wave can't recreate them:
 - [x] derive city from addressLine1 at write time, never accept free-text —
       same helper: when both addressLine1 (valid) and city are in a patch,
       city is coerced to the derived value.
-  Retires items 1, 2, and most of 4 permanently.
+      Retires items 1, 2, and most of 4 permanently.
 
 ---
 
