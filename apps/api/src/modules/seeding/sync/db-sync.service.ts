@@ -24,6 +24,7 @@ import {
 } from '../schemas/dop-sync-run.schema';
 import { DopLinkService } from '../activation/dop-link.service';
 import { buildSeededFilter } from '../common/seeded-cohort';
+import { sanitizeBusinessPatch } from '../common/business-write-guard';
 import {
   BUSINESS_FILTER_ARRAY_KEYS,
   OUTLET_FILTER_ARRAY_KEYS,
@@ -1296,13 +1297,27 @@ export class DbSyncService {
                 );
               }
             }
-            const changedFields: string[] = Object.keys(businessSet);
+            // Guard: strip placeholder covers, invalid addressLine1,
+            // and coerce city to derived value when addressLine1 is in
+            // the patch. computeBusinessSet does not currently emit any
+            // of these, but a future field addition to it (or an
+            // upstream taxResult surprise) must not silently reintroduce
+            // them.
+            const { patch: guardedBusinessSet, adjustments } =
+              sanitizeBusinessPatch(businessSet);
+            if (adjustments.length) {
+              this.logger.warn(
+                `[SYNC] businessSet sanitized for ${publishedId}: ` +
+                  adjustments.join('; '),
+              );
+            }
+            const changedFields: string[] = Object.keys(guardedBusinessSet);
 
             // Apply business $set if non-empty
-            if (Object.keys(businessSet).length > 0) {
+            if (Object.keys(guardedBusinessSet).length > 0) {
               await BusinessModel.updateOne(
                 { _id: new mongoose.Types.ObjectId(publishedId) },
-                { $set: businessSet },
+                { $set: guardedBusinessSet },
               );
             }
 

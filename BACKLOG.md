@@ -46,8 +46,7 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
       groupsProcessed=0. totalSeeded 24,602 → 24,369.
 - [ ] Add unique sparse index on `Business.placeId` AFTER dedup clears
       Blocked: 31 groups remain — 30 flagged `groupsFlaggedManualReview`
-      (dependent content on loser; buckets in `perGroup[i].dependentContent`)
-      + 1 flagged because a loser is claimed/Stripe-backed. Operator must
+      (dependent content on loser; buckets in `perGroup[i].dependentContent`) + 1 flagged because a loser is claimed/Stripe-backed. Operator must
       manually resolve these 31 before the unique index can be added.
       Target: `singleton_placeId` fails 471 → 0
 
@@ -63,18 +62,20 @@ the outlet. Outlets are distinct physical locations — that is wrong.
 - [ ] Wire `create_missing_outlet` to it
 - [ ] Sample 10, verify outlet addresses are correct, then batch
 
-## 4. Re-resolve — TODO (biggest single lever)
+## 4. Re-resolve — CORRECTED NUMBERS
 
-17,130 fail `real_hours`; ~8,341 sit at
-`resolveStatus.hours: review:bot_error:no_search_match`. Also covers the
-~1,269 records the city resync correctly skipped (malformed/absent
-`addressLine1`) and the Harlem cluster with no address at all.
+resolveStatus.hours distribution (24,602 seeded):
+null 14,999 (NEVER RESOLVED — the real lever)
+done 7,472
+review:no_hours_captured 1,965
+bot_error:no_search_match 107
+other 59
 
-- [ ] Deterministic first: retry resolve with name + `addressLine1` (not
-      name + city), libpostal-normalized (:4101), phone fallback, scraper
-      artifacts stripped from name. Measure recovery from this alone.
-- [ ] Only then consider LLM match adjudication on the residual
-      Target: `real_hours` fails 17,130 → ?
+- [ ] Queue resolve_business for the 14,999 nulls
+- [ ] Strategy (a) libpostal-normalize addressLine1 — build it, ~51% clean parse
+- [ ] Strategy (b) phone as retry — cheap, add it
+- [ ] Strategy (c) name artifacts — 1% actionable, SKIP
+- [ ] addressLine1 sanitizer (URLs/hours-strings in address slot) → folds into item 10
 
 ## 5. Email scrape — TODO
 
@@ -123,10 +124,22 @@ are 0 first, then proceed.
 These cleanups exist because writes were unguarded. After items 1-4 land,
 enforce at schema level so the next seed wave can't recreate them:
 
-- unique sparse index on Business.placeId
-- addressLine1 validator: reject phone/URL/hours-text, require postal shape
-- reject /Defaults/ placeholder covers on write
-- derive city from addressLine1 at write time, never accept free-text
+- [ ] unique sparse index on Business.placeId
+      BLOCKED: 31 duplicate groups remain from item 2 (30 dependent-content
+      manualReview + 1 claimed-loser). Operator must resolve them before
+      the unique index can be applied.
+- [x] addressLine1 validator: reject phone/URL/hours-text, require postal
+      shape — `sanitizeBusinessPatch` in
+      `apps/api/src/modules/seeding/common/business-write-guard.ts`.
+      Wired into `buildSeededBusinessFields`, migration `logoCoverPatch`,
+      and db-sync `computeBusinessSet`. Guard is drop-not-throw: invalid
+      addressLine1 stays absent from the write instead of blocking the doc.
+- [x] reject /Defaults/ placeholder covers on write — same helper strips
+      cover/coverThumbnail/logo/logoThumbnail from any outbound patch.
+      Belt-and-braces on top of the 4-site fix from item 1.
+- [x] derive city from addressLine1 at write time, never accept free-text —
+      same helper: when both addressLine1 (valid) and city are in a patch,
+      city is coerced to the derived value.
   Retires items 1, 2, and most of 4 permanently.
 
 ---

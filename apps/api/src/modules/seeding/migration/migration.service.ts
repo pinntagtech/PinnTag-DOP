@@ -26,6 +26,7 @@ import {
   hasRealBotCover,
   stripManagedFields,
 } from '../activation/seed-defaults';
+import { sanitizeBusinessPatch } from '../common/business-write-guard';
 import {
   evaluateGateShortCircuit as sharedEvaluateGateShortCircuit,
   extractCoords as sharedExtractCoords,
@@ -1394,20 +1395,32 @@ export class MigrationService {
       // Bot post-publish updates logo/cover on the source business doc
       // (not in DOP record.transformedData), so explicitly carry them over.
       if (srcBiz) {
-        const logoCoverPatch: Record<string, any> = {};
-        if (srcBiz.logo) logoCoverPatch.logo = srcBiz.logo;
+        const logoCoverPatchRaw: Record<string, any> = {};
+        if (srcBiz.logo) logoCoverPatchRaw.logo = srcBiz.logo;
         if (srcBiz.logoUploaded !== undefined) {
-          logoCoverPatch.logoUploaded = srcBiz.logoUploaded;
+          logoCoverPatchRaw.logoUploaded = srcBiz.logoUploaded;
         }
-        if (srcBiz.cover) logoCoverPatch.cover = srcBiz.cover;
+        if (srcBiz.cover) logoCoverPatchRaw.cover = srcBiz.cover;
         if (srcBiz.coverUploaded !== undefined) {
-          logoCoverPatch.coverUploaded = srcBiz.coverUploaded;
+          logoCoverPatchRaw.coverUploaded = srcBiz.coverUploaded;
         }
         if (srcBiz.coverStatus) {
-          logoCoverPatch.coverStatus = srcBiz.coverStatus;
+          logoCoverPatchRaw.coverStatus = srcBiz.coverStatus;
         }
         if (srcBiz.logoStatus) {
-          logoCoverPatch.logoStatus = srcBiz.logoStatus;
+          logoCoverPatchRaw.logoStatus = srcBiz.logoStatus;
+        }
+
+        // Guard: if srcBiz still carries a legacy Defaults/* placeholder,
+        // don't copy it to target. It would fail the c2 gate the same
+        // either way, but a null field is discoverable by Cover Backfill.
+        const { patch: logoCoverPatch, adjustments } =
+          sanitizeBusinessPatch(logoCoverPatchRaw);
+        if (adjustments.length) {
+          this.logger.warn(
+            `[MIGRATION] logoCoverPatch sanitized for ` +
+              `${tgtBusinessOid}: ${adjustments.join('; ')}`,
+          );
         }
 
         if (Object.keys(logoCoverPatch).length > 0) {

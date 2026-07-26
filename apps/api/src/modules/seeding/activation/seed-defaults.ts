@@ -7,6 +7,7 @@ import {
   BusinessCreatorType,
 } from '../../../common/enums';
 import { fullStateName } from '../common/us-states';
+import { sanitizeBusinessPatch } from '../common/business-write-guard';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants below are byte-for-byte mirrored from the PinnTag main backend
@@ -123,8 +124,15 @@ export function buildSeededBusinessFields(
     BUSINESS_FILTER_ARRAY_KEYS.map((k) => [k, base[k] ?? EMPTY()]),
   );
 
+  // Guard on the incoming base: drop placeholder covers, invalid
+  // addressLine1, and (if addressLine1 is set + valid) coerce city to
+  // the derived value. base is only ever a transformed source doc, so
+  // guarding it once at composition time covers every downstream use.
+  const guarded = sanitizeBusinessPatch(base);
+  const cleanBase = guarded.patch as Record<string, any>;
+
   return {
-    ...base,
+    ...cleanBase,
 
     creatorType: SEED_CREATOR_TYPE_ADMIN,
     creator: systemUserId,
@@ -134,11 +142,12 @@ export function buildSeededBusinessFields(
     status: SEED_BUSINESS_STATUS_COVER_ADDED,
     isFromCrawler: true,
     dataFetchedFromGoogle: true,
-    isActive: base.isActive ?? true,
+    isActive: cleanBase.isActive ?? true,
     isDeleted: false,
-    verificationStatus: base.verificationStatus ?? SEED_VERIFICATION_STATUS,
+    verificationStatus:
+      cleanBase.verificationStatus ?? SEED_VERIFICATION_STATUS,
     showVerificationBanner: true,
-    isCvb: base.isCvb ?? false,
+    isCvb: cleanBase.isCvb ?? false,
 
     // Cover / logo — never substitute the pinntag-assets Defaults/*
     // placeholder. A null field is honest: the frontend renders its own
@@ -148,15 +157,15 @@ export function buildSeededBusinessFields(
     // signature for the small number of call-sites that still pass it,
     // but it no longer affects the emitted value — with the placeholder
     // gone both branches converge on `base.cover ?? null`.
-    logo: base.logo ?? null,
-    logoThumbnail: base.logoThumbnail ?? null,
-    logoUploaded: base.logoUploaded ?? false,
-    cover: base.cover ?? null,
-    coverThumbnail: base.coverThumbnail ?? null,
+    logo: cleanBase.logo ?? null,
+    logoThumbnail: cleanBase.logoThumbnail ?? null,
+    logoUploaded: cleanBase.logoUploaded ?? false,
+    cover: cleanBase.cover ?? null,
+    coverThumbnail: cleanBase.coverThumbnail ?? null,
 
     profileCompletionStatus: SEED_PROFILE_COMPLETION_LOGO,
     profileCompletionPercentage: SEED_PROFILE_COMPLETION_PERCENTAGE,
-    completedProfileSteps: base.completedProfileSteps ?? [],
+    completedProfileSteps: cleanBase.completedProfileSteps ?? [],
     completedQuestionnaireSteps: 0,
     totalQuestionnaireSteps: 0,
     aiTrainingPercentage: 0,
@@ -164,19 +173,19 @@ export function buildSeededBusinessFields(
     followersCount: 0,
     followingCount: 0,
     viewsCount: 0,
-    rating: base.rating ?? 0,
-    userRatingCount: base.userRatingCount ?? 0,
+    rating: cleanBase.rating ?? 0,
+    userRatingCount: cleanBase.userRatingCount ?? 0,
 
     continueJourney: true,
     onboardingOfferStatus: 0,
     isOnboardingOfferDone: false,
-    scalabilityFactor: base.scalabilityFactor ?? 0,
+    scalabilityFactor: cleanBase.scalabilityFactor ?? 0,
 
-    isPhysicalType: base.isPhysicalType ?? false,
-    physicalUnits: base.physicalUnits ?? 0,
-    isMobileType: base.isMobileType ?? false,
-    mobileUnits: base.mobileUnits ?? 0,
-    isOnlineType: base.isOnlineType ?? false,
+    isPhysicalType: cleanBase.isPhysicalType ?? false,
+    physicalUnits: cleanBase.physicalUnits ?? 0,
+    isMobileType: cleanBase.isMobileType ?? false,
+    mobileUnits: cleanBase.mobileUnits ?? 0,
+    isOnlineType: cleanBase.isOnlineType ?? false,
 
     connectStatus: SEED_CONNECT_STATUS,
     stripeOnboardingComplete: false,
@@ -199,7 +208,7 @@ export function buildSeededBusinessFields(
 
     ...filters,
 
-    uniqueId: base.uniqueId ?? generateUniqueId(base.name),
+    uniqueId: cleanBase.uniqueId ?? generateUniqueId(cleanBase.name),
   };
 }
 
