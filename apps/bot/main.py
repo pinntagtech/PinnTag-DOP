@@ -1479,6 +1479,10 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
     # structurally different (country, glued postcode, variable city
     # position) so a hand-rolled splitter would fight reality.
     google_formatted_address: str | None = None
+    # Which selector actually pulled the address (or None). Logged so we
+    # can measure hit rate across a batch and swap the primary if the
+    # DOM shifts.
+    address_selector_used: str | None = None
 
     place_id_in = (req.placeId or '').strip()
     use_place_id = bool(re.match(r'^ChIJ[A-Za-z0-9_-]+$', place_id_in))
@@ -2226,11 +2230,14 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
             except Exception:
                 continue
 
-        # Google formatted address — full single-line raw string from
-        # the address button. Same SEL pattern scraper_bulk uses; we
-        # ship the raw text to the API and let libpostal parse it
-        # there (US/India formats diverge structurally — never split
-        # client-side). Cheap read; failure here never blocks
+        # Google formatted address — full single-line raw string.
+        # Primary: address button's inner fontBodyMedium div (the
+        # rendered text). Fallback: aria-label on the address button
+        # itself, which typically looks like
+        #   "Address: 927 Fulton St, Brooklyn, NY 11238, United States"
+        # — strip the "Address:" prefix. Both anchor on
+        # data-item-id="address" (stable attribute) rather than a
+        # fragile class chain. Cheap read; failure never blocks
         # hours/rating/cover/category.
         try:
             addr_txt = await page.locator(
@@ -2240,8 +2247,30 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
                 google_formatted_address = re.sub(
                     r'\s+', ' ', addr_txt,
                 ).strip()
+                address_selector_used = 'button.fontBodyMedium'
         except Exception:
             pass
+
+        if not google_formatted_address:
+            try:
+                aria = await page.locator(
+                    'button[data-item-id="address"]',
+                ).first.get_attribute(
+                    'aria-label', timeout=800,
+                )
+                if aria:
+                    cleaned = re.sub(
+                        r'^\s*address[:,\s]+',
+                        '',
+                        aria,
+                        flags=re.IGNORECASE,
+                    )
+                    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                    if cleaned:
+                        google_formatted_address = cleaned
+                        address_selector_used = 'button.aria-label'
+            except Exception:
+                pass
 
         # ── DEBUG: enough state to diagnose any future failure ──
         try:
@@ -2312,7 +2341,8 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
             f'coverUrl={"yes" if cover_url else "no"} '
             f'googleCategory={google_category!r} '
             f'googleFormattedAddress='
-            f'{"yes" if google_formatted_address else "no"}'
+            f'{"yes" if google_formatted_address else "no"} '
+            f'addressSelector={address_selector_used or "none"}'
         )
 
     except Exception as e:
@@ -2348,6 +2378,15 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
         # Raw single-line; API libpostal-parses (or flags for operator
         # review when libpostal is unavailable). Never split here.
         'googleFormattedAddress': google_formatted_address,
+        # New: address write-back block. `formattedAddress` is what the
+        # API pushes onto addressLine1 (through sanitizeBusinessPatch,
+        # which owns validation + city derivation). `googleName` backs
+        # verified_name / c11 later — capture now while we're on the
+        # page, even though c11 isn't scored yet.
+        'addressSync': {
+            'formattedAddress': google_formatted_address,
+            'googleName': resolved_name,
+        },
         'error': error_msg,
     }
 

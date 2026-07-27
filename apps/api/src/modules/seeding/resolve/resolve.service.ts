@@ -21,6 +21,11 @@ import {
   isValidChIJPlaceId,
   normalizeName,
 } from './name-match';
+import {
+  deriveCityFromAddressLine1,
+  isValidAddressLine1,
+  sanitizeBusinessPatch,
+} from '../common/business-write-guard';
 
 const LOOSE_SCHEMA = new mongoose.Schema<any>(
   {},
@@ -134,11 +139,21 @@ export interface ResolveWebhookPayload {
   // Raw single-line address as Google rendered it on the business
   // panel (e.g. "927 Fulton St, Brooklyn, NY 11238, United States" or
   // "Sector 41, E Block, Sector 50, Noida, Uttar Pradesh 201303").
-  // Stored authentically; component parse + proposedAddress flagging
-  // happens server-side (libpostal — currently unavailable on the
-  // API box, so we mark addressStatus='address_unparsed' as a
-  // fallback). NEVER auto-applied to address1/city/state/postalCode.
+  // Stored authentically as googleFormattedAddress. The actual
+  // addressLine1 write-back path is driven by `addressSync` below,
+  // gated by sanitizeBusinessPatch — never split here.
   googleFormattedAddress?: string | null;
+  // New: write-back path for addressLine1. `formattedAddress` is the
+  // same text as `googleFormattedAddress` (bot ships both for
+  // back-compat); the presence of this block signals the API should
+  // try to write it onto the business via sanitizeBusinessPatch.
+  // `googleName` is the h1 name from the Google panel — recorded on
+  // resolveStatus.googleName so verified_name (c11) has the value ready
+  // when the criterion is built.
+  addressSync?: {
+    formattedAddress?: string | null;
+    googleName?: string | null;
+  };
   error?: string;
 }
 
@@ -522,7 +537,7 @@ export class ResolveService {
     const {
       businessId, environment, resolvedPlaceId, resolvedName, hoursRaw,
       rating, userRatingCount, coverUrl, googleCategory,
-      googleFormattedAddress,
+      googleFormattedAddress, addressSync,
     } = payload;
     let { error, placeIdNote } = payload;
 
@@ -890,28 +905,89 @@ export class ResolveService {
       set.categoryStatus = categoryStatus;
       resolveStatusBody.category = categoryStatus;
 
-      // ── Google formatted address (RAW, flag-only) ──
-      // Capture the raw single-line address authentically. Component
-      // parse (libpostal → road/house/city/state/postcode/country) and
-      // the address_mismatch comparison against the stored
-      // address1/city/state/postalCode are intentionally NOT wired up
-      // here yet — node-postal is a system-level C dependency
-      // (libpostal-dev + ~2GB data) and the API box doesn't have it.
-      // Until that decision is made we set addressStatus to
-      // 'address_unparsed' so the operator can review via the Fix
-      // address tab. NEVER auto-overwrite address1/city/state/etc.
+      // ── Google formatted address (SAFE WRITE via guard) ──
+      // Bot ships the raw Google address in two places for back-compat:
+      //   - `googleFormattedAddress` (legacy, always stored raw)
+      //   - `addressSync.formattedAddress` (new; same value, presence
+      //     signals write-back intent)
+      // We honour either. Validation + city derivation are owned by
+      // business-write-guard (sanitizeBusinessPatch) — not
+      // reimplemented here.
       //
-      // When the parser lands later this block will branch to
-      // 'address_mismatch' (writes set.proposedAddress) or 'correct'
-      // (no proposal) instead of the unconditional 'address_unparsed'.
-      if (
-        typeof googleFormattedAddress === 'string' &&
-        googleFormattedAddress.trim()
-      ) {
-        const raw = googleFormattedAddress.trim();
-        set.googleFormattedAddress = raw;
-        set.addressStatus = 'address_unparsed';
-        resolveStatusBody.address = 'address_unparsed';
+      // Write rules:
+      //   1. sanitize rejects the incoming address → count as
+      //      'address_rejected', do NOT touch addressLine1.
+      //   2. existing addressLine1 is already valid → keep it, mark
+      //      'kept_existing'. Never overwrite a good value with a
+      //      scraped one.
+      //   3. existing addressLine1 is absent or itself fails the guard
+      //      → write the sanitized addressLine1 + derived city, mark
+      //      'written', record resolveStatus.addressSource.
+      //
+      // Guarded to staging: resolve_business jobs are only triggered
+      // for staging, but a stricter env check here means a misrouted
+      // webhook can never mutate a live-user address.
+      const incomingAddress = (
+        (typeof addressSync?.formattedAddress === 'string' &&
+          addressSync.formattedAddress.trim()) ||
+        (typeof googleFormattedAddress === 'string' &&
+          googleFormattedAddress.trim()) ||
+        ''
+      ).toString().trim();
+
+      const incomingGoogleName = (
+        (typeof addressSync?.googleName === 'string' &&
+          addressSync.googleName.trim()) ||
+        (typeof resolvedName === 'string' && resolvedName.trim()) ||
+        ''
+      ).toString().trim();
+
+      if (incomingGoogleName) {
+        // Recorded for verified_name (c11) — the criterion isn't built
+        // yet but the value is cheap to capture now.
+        resolveStatusBody.googleName = incomingGoogleName;
+      }
+
+      if (incomingAddress) {
+        set.googleFormattedAddress = incomingAddress;
+
+        if (environment !== 'staging') {
+          resolveStatusBody.address = 'skipped_non_staging';
+        } else {
+          const { derivedCity } =
+            deriveCityFromAddressLine1(incomingAddress);
+          const rawPatch: Record<string, any> = {
+            addressLine1: incomingAddress,
+          };
+          if (derivedCity) rawPatch.city = derivedCity;
+          const { patch: sanitized, adjustments } =
+            sanitizeBusinessPatch(rawPatch);
+
+          if (typeof sanitized.addressLine1 !== 'string') {
+            set.addressStatus = 'address_rejected';
+            resolveStatusBody.address = 'address_rejected';
+            if (adjustments.length > 0) {
+              resolveStatusBody.addressRejectReason = adjustments.join('; ');
+            }
+          } else {
+            const existingAddr =
+              typeof business.addressLine1 === 'string'
+                ? business.addressLine1
+                : '';
+            if (isValidAddressLine1(existingAddr)) {
+              set.addressStatus = 'kept_existing';
+              resolveStatusBody.address = 'kept_existing';
+            } else {
+              set.addressLine1 = sanitized.addressLine1;
+              if (typeof sanitized.city === 'string' && sanitized.city) {
+                set.city = sanitized.city;
+              }
+              set.addressStatus = 'written';
+              resolveStatusBody.address = 'written';
+              resolveStatusBody.addressSource = 'google_place_page';
+            }
+          }
+        }
       }
 
       // Remember whether we staged a pendingCoverUrl on this run —
@@ -959,6 +1035,8 @@ export class ResolveService {
               set.businessCategories ? 'businessCategories' : null,
               stagedPendingCover ? 'pendingCoverUrl' : null,
               set.googleFormattedAddress ? 'googleFormattedAddress' : null,
+              set.addressLine1 ? 'addressLine1' : null,
+              set.city ? 'city' : null,
             ]
               .filter(Boolean)
               .join(',') || 'resolveStatus_only'
