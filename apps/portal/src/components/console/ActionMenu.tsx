@@ -27,6 +27,10 @@ interface ActionDef {
 // Every entry is a real, wired action; no "stage not shipped" stubs.
 const ACTIONS: ActionDef[] = [
   { key: 'resync_city', label: 'Resync city from address', needsAdminPassword: true },
+  // Rewrites the FULL Google formatted address currently in addressLine1
+  // down to the street line only. Fixes the double-render ("…United
+  // States, City, State") on the consumer app.
+  { key: 'split_address_line', label: 'Split addressLine1 to street-only', needsAdminPassword: true },
   { key: 'dedup_place_id', label: 'Dedup by placeId', needsAdminPassword: true, danger: true },
   // Strips the pinntag-assets Defaults/* placeholder so Cover Backfill
   // discovery can queue the record for a real cover_sync. Never

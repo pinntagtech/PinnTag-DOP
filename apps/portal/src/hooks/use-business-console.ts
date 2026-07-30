@@ -205,6 +205,7 @@ export type ConsoleSelection =
 // portal know how to trigger this action" — server rejects unknowns.
 export type ConsoleActionType =
   | 'resync_city'
+  | 'split_address_line'
   | 'dedup_place_id'
   | 'strip_placeholder_covers'
   | 'trigger_email_scrape'

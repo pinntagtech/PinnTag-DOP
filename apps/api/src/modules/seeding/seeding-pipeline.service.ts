@@ -29,6 +29,7 @@ import {
   isPlaceholderAsset,
 } from './activation/seed-defaults';
 import { buildSeededFilter } from './common/seeded-cohort';
+import { splitFormattedAddress } from './common/business-write-guard';
 
 const MODULE_COLLECTION_MAP: Record<string, string> = {
   [SeedingModules.BUSINESS]: 'businesses',
@@ -1829,6 +1830,200 @@ export class SeedingPipelineService {
           coverSyncEligible,
           unrecoverable,
           stripped,
+        },
+        sample,
+      };
+    } finally {
+      await targetConn.close();
+    }
+  }
+
+  // Backfill: split the FULL Google formatted address currently stored
+  // in `addressLine1` down to just the street line. Legacy write paths
+  // (pre-item-5) stored the whole "123 Main St, Bronx, NY 10457, United
+  // States" string in addressLine1, which then rendered as
+  // "…United States, Bronx, NY" in the consumer app because the frontend
+  // concatenates addressLine1 + city + state itself.
+  //
+  // Scope: seeded cohort only, docs whose addressLine1 still carries a
+  // state+ZIP fragment or a "United States"/"USA" suffix. Prefers
+  // `googleFormattedAddress` as the split source when present (that
+  // field is where resolve stores the authoritative Google string);
+  // falls back to the current `addressLine1`.
+  //
+  // Writes ONLY `addressLine1`. NEVER touches `city` — city has already
+  // been resynced correctly (see resyncCityFromAddressLine1) and a
+  // second pass would risk regressing the county fix. Reports the count
+  // of records where the derived city disagrees with the stored city so
+  // an operator can spot check.
+  async splitAddressLine(opts: {
+    environment: string;
+    adminPassword: string;
+    dryRun?: boolean;
+    businessIds?: string[];
+    limit?: number;
+  }): Promise<{
+    environment: string;
+    dryRun: boolean;
+    totals: {
+      scanned: number;
+      split: number;
+      skippedNoStreetLine: number;
+      skippedNoStateZip: number;
+      cityMismatch: number;
+    };
+    sample: Array<{
+      businessId: string;
+      before: string;
+      after: string;
+      city: string;
+      derivedCity: string;
+    }>;
+  }> {
+    this.verifyAdminPassword(opts.adminPassword);
+    const dryRun = opts.dryRun !== false; // default dry
+    const environment = opts.environment;
+    if (environment !== 'staging') {
+      throw new HttpException(
+        'splitAddressLine only runs against staging',
+        400,
+      );
+    }
+
+    const targetUri = this.resolveTargetUri(environment);
+    const targetConn = await mongoose
+      .createConnection(targetUri)
+      .asPromise();
+
+    try {
+      const businesses = targetConn.collection('businesses');
+      // Match seeded docs whose addressLine1 still looks like a full
+      // formatted address: either it carries a US country suffix or it
+      // contains a "XX 12345" fragment somewhere. Regex is a $type
+      // guard-free string check (arrays of addressLine1 exist on some
+      // legacy docs — see CLAUDE.md; the string coercion below handles
+      // them gracefully).
+      const match: Record<string, any> = {
+        ...buildSeededFilter(),
+        addressLine1: {
+          $type: 'string',
+          $regex:
+            /(?:,\s*(?:USA|United States(?: of America)?)\s*$)|(?:\b[A-Za-z]{2}\s+\d{5}(?:-\d{4})?\b)/i,
+        },
+      };
+      if (opts.businessIds?.length) {
+        match._id = {
+          $in: opts.businessIds.map(
+            (id) => new mongoose.Types.ObjectId(id),
+          ),
+        };
+      }
+
+      const cursor = businesses.find(match, {
+        projection: {
+          _id: 1,
+          addressLine1: 1,
+          googleFormattedAddress: 1,
+          city: 1,
+        },
+      });
+
+      const SAMPLE_CAP = 20;
+      const writeCap =
+        opts.limit && opts.limit > 0
+          ? opts.limit
+          : Number.POSITIVE_INFINITY;
+
+      let scanned = 0;
+      let splitCount = 0;
+      let skippedNoStreetLine = 0;
+      let skippedNoStateZip = 0;
+      let cityMismatch = 0;
+      const sample: Array<{
+        businessId: string;
+        before: string;
+        after: string;
+        city: string;
+        derivedCity: string;
+      }> = [];
+
+      const STATE_ZIP_ANYWHERE_RE = /\b[A-Za-z]{2}\s+\d{5}(?:-\d{4})?\b/;
+
+      while (await cursor.hasNext()) {
+        if (!dryRun && splitCount >= writeCap) break;
+        const doc = (await cursor.next()) as any;
+        if (!doc) break;
+        scanned += 1;
+
+        const currentAddr =
+          typeof doc.addressLine1 === 'string' ? doc.addressLine1 : '';
+        const gfa =
+          typeof doc.googleFormattedAddress === 'string'
+            ? doc.googleFormattedAddress
+            : '';
+        const currentCity = typeof doc.city === 'string' ? doc.city : '';
+        const source = gfa.trim() || currentAddr.trim();
+        if (!source) {
+          skippedNoStateZip += 1;
+          continue;
+        }
+
+        const split = splitFormattedAddress(source);
+        if (!split) {
+          // Distinguish "no state+ZIP at all" from "state+ZIP present
+          // but no street line before it" so an operator can size the
+          // remaining re-resolve cohort. STATE_ZIP_ANYWHERE_RE mirrors
+          // the write-guard's detector.
+          if (STATE_ZIP_ANYWHERE_RE.test(source)) {
+            skippedNoStreetLine += 1;
+          } else {
+            skippedNoStateZip += 1;
+          }
+          continue;
+        }
+
+        if (
+          currentCity.trim().toLowerCase() !== split.city.trim().toLowerCase()
+        ) {
+          cityMismatch += 1;
+        }
+
+        if (sample.length < SAMPLE_CAP) {
+          sample.push({
+            businessId: String(doc._id),
+            before: currentAddr,
+            after: split.addressLine1,
+            city: currentCity,
+            derivedCity: split.city,
+          });
+        }
+
+        if (!dryRun) {
+          await businesses.updateOne(
+            { _id: doc._id },
+            { $set: { addressLine1: split.addressLine1 } },
+          );
+        }
+        splitCount += 1;
+      }
+
+      this.logger.log(
+        `[SPLIT-ADDRESSLINE${dryRun ? '-DRYRUN' : ''}] env=${environment} ` +
+          `scanned=${scanned} split=${splitCount} ` +
+          `skippedNoStreetLine=${skippedNoStreetLine} ` +
+          `skippedNoStateZip=${skippedNoStateZip} ` +
+          `cityMismatch=${cityMismatch}`,
+      );
+
+      return {
+        environment,
+        dryRun,
+        totals: {
+          scanned,
+          split: splitCount,
+          skippedNoStreetLine,
+          skippedNoStateZip,
+          cityMismatch,
         },
         sample,
       };

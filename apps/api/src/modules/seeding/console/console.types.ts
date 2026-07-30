@@ -107,6 +107,7 @@ export type ConsoleSelection =
 // locations. It ships when a non-copying helper exists.
 export type ConsoleActionType =
   | 'resync_city'
+  | 'split_address_line'
   | 'dedup_place_id'
   | 'strip_placeholder_covers'
   | 'trigger_email_scrape'

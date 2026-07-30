@@ -25,6 +25,7 @@ const BOT_TRIGGER_BATCH = 100;
 // row's city (resync_city).
 const ADMIN_PASSWORD_ACTIONS = new Set<ConsoleActionType>([
   'resync_city',
+  'split_address_line',
   'dedup_place_id',
   'strip_placeholder_covers',
   'activate',
@@ -264,6 +265,9 @@ export class RunService {
         case 'resync_city':
           await this.runResyncCity(runId, input, total);
           break;
+        case 'split_address_line':
+          await this.runSplitAddressLine(runId, input);
+          break;
         case 'dedup_place_id':
           await this.runDedup(runId, input);
           break;
@@ -474,6 +478,58 @@ export class RunService {
         `mismatches=${result.totals.mismatchCount} ` +
         `corrected=${result.totals.corrected} ` +
         `skippedAmbiguous=${result.totals.skippedAmbiguous}`,
+    );
+  }
+
+  // ── Action: split_address_line ────────────────────────────────────────
+  //
+  // Splits the FULL Google formatted address currently stored in
+  // addressLine1 down to just the street line. Legacy write paths kept
+  // the whole "…, City, ST 12345, United States" string in
+  // addressLine1, which then double-rendered on the consumer app
+  // (addressLine1 + city + state). This action rewrites addressLine1
+  // to the street portion only; city/state/postalCode are left alone.
+  private async runSplitAddressLine(
+    runId: string,
+    input: Parameters<RunService['launch']>[0],
+  ): Promise<void> {
+    if (!input.dryRun && !input.adminPassword) {
+      throw new HttpException(
+        'split_address_line requires adminPassword on a live run',
+        400,
+      );
+    }
+    const ids: string[] = [];
+    for await (const oid of this.consoleService.iterateSelectionIds(
+      input.environment,
+      input.selection,
+    )) {
+      ids.push(String(oid));
+    }
+
+    const result = await this.pipelineService.splitAddressLine({
+      environment: input.environment,
+      adminPassword: input.adminPassword ?? '',
+      dryRun: input.dryRun,
+      businessIds: ids,
+    });
+
+    await this.incrementCounters(runId, {
+      processed: result.totals.scanned,
+      succeeded: result.totals.split,
+      skipped:
+        result.totals.skippedNoStreetLine + result.totals.skippedNoStateZip,
+    });
+    await this.patch(runId, { result });
+    await this.appendLog(
+      runId,
+      'info',
+      `split_address_line dryRun=${input.dryRun}: ` +
+        `scanned=${result.totals.scanned} ` +
+        `split=${result.totals.split} ` +
+        `skippedNoStreetLine=${result.totals.skippedNoStreetLine} ` +
+        `skippedNoStateZip=${result.totals.skippedNoStateZip} ` +
+        `cityMismatch=${result.totals.cityMismatch}`,
     );
   }
 

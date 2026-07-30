@@ -14,6 +14,7 @@
 // below marks the exact line to remove when that stage lands.
 
 import { SEED_DEFAULT_COVER } from '../activation/seed-defaults';
+import { isStreetLineShape } from '../common/business-write-guard';
 
 export const US_LAT_MIN = 24;
 export const US_LAT_MAX = 50;
@@ -93,6 +94,13 @@ export function c5_valid_address(doc: Record<string, any>): boolean {
   if (!rawAddr) return false;
   if (URL_RE.test(rawAddr)) return false;
   if (PHONE_RE.test(rawAddr)) return false;
+  // addressLine1 must look like a street line only: no lingering
+  // state+ZIP fragment, no country suffix, and either starts with a
+  // house number or carries a recognised street-type token. Records
+  // that store the full Google formatted string here (12k+ as of
+  // 2026-07-31) fail this check — they need the split_address_line
+  // backfill first.
+  if (!isStreetLineShape(rawAddr)) return false;
   const city = typeof doc.city === 'string' ? doc.city.trim() : '';
   if (!city) return false;
   if (COUNTY_RE.test(city)) return false;

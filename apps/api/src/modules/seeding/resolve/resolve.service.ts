@@ -22,9 +22,9 @@ import {
   normalizeName,
 } from './name-match';
 import {
-  deriveCityFromAddressLine1,
   isValidAddressLine1,
   sanitizeBusinessPatch,
+  splitFormattedAddress,
 } from '../common/business-write-guard';
 
 const LOOSE_SCHEMA = new mongoose.Schema<any>(
@@ -954,37 +954,46 @@ export class ResolveService {
         if (environment !== 'staging') {
           resolveStatusBody.address = 'skipped_non_staging';
         } else {
-          const { derivedCity } =
-            deriveCityFromAddressLine1(incomingAddress);
-          const rawPatch: Record<string, any> = {
-            addressLine1: incomingAddress,
-          };
-          if (derivedCity) rawPatch.city = derivedCity;
-          const { patch: sanitized, adjustments } =
-            sanitizeBusinessPatch(rawPatch);
-
-          if (typeof sanitized.addressLine1 !== 'string') {
+          // Split the full Google formatted address into street-only +
+          // city + state + ZIP. addressLine1 gets the street line only;
+          // the full string stays on googleFormattedAddress above. If
+          // the split fails (no state+ZIP or no street portion — e.g.
+          // "New York, NY 11111, United States"), skip the write.
+          const split = splitFormattedAddress(incomingAddress);
+          if (!split) {
             set.addressStatus = 'address_rejected';
             resolveStatusBody.address = 'address_rejected';
-            if (adjustments.length > 0) {
-              resolveStatusBody.addressRejectReason = adjustments.join('; ');
-            }
+            resolveStatusBody.addressRejectReason =
+              'no street line or state+ZIP in formatted address';
           } else {
-            const existingAddr =
-              typeof business.addressLine1 === 'string'
-                ? business.addressLine1
-                : '';
-            if (isValidAddressLine1(existingAddr)) {
-              set.addressStatus = 'kept_existing';
-              resolveStatusBody.address = 'kept_existing';
-            } else {
-              set.addressLine1 = sanitized.addressLine1;
-              if (typeof sanitized.city === 'string' && sanitized.city) {
-                set.city = sanitized.city;
+            const { patch: sanitized, adjustments } = sanitizeBusinessPatch({
+              addressLine1: split.addressLine1,
+              city: split.city,
+            });
+
+            if (typeof sanitized.addressLine1 !== 'string') {
+              set.addressStatus = 'address_rejected';
+              resolveStatusBody.address = 'address_rejected';
+              if (adjustments.length > 0) {
+                resolveStatusBody.addressRejectReason = adjustments.join('; ');
               }
-              set.addressStatus = 'written';
-              resolveStatusBody.address = 'written';
-              resolveStatusBody.addressSource = 'google_place_page';
+            } else {
+              const existingAddr =
+                typeof business.addressLine1 === 'string'
+                  ? business.addressLine1
+                  : '';
+              if (isValidAddressLine1(existingAddr)) {
+                set.addressStatus = 'kept_existing';
+                resolveStatusBody.address = 'kept_existing';
+              } else {
+                set.addressLine1 = sanitized.addressLine1;
+                if (typeof sanitized.city === 'string' && sanitized.city) {
+                  set.city = sanitized.city;
+                }
+                set.addressStatus = 'written';
+                resolveStatusBody.address = 'written';
+                resolveStatusBody.addressSource = 'google_place_page';
+              }
             }
           }
         }
