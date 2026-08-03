@@ -26,6 +26,17 @@ import {
   sanitizeBusinessPatch,
   splitFormattedAddress,
 } from '../common/business-write-guard';
+import {
+  extractCoords,
+  US_LAT_MAX,
+  US_LAT_MIN,
+  US_LNG_MAX,
+  US_LNG_MIN,
+} from '../console/gate-predicates';
+import {
+  sanitizeResolveQueryFields,
+  buildQuerySanitizerCounters,
+} from './query-sanitizer';
 
 const LOOSE_SCHEMA = new mongoose.Schema<any>(
   {},
@@ -115,6 +126,11 @@ export interface ResolveWebhookPayload {
   resolvedPlaceId?: string | null;
   resolvedName?: string | null;
   hoursRaw?: string[];
+  // 'search' | 'place_id' | 'two_hop'. Diagnostic only — surfaces which
+  // nav strategy the bot ended up using. two_hop means the resolver
+  // clicked into a child business POI after the primary landing failed
+  // to yield hours (FIX 1 in recover-resolve-failures.md).
+  navPath?: string | null;
   // Soft note from the bot when the only ChIJ visible on the resolved
   // page is the stored building id (i.e. no real upgrade is available).
   // The bot returns resolvedPlaceId: null in this case AND sets this
@@ -345,6 +361,7 @@ export class ResolveService {
       })
         .select(
           '_id name addressLine1 address1 city state postalCode placeId ' +
+            'latitude longitude location ' +
             'resolveStatus categoryStatus pendingCoverUrl',
         )
         .lean();
@@ -378,16 +395,42 @@ export class ResolveService {
         return true;
       });
 
-      const records = filtered.map((b) => ({
-        placeId: b.placeId || '',
-        businessId: String(b._id),
-        businessName: b.name || '',
-        environment,
-        addressLine1: b.addressLine1 || b.address1 || '',
-        city: b.city || '',
-        state: b.state || '',
-        postalCode: b.postalCode || '',
-      }));
+      // FIX 3: drop junk / contradictory query fields before the bot
+      // ever sees them. `sanitized` returns '' for any field it dropped
+      // so the bot's existing query builder falls back cleanly. Counter
+      // is logged once per triggerResolve call for measurement.
+      const qCounters = buildQuerySanitizerCounters();
+      const records = filtered.map((b) => {
+        const sanitized = sanitizeResolveQueryFields(
+          {
+            addressLine1: b.addressLine1,
+            address1: b.address1,
+            city: b.city,
+            state: b.state,
+            postalCode: b.postalCode,
+          },
+          b,
+        );
+        qCounters.total += 1;
+        if (sanitized.droppedAddress) qCounters.droppedAddress += 1;
+        if (sanitized.droppedCityState) qCounters.droppedCityState += 1;
+        return {
+          placeId: b.placeId || '',
+          businessId: String(b._id),
+          businessName: b.name || '',
+          environment,
+          addressLine1: sanitized.addressLine1,
+          city: sanitized.city,
+          state: sanitized.state,
+          postalCode: sanitized.postalCode,
+        };
+      });
+      this.logger.log(
+        `[RESOLVE] triggerResolve sanitize: ` +
+          `total=${qCounters.total} ` +
+          `droppedAddress=${qCounters.droppedAddress} ` +
+          `droppedCityState=${qCounters.droppedCityState}`,
+      );
 
       // Create the batch BEFORE enqueuing jobs so the webhook can
       // always attribute outcomes back to a batchId — even the
@@ -537,7 +580,7 @@ export class ResolveService {
     const {
       businessId, environment, resolvedPlaceId, resolvedName, hoursRaw,
       rating, userRatingCount, coverUrl, googleCategory,
-      googleFormattedAddress, addressSync,
+      googleFormattedAddress, addressSync, navPath,
     } = payload;
     let { error, placeIdNote } = payload;
 
@@ -712,6 +755,7 @@ export class ResolveService {
         hoursRaw: hoursRaw ?? [],
         confidence: conf,
         checkedAt: new Date(),
+        ...(navPath ? { navPath } : {}),
       };
 
       if (hoursResult.kind === 'empty') {
@@ -770,11 +814,39 @@ export class ResolveService {
 
       if (placeIdIsChIJ) {
         if (business.placeId !== resolvedPlaceId) {
-          // Upgrade from the stored (likely building) id to the
-          // discovered business id. Record both for audit.
-          set.placeId = resolvedPlaceId;
-          resolveStatusBody.oldPlaceId = business.placeId ?? null;
-          resolveStatusBody.newPlaceId = resolvedPlaceId;
+          // FIX 1 (recover-resolve-failures.md §Persist the corrected
+          // placeId): only overwrite when hours were captured on the
+          // same visit. Empty hours means we can't verify we're on the
+          // right POI — a wrong placeId here would break singleton
+          // (c6) and taint every downstream cover/image sync for the
+          // business. Collision guard is unconditional.
+          const collision = await Business.findOne(
+            {
+              placeId: resolvedPlaceId,
+              _id: {
+                $ne: new mongoose.Types.ObjectId(businessId),
+              },
+            },
+            { _id: 1 },
+          ).lean();
+          if (collision) {
+            resolveStatusBody.placeIdCollision = true;
+            resolveStatusBody.placeIdCollisionWith = String(
+              (collision as any)._id,
+            );
+          } else if (hoursStatus === 'done') {
+            set.placeId = resolvedPlaceId;
+            resolveStatusBody.oldPlaceId = business.placeId ?? null;
+            resolveStatusBody.newPlaceId = resolvedPlaceId;
+            resolveStatusBody.placeIdCorrected = true;
+            resolveStatusBody.previousPlaceId = business.placeId ?? null;
+          } else {
+            // Discovered a new ChIJ but hours weren't captured — hold
+            // off on the write. The next resolve pass with a
+            // successful hours capture will finalise the upgrade.
+            resolveStatusBody.placeIdCorrectionPending = true;
+            resolveStatusBody.pendingNewPlaceId = resolvedPlaceId;
+          }
         } else {
           resolveStatusBody.placeIdUnchanged = true;
         }

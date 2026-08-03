@@ -2146,6 +2146,282 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
             except Exception:
                 pass
 
+        # ── FIX 1: POST-HOURS TWO-HOP (recover-resolve-failures.md) ──
+        # We landed on a business panel (h1 present, hours read
+        # attempted) but hoursRaw came back empty. In the
+        # 'no_hours_captured' cohort this is often because we're on a
+        # low-info duplicate POI while the real hours-bearing panel is
+        # one hop away via the "At this place" list or a
+        # /maps/search/ results feed. Reuse the same click-through
+        # selectors as the pre-hours drill-in; skip if we already
+        # drilled once (page budget: max 2 navigations per business).
+        did_two_hop = False
+        two_hop_score = 0
+        two_hop_matched: Optional[str] = None
+        if (
+            not hours_raw
+            and not drilled_in
+            and not error_msg
+            and has_name
+            and h1_present
+        ):
+            th_target = (req.businessName or '').strip()
+            th_norm = re.sub(
+                r'[^\w\s]', '', th_target.lower(),
+            ).strip()
+            th_tokens = (
+                set(th_norm.split()) if th_norm else set()
+            )
+            th_candidates: list = []
+            if th_norm:
+                try:
+                    th_candidates = await page.evaluate(r"""() => {
+                        // Same selector chain as the pre-hours drill.
+                        const out = [];
+                        const seen = new Set();
+                        const selectors = [
+                            'a.hfpxzc[aria-label]',
+                            'a[href*="/maps/place/"][aria-label]',
+                            'div[role="feed"] a[href*="/maps/place/"]',
+                            'div[role="article"] a[href*="/maps/place/"]',
+                            'a[jsaction][href*="/maps/place/"]',
+                        ];
+                        const currentHref = location.href;
+                        for (const sel of selectors) {
+                            const els = document.querySelectorAll(sel);
+                            for (const el of els) {
+                                const aria =
+                                    el.getAttribute('aria-label') || '';
+                                const inner = (
+                                    el.innerText || el.textContent || ''
+                                ).trim();
+                                const raw =
+                                    aria || inner.split('\n')[0];
+                                const name = (raw || '').trim();
+                                if (!name || name.length < 2) continue;
+                                const href = el.href || '';
+                                if (
+                                    !href ||
+                                    !href.includes('/maps/place/')
+                                ) continue;
+                                // Skip self — clicking it is a no-op.
+                                if (href === currentHref) continue;
+                                const key = name + '|' + href;
+                                if (seen.has(key)) continue;
+                                seen.add(key);
+                                out.push({ name, href });
+                            }
+                            if (out.length > 0) break;
+                        }
+                        return out;
+                    }""") or []
+                except Exception:
+                    th_candidates = []
+
+            th_best = None
+            for c in th_candidates:
+                name = (c.get('name') or '').strip()
+                name_norm = re.sub(
+                    r'[^\w\s]', '', name.lower(),
+                ).strip()
+                if not name_norm:
+                    continue
+                name_tokens = set(name_norm.split())
+                score = 0
+                if name_norm == th_norm:
+                    score = 100
+                elif (
+                    name_norm in th_norm or th_norm in name_norm
+                ):
+                    score = 70
+                elif th_tokens:
+                    overlap = len(name_tokens & th_tokens)
+                    if overlap > 0:
+                        denom = max(
+                            len(name_tokens), len(th_tokens),
+                        )
+                        score = int((overlap / denom) * 60)
+                if score > two_hop_score:
+                    two_hop_score = score
+                    th_best = c
+
+            if th_best and two_hop_score >= 50:
+                two_hop_matched = th_best.get('name')
+                th_href = th_best.get('href', '')
+                logger.info(
+                    f'[RESOLVE] {req.businessId} two-hop: matched '
+                    f'"{two_hop_matched}" (score={two_hop_score}) '
+                    f'→ {th_href[:100]}'
+                )
+                try:
+                    await page.goto(
+                        th_href,
+                        wait_until='domcontentloaded',
+                        timeout=40000,
+                    )
+                    for sel in [
+                        'button[aria-label*="Accept all"]',
+                        'button[aria-label*="Accept"]',
+                        'button[aria-label*="Agree"]',
+                    ]:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=1000):
+                                await btn.click()
+                                await page.wait_for_timeout(400)
+                                break
+                        except Exception:
+                            pass
+                    try:
+                        await page.wait_for_selector(
+                            'h1.DUwDvf, h1.fontHeadlineLarge',
+                            timeout=15000,
+                        )
+                        await page.wait_for_timeout(1500)
+                        did_two_hop = True
+                        drilled_in = True
+                        nav_path = 'two_hop'
+                        landed_on = 'business'
+                        try:
+                            resolved_name = (
+                                await page.locator(
+                                    'h1.DUwDvf, h1.fontHeadlineLarge'
+                                ).first.inner_text(timeout=5000)
+                            ).strip()
+                        except Exception:
+                            pass
+                        # Re-read hours on the new panel.
+                        rows_2 = []
+                        try:
+                            rows_2 = await page.locator(
+                                'table.eK4R0e tr'
+                            ).all()
+                        except Exception:
+                            rows_2 = []
+                        if not rows_2:
+                            for expand_sel in [
+                                'div[data-hide-tooltip-on-mouse-leave="true"] '
+                                'button',
+                                'div[data-hide-tooltip-on-mouse-leave] button',
+                                'button[aria-label*="hour" i]',
+                                'button[data-item-id*="oh"]',
+                                'div[aria-label*="hour" i]',
+                            ]:
+                                try:
+                                    btn = page.locator(
+                                        expand_sel,
+                                    ).first
+                                    if await btn.is_visible(timeout=1500):
+                                        await btn.click()
+                                        await page.wait_for_timeout(600)
+                                        rows_2 = await page.locator(
+                                            'table.eK4R0e tr'
+                                        ).all()
+                                        if rows_2:
+                                            break
+                                except Exception:
+                                    continue
+                        if rows_2:
+                            for row in rows_2:
+                                try:
+                                    cells = await row.locator('td').all()
+                                    if len(cells) < 2:
+                                        continue
+                                    day_raw = (
+                                        await cells[0].inner_text(
+                                            timeout=500,
+                                        )
+                                    ).strip()
+                                    time_raw = (
+                                        await cells[1].inner_text(
+                                            timeout=500,
+                                        )
+                                    ).strip()
+                                    day = re.sub(
+                                        r'\s+', ' ', day_raw,
+                                    ).strip()
+                                    time_ = re.sub(
+                                        r'\s+', ' ', time_raw,
+                                    ).strip()
+                                    if day:
+                                        hours_raw.append(
+                                            f'{day}: {time_}',
+                                        )
+                                except Exception:
+                                    pass
+                        # Re-scan ChIJ from the child panel — this is
+                        # the real business ChIJ (not the building's).
+                        try:
+                            chij_dump_2 = await page.evaluate(r"""() => {
+                                const CHIJ = /ChIJ[A-Za-z0-9_-]{20,}/g;
+                                const collect = (s) => {
+                                    if (!s) return [];
+                                    const m = String(s).match(CHIJ);
+                                    return m ? Array.from(m) : [];
+                                };
+                                const out = {
+                                    initstate: [], url: [], content: [],
+                                };
+                                try {
+                                    const init = window.APP_INITIALIZATION_STATE;
+                                    if (init) out.initstate = collect(
+                                        JSON.stringify(init),
+                                    );
+                                } catch (e) {}
+                                try {
+                                    out.url = collect(location.href);
+                                } catch (e) {}
+                                try {
+                                    out.content = collect(
+                                        document.documentElement.outerHTML,
+                                    );
+                                } catch (e) {}
+                                return out;
+                            }""")
+                            building_id = (place_id_in or '').strip()
+                            for src in ('initstate', 'url', 'content'):
+                                for cand in (chij_dump_2 or {}).get(
+                                    src, [],
+                                ) or []:
+                                    if not cand:
+                                        continue
+                                    if (
+                                        building_id
+                                        and cand == building_id
+                                    ):
+                                        continue
+                                    resolved_place_id = cand
+                                    chij_source = f'two_hop:{src}'
+                                    chij_in_content = True
+                                    # A real business ChIJ was found
+                                    # — clear the earlier
+                                    # equals_building note.
+                                    place_id_note = None
+                                    break
+                                if (
+                                    resolved_place_id
+                                    and resolved_place_id != building_id
+                                ):
+                                    break
+                        except Exception:
+                            pass
+                    except Exception:
+                        logger.info(
+                            f'[RESOLVE-DEBUG] {req.businessId} two-hop '
+                            f'h1 never appeared within 15s'
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f'[RESOLVE] {req.businessId} two-hop nav '
+                        f'failed: {e}'
+                    )
+            elif th_candidates:
+                logger.info(
+                    f'[RESOLVE] {req.businessId} two-hop: no confident '
+                    f'match (entries={len(th_candidates)} '
+                    f'best_score={two_hop_score})'
+                )
+
         # ── 4) Extra-cheap reads off the same panel ──
         # rating, userRatingCount and cover URL are all visible on the
         # same DOM we already loaded for hours/placeId; pull them in
@@ -2318,6 +2594,9 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
             f'nav_path={nav_path} '
             f'landed_on={landed_on} '
             f'drilled_in={drilled_in} '
+            f'did_two_hop={did_two_hop} '
+            f'two_hop_score={two_hop_score} '
+            f'two_hop_matched={two_hop_matched!r} '
             f'atplace_entries_found={atplace_entries_found} '
             f'atplace_matched={atplace_matched!r} '
             f'atplace_best_score={atplace_best_score} '
@@ -2362,6 +2641,10 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
         'resolvedName': resolved_name,
         'resolvedPlaceId': resolved_place_id,
         'hoursRaw': hours_raw,
+        # 'search' | 'place_id' | 'two_hop'. two_hop signals to the
+        # API webhook that this run navigated a second time to reach
+        # the hours-bearing panel.
+        'navPath': nav_path,
         # Soft note for the API decouple — set when search/drilled-in
         # surfaced ONLY the input building id (no business-level ChIJ
         # was visible). API maps this to placeId='review:placeid_equals_building'
