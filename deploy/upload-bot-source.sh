@@ -33,6 +33,7 @@ echo "Uploading bot source to s3://$S3_BUCKET/$S3_PREFIX/ ..."
 SOURCE_FILES=(
     main.py
     scraper_bulk.py
+    email_scraper.py
     auto_setup_cookies.py
     requirements.txt
     version.json
