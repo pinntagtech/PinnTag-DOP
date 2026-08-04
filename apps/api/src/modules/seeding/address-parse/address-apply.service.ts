@@ -39,6 +39,7 @@ import {
   SeedingErrorMessages,
 } from '../../../common/constants';
 import { andSeeded } from '../data-repair/data-repair.constants';
+import { fullStateName } from '../common/us-states';
 
 const LOOSE_SCHEMA = new mongoose.Schema<any>(
   {},
@@ -279,7 +280,7 @@ export class AddressApplyService {
             $set: {
               addressLine1: proposedLine1,
               city: trimStr(p?.city),
-              state: trimStr(p?.state),
+              state: fullStateName(trimStr(p?.state)),
               postalCode: trimStr(p?.postalCode),
               ...(p?.country ? { country: p.country } : {}),
               ...(p?.countryCode ? { countryCode: p.countryCode } : {}),

@@ -20,6 +20,7 @@
 // explicitly at each write site — not via a schema-level pre-save.
 
 import { PLACEHOLDER_COVER_REGEX } from '../activation/seed-defaults';
+import { fullStateName } from './us-states';
 
 // The four media fields that are known cover/logo carriers. If a caller
 // invents a new one, it stays unguarded — that's fine; the placeholder
@@ -218,6 +219,10 @@ export interface SanitizedBusinessPatch<T extends Record<string, any>> {
 //   - When auto-split fires: patch.city / patch.state / patch.postalCode
 //     are set to the derived values only if the caller did not already
 //     provide them. Explicit values from the caller win.
+//   - `state` (if present) is normalized via `fullStateName` to the full
+//     US state name. Idempotent, so callers that already normalized are
+//     unaffected. Covers both the split path (which sets a 2-letter
+//     code) and callers that pass state directly.
 export function sanitizeBusinessPatch<T extends Record<string, any>>(
   input: T,
 ): SanitizedBusinessPatch<T> {
@@ -266,6 +271,21 @@ export function sanitizeBusinessPatch<T extends Record<string, any>>(
         'dropped addressLine1: fails street-line shape / contains ' +
           'phone|URL|hours-text|state+ZIP',
       );
+    }
+  }
+
+  // State normalization — every target-DB write stores the full US state
+  // name (Business.state renders on the consumer app as "California",
+  // not "CA"). Idempotent: fullStateName is a no-op on already-full
+  // names and on non-US strings. Covers both the split path above
+  // (which sets a 2-letter code) and callers that pass state directly.
+  if (typeof patch.state === 'string' && patch.state.length > 0) {
+    const normalized = fullStateName(patch.state);
+    if (normalized !== patch.state) {
+      adjustments.push(
+        `normalized state: "${patch.state}" -> "${normalized}"`,
+      );
+      patch.state = normalized;
     }
   }
 
