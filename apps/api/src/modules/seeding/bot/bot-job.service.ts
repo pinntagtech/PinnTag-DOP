@@ -66,9 +66,17 @@ export class BotJobService {
       // build the Google Maps search URL when a valid ChIJ placeId
       // isn't on record yet). Other job types ignore them.
       addressLine1?: string;
+      // Legacy street field — sent so the bot can fall back to it when
+      // addressLine1 is empty (some pre-backfill docs still carry only
+      // this field).
+      address1?: string;
       city?: string;
       state?: string;
       postalCode?: string;
+      // Coords — used by the bot's in-context sanitizer to drop
+      // stored city/state that contradict the domestic coord box.
+      latitude?: number | null;
+      longitude?: number | null;
       // Website URL is required for EMAIL_SCRAPE — the bot fetches this
       // page (plus a few contact/about links) to extract emails.
       website?: string;
@@ -118,9 +126,12 @@ export class BotJobService {
         status: BotJobStatus.PENDING,
         maxReviews: r.maxReviews || 100,
         addressLine1: r.addressLine1 ?? '',
+        address1: r.address1 ?? '',
         city: r.city ?? '',
         state: r.state ?? '',
         postalCode: r.postalCode ?? '',
+        latitude: r.latitude ?? null,
+        longitude: r.longitude ?? null,
         website: r.website ?? '',
         attempts: 0,
       }));

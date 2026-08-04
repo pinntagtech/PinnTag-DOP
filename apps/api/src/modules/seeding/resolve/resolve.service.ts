@@ -414,15 +414,26 @@ export class ResolveService {
         qCounters.total += 1;
         if (sanitized.droppedAddress) qCounters.droppedAddress += 1;
         if (sanitized.droppedCityState) qCounters.droppedCityState += 1;
+        // Also send the LEGACY `address1` and the lat/lng — the bot's
+        // own in-context sanitizer (main.py _sanitize_query_fields)
+        // uses address1 as a fallback when addressLine1 is empty and
+        // uses coordinates to drop city/state that contradict them.
+        // Belt-and-suspenders with this API-side sanitizer — a job that
+        // reaches the bot through a path that skipped this method still
+        // gets the same treatment.
+        const coords = extractCoords(b);
         return {
           placeId: b.placeId || '',
           businessId: String(b._id),
           businessName: b.name || '',
           environment,
           addressLine1: sanitized.addressLine1,
+          address1: (b.address1 || '').toString(),
           city: sanitized.city,
           state: sanitized.state,
           postalCode: sanitized.postalCode,
+          latitude: coords ? coords.lat : undefined,
+          longitude: coords ? coords.lng : undefined,
         };
       });
       this.logger.log(

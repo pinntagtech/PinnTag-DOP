@@ -675,9 +675,12 @@ export class RunService {
         businessName: string;
         environment: string;
         addressLine1?: string;
+        address1?: string;
         city?: string;
         state?: string;
         postalCode?: string;
+        latitude?: number | null;
+        longitude?: number | null;
         website?: string;
       }> = [];
       let created = 0;
@@ -724,23 +727,49 @@ export class RunService {
               name: 1,
               placeId: 1,
               addressLine1: 1,
+              address1: 1,
               city: 1,
               state: 1,
               postalCode: 1,
+              latitude: 1,
+              longitude: 1,
+              location: 1,
               website: 1,
             },
           },
         )) as any;
         if (!doc) continue;
+        // Pull coords from the flat lat/lng or the GeoJSON location
+        // field — the bot's sanitizer needs them for the coord-vs-state
+        // contradiction check.
+        let lat: number | null = null;
+        let lng: number | null = null;
+        if (
+          typeof doc.latitude === 'number' &&
+          typeof doc.longitude === 'number'
+        ) {
+          lat = doc.latitude;
+          lng = doc.longitude;
+        } else if (
+          doc.location &&
+          Array.isArray(doc.location.coordinates) &&
+          doc.location.coordinates.length >= 2
+        ) {
+          lng = doc.location.coordinates[0];
+          lat = doc.location.coordinates[1];
+        }
         batch.push({
           placeId: typeof doc.placeId === 'string' ? doc.placeId : '',
           businessId: String(doc._id),
           businessName: String(doc.name ?? ''),
           environment: input.environment,
           addressLine1: doc.addressLine1 ?? '',
+          address1: doc.address1 ?? '',
           city: doc.city ?? '',
           state: doc.state ?? '',
           postalCode: doc.postalCode ?? '',
+          latitude: lat,
+          longitude: lng,
           website: typeof doc.website === 'string' ? doc.website : '',
         });
         if (batch.length >= BOT_TRIGGER_BATCH) await flush();

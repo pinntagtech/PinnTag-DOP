@@ -313,6 +313,313 @@ SKIP_FOLDERS = {
 
 POLL_INTERVAL = 5  # seconds between polls
 
+
+# ─── Resolve query sanitizer + name-match helpers ─────────────
+# Two of the three fixes in recover-resolve-failures.md live here so the
+# bot is self-sufficient regardless of which enqueue path the job came
+# from. The API applies the same rules on the way in
+# (query-sanitizer.ts / name-match.ts), but a pending job predating that
+# deploy — or a job enqueued via a path that skipped the API-side
+# sanitizer — must not poison Google's search or reject a good drill-in
+# match downstream. Belt-and-suspenders, and the bot is the last line
+# before Google.
+import re as _re
+
+
+_PHONE_RE = _re.compile(r'^\+?[\d\s().-]{7,}$')
+_URL_RE = _re.compile(r'^\s*(https?://|www\.)', _re.I)
+_DOMAIN_TAIL_RE = _re.compile(r'\.[a-z]{2,4}\b', _re.I)
+_HOURS_TEXT_RE = _re.compile(
+    r'\b(?:open\s+24\s+hours?|closed|hours?[:\s])', _re.I,
+)
+_POSTAL_ONLY_RE = _re.compile(
+    r'^[^,]+,\s*[A-Za-z]{2}\s+\d{5}(?:-\d{4})?\s*$',
+)
+_STREET_RE = _re.compile(
+    r'\b(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|'
+    r'way|ct|court|pl|place|hwy|highway|pkwy|parkway|ter|terrace|cir|'
+    r'circle|sq|square|broadway|turnpike|tpke|trail|trl|loop|alley|aly|'
+    r'row|walk|plaza|plz|crossing|xing)\b',
+    _re.I,
+)
+_HAS_DIGIT_RE = _re.compile(r'\d')
+
+# Continental US bounding box — the API side uses the same constants
+# (gate-predicates.ts). Kept in sync here so the coord-contradiction
+# check produces the same answer regardless of which side runs it.
+_US_LAT_MIN, _US_LAT_MAX = 24.396308, 49.384358
+_US_LNG_MIN, _US_LNG_MAX = -124.848974, -66.885444
+
+_US_STATES = {
+    'alabama','alaska','arizona','arkansas','california','colorado',
+    'connecticut','delaware','florida','georgia','hawaii','idaho',
+    'illinois','indiana','iowa','kansas','kentucky','louisiana','maine',
+    'maryland','massachusetts','michigan','minnesota','mississippi',
+    'missouri','montana','nebraska','nevada','new hampshire','new jersey',
+    'new mexico','new york','north carolina','north dakota','ohio',
+    'oklahoma','oregon','pennsylvania','rhode island','south carolina',
+    'south dakota','tennessee','texas','utah','vermont','virginia',
+    'washington','west virginia','wisconsin','wyoming',
+    'district of columbia','dc','puerto rico','pr',
+    'al','ak','az','ar','ca','co','ct','de','fl','ga','hi','id','il',
+    'in','ia','ks','ky','la','me','md','ma','mi','mn','ms','mo','mt',
+    'ne','nv','nh','nj','nm','ny','nc','nd','oh','ok','or','pa','ri',
+    'sc','sd','tn','tx','ut','vt','va','wa','wv','wi','wy',
+}
+
+
+def _address_line1_is_junk(raw) -> bool:
+    """FIX 3: reject an addressLine1 that would poison the Google Maps
+    search. Real staging examples the plan doc calls out:
+      "+1 501-804-9227"                         (phone-only)
+      "corpwellness.org"                        (bare domain)
+      "Miami, FL 33131"                         (postal fragment)
+      "Yoga"                                    (no digit, no street)
+    """
+    s = (raw or '').strip()
+    if not s:
+        return False  # empty is handled by the caller's fallback chain
+    if _PHONE_RE.match(s):
+        return True
+    if _URL_RE.match(s):
+        return True
+    if _HOURS_TEXT_RE.search(s):
+        return True
+    has_digit = bool(_HAS_DIGIT_RE.search(s))
+    if _DOMAIN_TAIL_RE.search(s) and not has_digit:
+        return True
+    if _POSTAL_ONLY_RE.match(s) and not _STREET_RE.search(s):
+        return True
+    if not has_digit and not _STREET_RE.search(s):
+        return True
+    return False
+
+
+def _city_is_junk(raw) -> bool:
+    """City-side variant. Only rejects the exact phone/URL/bare-domain
+    shapes — a legitimate city name never carries a digit sequence long
+    enough to trip the phone regex, so this is safe."""
+    s = (raw or '').strip()
+    if not s:
+        return False
+    if _PHONE_RE.match(s):
+        return True
+    if _URL_RE.match(s):
+        return True
+    if _DOMAIN_TAIL_RE.search(s) and not _HAS_DIGIT_RE.search(s):
+        return True
+    return False
+
+
+def _coords_in_us(lat, lng) -> bool:
+    try:
+        return (
+            _US_LAT_MIN <= float(lat) <= _US_LAT_MAX
+            and _US_LNG_MIN <= float(lng) <= _US_LNG_MAX
+        )
+    except Exception:
+        return False
+
+
+def _sanitize_query_fields(
+    address_line1, address1_fallback, city, state, lat, lng,
+) -> dict:
+    """Return the (address, city, state) the bot should actually search
+    with, along with reasons for each drop so we can log them.
+
+    Priority chain for the address:
+      1) addressLine1 if present and non-junk
+      2) address1 (legacy field) if present and non-junk
+      3) empty — the query becomes name + city + state, which is still
+                 viable when city/state carry real signal
+
+    City/state get dropped together when domestic coords contradict a
+    non-US state — the "US business carrying Spanish city" pattern the
+    plan doc calls out. `state` alone can't be dropped without `city`
+    (they only make sense as a pair for Google's search).
+    """
+    a1 = (address_line1 or '').strip()
+    a1_fb = (address1_fallback or '').strip()
+    dropped_reason = None
+    if a1 and _address_line1_is_junk(a1):
+        dropped_reason = 'a1_junk'
+        a1 = ''
+    if not a1 and a1_fb and not _address_line1_is_junk(a1_fb):
+        a1 = a1_fb
+        dropped_reason = dropped_reason or 'used_address1_fallback'
+
+    c = (city or '').strip()
+    s = (state or '').strip()
+    dropped_cs = False
+    if lat is not None and lng is not None and _coords_in_us(lat, lng):
+        if s and s.lower() not in _US_STATES:
+            dropped_cs = True
+    if c and _city_is_junk(c):
+        c = ''
+    if dropped_cs:
+        c = ''
+        s = ''
+    return {
+        'addressLine1': a1,
+        'city': c,
+        'state': s,
+        'droppedReason': dropped_reason,
+        'droppedCityState': dropped_cs,
+    }
+
+
+# ── Fix 2: loosened name-match, applied to drill-in / two-hop scoring ──
+# Mirrors apps/api/src/modules/seeding/resolve/name-match.ts so the
+# bot's own drill-in decision uses the same acceptance criteria the API
+# will use post-webhook. If we click into a candidate the API would
+# later reject as name_mismatch, we've wasted a nav and lost a row.
+
+_PUNCT_RE = _re.compile(r'[^\w\s]+', _re.U)
+
+_STOPWORDS = {
+    'the', 'a', 'an', 'of', 'and', 'co', 'inc', 'llc', 'ltd',
+    'limited', 'corp', 'corporation', 'company',
+}
+
+_COMMON_SUFFIXES = {
+    'restaurant', 'cafe', 'coffee', 'bar', 'grill', 'salon', 'spa',
+    'studio', 'gallery', 'shop', 'store', 'boutique', 'inc', 'llc',
+    'co', 'company', 'winery', 'brewery', 'distillery', 'kitchen',
+    'lounge', 'club', 'center', 'centre', 'hotel', 'inn', 'motel',
+    'pub', 'tavern', 'bakery', 'diner', 'bistro', 'eatery', 'market',
+    'shoppe', 'academy', 'llp',
+}
+
+_GENERIC_TOKENS = {
+    'the', 'a', 'an', 'of', 'and',
+    'cafe', 'bar', 'grill', 'salon', 'spa', 'studio', 'gallery',
+    'shop', 'store', 'restaurant', 'kitchen', 'lounge', 'club',
+    'hair', 'beauty', 'nail', 'nails', 'hotel', 'inn', 'boutique',
+    'coffee', 'tea', 'food', 'bistro', 'academy',
+    'atlanta', 'nyc', 'ny', 'la', 'sf', 'boston', 'miami', 'brooklyn',
+    'manhattan',
+}
+
+
+def _strip_diacritics(s: str) -> str:
+    import unicodedata
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+
+def _normalize_name(value) -> str:
+    if not value:
+        return ''
+    spaced = _strip_diacritics(str(value).lower())
+    spaced = spaced.replace('&', ' and ')
+    spaced = _PUNCT_RE.sub(' ', spaced)
+    spaced = _re.sub(r'\s+', ' ', spaced).strip()
+    # Glue single-letter runs ("m a d beauty" → "mad beauty") so
+    # "M.A.D. Beauty" collapses to the same token set as Google's
+    # "Mad Beauty Bar".
+    return _re.sub(
+        r'\b[a-z](?:\s[a-z])+\b',
+        lambda m: m.group(0).replace(' ', ''),
+        spaced,
+    )
+
+
+def _stem_plural(t: str) -> str:
+    if len(t) > 3 and t.endswith('ies'):
+        return t[:-3] + 'y'
+    if (len(t) > 3 and t.endswith('s')
+            and not t.endswith('ss') and not t.endswith('us')):
+        return t[:-1]
+    return t
+
+
+def _tokenize(value: str) -> list:
+    n = _normalize_name(value)
+    if not n:
+        return []
+    return [
+        _stem_plural(t)
+        for t in n.split(' ')
+        if t and t not in _STOPWORDS
+    ]
+
+
+def _strip_trailing_city(norm: str, city) -> str:
+    c = _normalize_name(city or '')
+    if not c:
+        return norm
+    if norm.endswith(' ' + c):
+        return norm[: -(len(c) + 1)].strip()
+    if norm == c:
+        return ''
+    return norm
+
+
+def _strip_trailing_suffixes(toks: list) -> list:
+    out = list(toks)
+    while len(out) > 1 and out[-1] in _COMMON_SUFFIXES:
+        out.pop()
+    return out
+
+
+def _names_loose_match(stored, resolved, city=None) -> dict:
+    """FIX 2: return (matched, rule, score). Rules mirror the API's
+    compareNames priority: equal → contains → equal_suffixed → overlap.
+    'overlap' requires ≥2 non-generic tokens in the intersection so
+    "Nail Cafe" vs "Hair Cafe" (single-generic-token overlap) rejects.
+    """
+    raw_a = _normalize_name(stored)
+    raw_b = _normalize_name(resolved)
+    a = _strip_trailing_city(raw_a, city)
+    b = _strip_trailing_city(raw_b, city)
+    base = {'normalizedStored': a or raw_a, 'normalizedResolved': b or raw_b}
+    if not a or not b:
+        return {'match': False, 'rule': 'no_match', 'score': 0, **base}
+    if a == b:
+        return {'match': True, 'rule': 'equal', 'score': 1.0, **base}
+    if a in b or b in a:
+        return {'match': True, 'rule': 'contains', 'score': 1.0, **base}
+
+    toks_a = _tokenize(a)
+    toks_b = _tokenize(b)
+    strip_a = _strip_trailing_suffixes(toks_a)
+    strip_b = _strip_trailing_suffixes(toks_b)
+    if (
+        len(strip_a) >= 2 and len(strip_b) >= 2
+        and ' '.join(strip_a) == ' '.join(strip_b)
+    ):
+        return {'match': True, 'rule': 'equal_suffixed', 'score': 0.95, **base}
+    if (
+        len(strip_a) >= 2 and len(strip_b) >= 2 and (
+            ' '.join(toks_a) == ' '.join(strip_b)
+            or ' '.join(toks_b) == ' '.join(strip_a)
+        )
+    ):
+        return {'match': True, 'rule': 'equal_suffixed', 'score': 0.9, **base}
+
+    set_a, set_b = set(toks_a), set(toks_b)
+    if not set_a or not set_b:
+        return {'match': False, 'rule': 'no_match', 'score': 0, **base}
+    inter = set_a & set_b
+    denom = min(len(set_a), len(set_b))
+    ov = 0 if denom == 0 else len(inter) / denom
+    non_generic = sum(1 for t in inter if t not in _GENERIC_TOKENS)
+    interSole = next(iter(inter)) if len(inter) == 1 else None
+    if (
+        ov >= 0.6 and denom >= 2 and non_generic >= 2
+        and not (len(inter) == 1 and interSole in _GENERIC_TOKENS)
+    ):
+        return {'match': True, 'rule': 'overlap', 'score': ov, **base}
+
+    union = len(set_a) + len(set_b) - len(inter)
+    jac = 0 if union == 0 else len(inter) / union
+    if jac >= 0.6:
+        return {'match': True, 'rule': 'jaccard', 'score': jac, **base}
+
+    return {'match': False, 'rule': 'no_match', 'score': max(ov, jac), **base}
+
 # ── Self-update plumbing ──────────────────────────────────────
 # Version is read from version.json sitting next to main.py. A successful
 # remote update overwrites this file, then we os.execv re-exec ONCE
@@ -440,9 +747,12 @@ async def poll_and_execute():
             skipMenu=(job_type != 'gallery_menu'),
             maxReviews=job.get('maxReviews', 100),
             addressLine1=job.get('addressLine1', '') or '',
+            address1=job.get('address1', '') or '',
             city=job.get('city', '') or '',
             state=job.get('state', '') or '',
             postalCode=job.get('postalCode', '') or '',
+            latitude=job.get('latitude'),
+            longitude=job.get('longitude'),
             website=job.get('website', '') or '',
         )
 
@@ -492,9 +802,19 @@ class ScrapeRequest(BaseModel):
     # Address fields carried for resolve_business — used to build a
     # Google Maps search URL when placeId is missing or invalid.
     addressLine1: Optional[str] = ""
+    # Legacy field. Some older Business docs (pre split_address_line
+    # backfill) still carry the street portion only under `address1`;
+    # the bot uses it as a fallback when `addressLine1` is empty so
+    # records with just the legacy field still build a viable query.
+    address1: Optional[str] = ""
     city: Optional[str] = ""
     state: Optional[str] = ""
     postalCode: Optional[str] = ""
+    # Coordinates — Fix 3 uses these to reject a stored city/state that
+    # contradicts a domestic business (US bounds + non-US state).
+    # Optional so non-resolve callers can omit them.
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     # Website URL carried for email_scrape — the business's own site
     # that we fetch to extract a literally-present email.
     website: Optional[str] = ""
@@ -1497,13 +1817,37 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
     #
     # nav_path tracks which URL strategy we used so the placeId echo /
     # sanity guards downstream can act accordingly.
+    # FIX 3: sanitize the query fields BEFORE building the URL. See
+    # module-top _sanitize_query_fields for the rules. Runs regardless
+    # of whether the API already sanitized on its side — a job enqueued
+    # via a path that skipped the API sanitizer must not poison the
+    # Google search here.
+    sanitized_q = _sanitize_query_fields(
+        req.addressLine1, getattr(req, 'address1', ''),
+        req.city, req.state,
+        getattr(req, 'latitude', None),
+        getattr(req, 'longitude', None),
+    )
+    sanitized_addr = sanitized_q['addressLine1']
+    sanitized_city = sanitized_q['city']
+    sanitized_state = sanitized_q['state']
+    if sanitized_q['droppedReason'] or sanitized_q['droppedCityState']:
+        logger.info(
+            f'[RESOLVE-SANITIZE] {req.businessId} '
+            f"reason={sanitized_q['droppedReason']} "
+            f"cs={sanitized_q['droppedCityState']} "
+            f"raw_a1={req.addressLine1!r} "
+            f"→ a1={sanitized_addr!r} city={sanitized_city!r} "
+            f"state={sanitized_state!r}"
+        )
+
     nav_path = 'search'
     if has_name:
         query_parts = [
             (req.businessName or '').strip(),
-            (req.addressLine1 or '').strip(),
-            (req.city or '').strip(),
-            (req.state or '').strip(),
+            sanitized_addr,
+            sanitized_city,
+            sanitized_state,
         ]
         query = ' '.join([p for p in query_parts if p])
         if not query:
@@ -1524,9 +1868,9 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
         )
     else:
         parts = [
-            (req.addressLine1 or '').strip(),
-            (req.city or '').strip(),
-            (req.state or '').strip(),
+            sanitized_addr,
+            sanitized_city,
+            sanitized_state,
             (req.postalCode or '').strip(),
         ]
         address = ', '.join([p for p in parts if p])
@@ -1614,9 +1958,9 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
         # and the real business (e.g. "Blink Nails") is a tenant in the
         # "At this place" section. We need to drill into it.
         address_for_compare = ', '.join([
-            (req.addressLine1 or '').strip(),
-            (req.city or '').strip(),
-            (req.state or '').strip(),
+            sanitized_addr,
+            sanitized_city,
+            sanitized_state,
         ]).strip(', ').lower()
         name_looks_like_address = bool(
             resolved_name
@@ -1708,34 +2052,53 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
 
             atplace_entries_found = len(candidates)
             best_entry = None
+            best_rule = 'no_match'
+            # FIX 2: score with the loosened match rule (equal / contains
+            # / equal_suffixed / overlap-over-smaller with generic-token
+            # guard) so we accept the same set of drill-in candidates the
+            # API would accept post-webhook. Falls through to the old
+            # token-overlap scorer only for candidates the loose match
+            # doesn't confidently accept, so no candidate we USED to
+            # accept can newly reject (monotonic loosening).
             for c in candidates:
                 name = (c.get('name') or '').strip()
-                name_norm = re.sub(
-                    r'[^\w\s]', '', name.lower(),
-                ).strip()
-                if not name_norm:
+                if not name:
                     continue
-                name_tokens = set(name_norm.split())
-
-                score = 0
-                if name_norm == target_name_norm:
-                    score = 100
-                elif (
-                    name_norm in target_name_norm
-                    or target_name_norm in name_norm
-                ):
-                    score = 70
-                elif target_tokens:
-                    overlap = len(name_tokens & target_tokens)
-                    if overlap > 0:
-                        denom = max(
-                            len(name_tokens), len(target_tokens),
-                        )
-                        score = int((overlap / denom) * 60)
+                m = _names_loose_match(
+                    target_name, name, city=req.city or None,
+                )
+                if m['match']:
+                    # rule → score mapping: equal 100, contains 90,
+                    # equal_suffixed 80, overlap/jaccard 60. Threshold
+                    # below is >=50 so overlap+jaccard both clear.
+                    score = {
+                        'equal': 100, 'contains': 90,
+                        'equal_suffixed': 80,
+                        'overlap': 60, 'jaccard': 60,
+                    }.get(m['rule'], 50)
+                else:
+                    # Legacy fallback: original max-set token overlap
+                    # scoring. Kept so we don't newly reject anything
+                    # the old code would have accepted.
+                    name_norm = re.sub(
+                        r'[^\w\s]', '', name.lower(),
+                    ).strip()
+                    name_tokens = (
+                        set(name_norm.split()) if name_norm else set()
+                    )
+                    score = 0
+                    if target_tokens and name_tokens:
+                        overlap = len(name_tokens & target_tokens)
+                        if overlap > 0:
+                            denom = max(
+                                len(name_tokens), len(target_tokens),
+                            )
+                            score = int((overlap / denom) * 60)
 
                 if score > atplace_best_score:
                     atplace_best_score = score
                     best_entry = c
+                    best_rule = m['rule'] if m['match'] else 'legacy'
 
             if best_entry and atplace_best_score >= 50:
                 atplace_matched = best_entry.get('name')
@@ -2219,28 +2582,37 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
                     th_candidates = []
 
             th_best = None
+            # FIX 2: same loosened match as the pre-hours drill-in above.
+            # Legacy overlap kept as a fallback so this can only ever
+            # accept a superset of what the old code accepted.
             for c in th_candidates:
                 name = (c.get('name') or '').strip()
-                name_norm = re.sub(
-                    r'[^\w\s]', '', name.lower(),
-                ).strip()
-                if not name_norm:
+                if not name:
                     continue
-                name_tokens = set(name_norm.split())
-                score = 0
-                if name_norm == th_norm:
-                    score = 100
-                elif (
-                    name_norm in th_norm or th_norm in name_norm
-                ):
-                    score = 70
-                elif th_tokens:
-                    overlap = len(name_tokens & th_tokens)
-                    if overlap > 0:
-                        denom = max(
-                            len(name_tokens), len(th_tokens),
-                        )
-                        score = int((overlap / denom) * 60)
+                m = _names_loose_match(
+                    th_target, name, city=req.city or None,
+                )
+                if m['match']:
+                    score = {
+                        'equal': 100, 'contains': 90,
+                        'equal_suffixed': 80,
+                        'overlap': 60, 'jaccard': 60,
+                    }.get(m['rule'], 50)
+                else:
+                    name_norm = re.sub(
+                        r'[^\w\s]', '', name.lower(),
+                    ).strip()
+                    name_tokens = (
+                        set(name_norm.split()) if name_norm else set()
+                    )
+                    score = 0
+                    if th_tokens and name_tokens:
+                        overlap = len(name_tokens & th_tokens)
+                        if overlap > 0:
+                            denom = max(
+                                len(name_tokens), len(th_tokens),
+                            )
+                            score = int((overlap / denom) * 60)
                 if score > two_hop_score:
                     two_hop_score = score
                     th_best = c
@@ -2834,9 +3206,12 @@ async def _resolve_worker(
                 skipMenu=True,
                 maxReviews=job.get('maxReviews', 100),
                 addressLine1=job.get('addressLine1', '') or '',
+                address1=job.get('address1', '') or '',
                 city=job.get('city', '') or '',
                 state=job.get('state', '') or '',
                 postalCode=job.get('postalCode', '') or '',
+                latitude=job.get('latitude'),
+                longitude=job.get('longitude'),
             )
 
             context = await _resolve_make_context(browser, cookies)

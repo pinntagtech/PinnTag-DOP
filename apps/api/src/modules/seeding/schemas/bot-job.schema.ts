@@ -54,6 +54,12 @@ export class BotJob {
   @Prop({ type: String, default: '' })
   addressLine1: string;
 
+  // Legacy field — kept so the bot can fall back to it inside
+  // _sanitize_query_fields when addressLine1 is empty but address1
+  // still has the street portion. Read-only from the bot's POV.
+  @Prop({ type: String, default: '' })
+  address1: string;
+
   @Prop({ type: String, default: '' })
   city: string;
 
@@ -62,6 +68,15 @@ export class BotJob {
 
   @Prop({ type: String, default: '' })
   postalCode: string;
+
+  // Coordinates — carried so the bot's coord-contradiction check
+  // (drop stored city/state when they don't sit inside the coords'
+  // country) can run without a DB round-trip.
+  @Prop({ type: Number, default: null })
+  latitude?: number | null;
+
+  @Prop({ type: Number, default: null })
+  longitude?: number | null;
 
   // Website URL carried for email_scrape — the bot fetches this page
   // (plus a few contact/about links) to extract a literally-present email.
