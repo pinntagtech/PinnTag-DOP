@@ -91,7 +91,8 @@ const NOT_BOT_FIXABLE_OK = {
 };
 
 const HAS_PLACEID = { placeId: { $type: "string", $ne: "" } };
-const PROJ = { _id: 1, name: 1, placeId: 1, addressLine1: 1, latitude: 1, longitude: 1,
+const PROJ = { _id: 1, name: 1, placeId: 1, addressLine1: 1, city: 1, state: 1,
+  latitude: 1, longitude: 1,
   "gateStatus.c2_real_cover": 1, "gateStatus.c3_real_hours": 1,
   "gateStatus.c5_valid_address": 1 };
 
@@ -209,6 +210,8 @@ function queue(list, type) {
       businessId: String(b._id),
       businessName: b.name || "",
       address1: b.addressLine1 || "",
+      city: b.city || "",
+      state: b.state || "",
       latitude: (typeof b.latitude === "number") ? b.latitude : null,
       longitude: (typeof b.longitude === "number") ? b.longitude : null,
       environment: "staging",

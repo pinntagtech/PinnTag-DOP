@@ -421,6 +421,63 @@ def _coords_in_us(lat, lng) -> bool:
         return False
 
 
+# Full-name → 2-letter code lookup for state normalization. `_US_STATES`
+# above holds both forms as a membership set; this dict is the one-way
+# canonical map used by the state cross-validation guard so "GA",
+# "Georgia" and "georgia" all compare equal.
+_US_STATE_CODE_BY_NAME = {
+    'alabama':'al','alaska':'ak','arizona':'az','arkansas':'ar',
+    'california':'ca','colorado':'co','connecticut':'ct','delaware':'de',
+    'florida':'fl','georgia':'ga','hawaii':'hi','idaho':'id',
+    'illinois':'il','indiana':'in','iowa':'ia','kansas':'ks',
+    'kentucky':'ky','louisiana':'la','maine':'me','maryland':'md',
+    'massachusetts':'ma','michigan':'mi','minnesota':'mn',
+    'mississippi':'ms','missouri':'mo','montana':'mt','nebraska':'ne',
+    'nevada':'nv','new hampshire':'nh','new jersey':'nj',
+    'new mexico':'nm','new york':'ny','north carolina':'nc',
+    'north dakota':'nd','ohio':'oh','oklahoma':'ok','oregon':'or',
+    'pennsylvania':'pa','rhode island':'ri','south carolina':'sc',
+    'south dakota':'sd','tennessee':'tn','texas':'tx','utah':'ut',
+    'vermont':'vt','virginia':'va','washington':'wa','west virginia':'wv',
+    'wisconsin':'wi','wyoming':'wy',
+    'district of columbia':'dc','puerto rico':'pr',
+}
+_US_STATE_CODES = set(_US_STATE_CODE_BY_NAME.values())
+
+# Google formatted addresses look like
+#   "927 Fulton St, Brooklyn, NY 11238, United States"
+#   "123 Main St, Miami, FL 33131"
+#   "Suite 200, 1 Elm Rd, New York, New York 10001, USA"
+# Anchor on ", <state token(s)> <5-digit ZIP>" so we don't misread a
+# 5-digit street number as the ZIP.
+_STATE_FROM_ADDR_RE = _re.compile(
+    r',\s*([A-Za-z][A-Za-z .]{1,25}?)\s+\d{5}(?:-\d{4})?'
+    r'\s*(?:,\s*(?:USA|United States|US))?\s*$'
+)
+
+
+def _normalize_state(raw) -> str:
+    """Return a 2-letter lowercase state code, or '' if we can't tell."""
+    s = (raw or '').strip().lower()
+    if not s:
+        return ''
+    if len(s) == 2 and s in _US_STATE_CODES:
+        return s
+    return _US_STATE_CODE_BY_NAME.get(s, '')
+
+
+def _extract_state_from_formatted(addr) -> str:
+    """Pull the state out of a Google-formatted address string, or ''
+    if the pattern doesn't match. The 5-digit ZIP anchor keeps this
+    from mistaking a numeric street prefix for a ZIP."""
+    if not addr:
+        return ''
+    m = _STATE_FROM_ADDR_RE.search(addr)
+    if not m:
+        return ''
+    return _normalize_state(m.group(1))
+
+
 def _sanitize_query_fields(
     address_line1, address1_fallback, city, state, lat, lng,
 ) -> dict:
@@ -1827,6 +1884,21 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
         f'/@{float(lat)},{float(lng)},14z' if has_geo_anchor else ''
     )
 
+    # Signal tier for the fallback search, best first:
+    #   'coord' — viewport-anchored via @lat,lng,14z (Google honors it)
+    #   'text'  — no coord anchor but city+state are in the query text,
+    #             which biases Google's ranking away from operator IP
+    #             even though it's a soft hint, not a hard viewport
+    #   'none'  — name-only; drifts toward the requester's IP location.
+    #             Logged distinctly so we can count how many jobs still
+    #             fall through both tiers (data gap upstream).
+    if has_geo_anchor:
+        geo_signal = 'coord'
+    elif (req.city or '').strip() and (req.state or '').strip():
+        geo_signal = 'text'
+    else:
+        geo_signal = 'none'
+
     # PRIMARY: when we have a business name, search by name+address. The
     # placeIds we have on file are ADDRESS/BUILDING ids, not business
     # ids — navigating ?q=place_id:<id> opens the building's panel and
@@ -1910,6 +1982,7 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
     logger.info(
         f'[RESOLVE] {req.businessId} nav_path={nav_path} '
         f'geo_anchor={"present" if has_geo_anchor else "missing"} '
+        f'geo_signal={geo_signal} '
         f'→ {target_url[:160]}'
     )
 
@@ -3031,6 +3104,54 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
             await page.close()
         except Exception:
             pass
+
+    # ── STATE CROSS-VALIDATION (Check A) ──
+    # The API's country-only guard is too coarse: "Atlanta, GA" vs
+    # "Los Angeles, CA" is same-country, wrong business, and slips
+    # through today. Compare resolved state (parsed from Google's
+    # formatted address) against the stored state on the job. Applies
+    # to every path — place_id, two_hop, and the fallback search — by
+    # firing at the single return point below.
+    #
+    # On mismatch: null hoursRaw/placeId and set error='state_mismatch'.
+    # The API webhook (resolve.service.ts ~654) treats error != null as
+    # a bot failure — writes resolveStatus.reason='bot_error:state_mismatch',
+    # hours/placeId='review:bot_error:state_mismatch', and skips ALL
+    # per-field writes (hours, placeId, cover, category, rating).
+    # Skipped when either side is empty: no signal, no verdict — never
+    # a false positive.
+    stored_state_norm = _normalize_state(req.state)
+    resolved_state_norm = _extract_state_from_formatted(
+        google_formatted_address,
+    )
+    state_mismatch = (
+        stored_state_norm
+        and resolved_state_norm
+        and stored_state_norm != resolved_state_norm
+        and (resolved_name or resolved_place_id)
+    )
+    if state_mismatch:
+        logger.warning(
+            f'[RESOLVE-STATE-MISMATCH] {req.businessId} '
+            f'stored={stored_state_norm} '
+            f'resolved={resolved_state_norm} '
+            f'name={resolved_name!r} '
+            f'addr={google_formatted_address!r}'
+        )
+        return {
+            'resolvedName': resolved_name,
+            'resolvedPlaceId': None,
+            'hoursRaw': [],
+            'navPath': nav_path,
+            'placeIdNote': None,
+            'rating': None,
+            'userRatingCount': None,
+            'coverUrl': None,
+            'googleCategory': None,
+            'googleFormattedAddress': google_formatted_address,
+            'addressSync': None,
+            'error': 'state_mismatch',
+        }
 
     return {
         'resolvedName': resolved_name,
