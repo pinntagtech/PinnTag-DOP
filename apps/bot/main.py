@@ -1808,6 +1808,25 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
     use_place_id = bool(re.match(r'^ChIJ[A-Za-z0-9_-]+$', place_id_in))
     has_name = bool((req.businessName or '').strip())
 
+    # Viewport anchor for /maps/search/ URLs. Without it, Google ranks
+    # results by requester IP — an operator machine in India searching a
+    # bare-name query like "Eric house" resolves to a New Delhi housing
+    # society, not the intended US POI. The @lat,lng,14z segment biases
+    # ranking back into the business's own neighborhood; Google honors
+    # the viewport for /maps/search/ (verified live).
+    lat = getattr(req, 'latitude', None)
+    lng = getattr(req, 'longitude', None)
+    has_geo_anchor = (
+        isinstance(lat, (int, float))
+        and isinstance(lng, (int, float))
+        and -90 <= float(lat) <= 90
+        and -180 <= float(lng) <= 180
+        and not (float(lat) == 0.0 and float(lng) == 0.0)
+    )
+    geo_anchor_suffix = (
+        f'/@{float(lat)},{float(lng)},14z' if has_geo_anchor else ''
+    )
+
     # PRIMARY: when we have a business name, search by name+address. The
     # placeIds we have on file are ADDRESS/BUILDING ids, not business
     # ids — navigating ?q=place_id:<id> opens the building's panel and
@@ -1859,6 +1878,7 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
             }
         target_url = (
             f'https://www.google.com/maps/search/{quote_plus(query)}'
+            f'{geo_anchor_suffix}'
         )
     elif use_place_id:
         nav_path = 'place_id'
@@ -1884,10 +1904,13 @@ async def _resolve_in_context(context, req: 'ScrapeRequest'):
         target_url = (
             f'https://www.google.com/maps/search/'
             f'{quote_plus(address)}'
+            f'{geo_anchor_suffix}'
         )
 
     logger.info(
-        f'[RESOLVE] {req.businessId} → {target_url[:120]}'
+        f'[RESOLVE] {req.businessId} nav_path={nav_path} '
+        f'geo_anchor={"present" if has_geo_anchor else "missing"} '
+        f'→ {target_url[:160]}'
     )
 
     page = await context.new_page()
