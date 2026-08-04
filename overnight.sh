@@ -14,6 +14,12 @@
 # resolve_business fetches the Google Maps place page, which yields BOTH
 # address and hours — so one job covers both deficits.
 #
+# 2026-08-05 patch: the bot's query sanitizer (a2c786b) reads address1 /
+# latitude / longitude off the job document. This script previously queued
+# jobs with only placeId + businessName, so every resolve fell back to the
+# pre-fix broken query regardless of the bot code being current. Fixed by
+# projecting and forwarding those three fields.
+#
 # Usage: nohup bash overnight.sh > /dev/null 2>&1 &
 #
 # .env.local (gitignored):
@@ -85,7 +91,7 @@ const NOT_BOT_FIXABLE_OK = {
 };
 
 const HAS_PLACEID = { placeId: { $type: "string", $ne: "" } };
-const PROJ = { _id: 1, name: 1, placeId: 1,
+const PROJ = { _id: 1, name: 1, placeId: 1, addressLine1: 1, latitude: 1, longitude: 1,
   "gateStatus.c2_real_cover": 1, "gateStatus.c3_real_hours": 1,
   "gateStatus.c5_valid_address": 1 };
 
@@ -168,12 +174,30 @@ const fs = require("fs");
 const c = JSON.parse(fs.readFileSync("/tmp/dop-candidates.json","utf8"));
 let seq = 0, added = 0, skipped = 0;
 
-// what is already queued or in flight, so we never double-queue
+// Do not re-queue a business we already handled.
 const live = {};
+const CUTOFF = new Date(Date.now() - 2 * 60 * 60 * 1000);
+
+// 1. currently queued or running
 db.dopBotJobs.find(
   { status: { $in: ["pending","running"] } },
   { businessId: 1, type: 1 }
 ).forEach(function (j) { live[j.businessId + "|" + j.type] = 1; });
+
+// 2. finished within the last 2h - give it a cooldown
+db.dopBotJobs.find(
+  { status: { $in: ["done","failed"] }, completedAt: { $gt: CUTOFF } },
+  { businessId: 1, type: 1 }
+).forEach(function (j) { live[j.businessId + "|" + j.type] = 1; });
+
+// 3. tried 5+ times already - it is not going to work on the 6th
+db.dopBotJobs.aggregate([
+  { $match: { status: { $in: ["done","failed"] } } },
+  { $group: { _id: { b: "$businessId", t: "$type" }, n: { $sum: 1 } } },
+  { $match: { n: { $gte: 5 } } }
+], { allowDiskUse: true }).forEach(function (r) {
+  live[r._id.b + "|" + r._id.t] = 1;
+});
 
 function queue(list, type) {
   const docs = [];
@@ -184,8 +208,11 @@ function queue(list, type) {
       placeId: b.placeId,
       businessId: String(b._id),
       businessName: b.name || "",
+      address1: b.addressLine1 || "",
+      latitude: (typeof b.latitude === "number") ? b.latitude : null,
+      longitude: (typeof b.longitude === "number") ? b.longitude : null,
       environment: "staging",
-      sessionId: "pipeline",
+      sessionId: "000000000000000000000000",
       type: type,
       status: "pending",
       attempts: 0,
