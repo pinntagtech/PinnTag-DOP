@@ -171,3 +171,84 @@ Branch `recovered-stash` (commit `3dadccf`) holds Marketing Suite work
 (`invitation-links.service.ts`, `pinntag-api.service.ts`,
 `business-filter.service.ts`, `docs/marketing-api-reference.md`) thought lost.
 Do not pop the stash. Extract specific paths only.
+## 11. Production placeId verification — HIGH PRIORITY, not yet started
+2,126 of 11,532 production businesses (18.4%) have a placeId that has never
+been confidence-scored against the actual Google listing. 0 have been
+proven wrong so far (81.6% independently verified, 0 proven wrong) — but
+"never checked" is not the same as "confirmed correct."
+
+Discovered via: an Apify test batch of 100 staging placeIds returned 2
+genuinely non-US results (New Delhi, Ghaziabad) for businesses whose STORED
+coordinates said domestic. Proves placeId and coordinates can silently
+disagree — domestic_coords alone does not catch this.
+
+- [ ] Read-only resolve pass against the 2,126 unscored production placeIds
+      (name-match + country check, same logic as staging resolve). No writes
+      to production in this pass — flag mismatches only.
+- [ ] Any flagged as non-US or provably-wrong: manual review before any
+      corrective action. Do not auto-correct or auto-remove production data.
+- [ ] Once closed, re-run this check as a standing quarterly job, not a
+      one-time pass — placeIds can drift after future dedup/migration work,
+      as this session's whole night proved.
+
+## 12. Third-party bulk enrichment (Apify) — PARKED, needs a verification gate before use
+Explored using Apify's Google Maps Scraper (compass/crawler-google-places)
+to bulk-resolve the ~6,338 staging businesses where hours+address are the
+ONLY remaining gate blocker (everything else already passes). Cost ~$6/1,000
+(base $4 + mandatory place-details add-on $2, NOT the $1.50-4 headline rate).
+~6,000 businesses ≈ ₹3,000 budget.
+
+STOPPED before running the full batch: a 100-record test returned 2 results
+for genuinely different businesses in India (New Delhi, Ghaziabad) despite
+every input placeId belonging to a business already gate-verified as
+domestic. Root cause unconfirmed — either those specific staging placeIds
+are themselves wrong (same class of problem as item 11), or a
+config/matching issue on the Apify side. NOT a leftover-search-field bug —
+Apify's own docs confirm placeId input takes priority over search fields.
+
+- [ ] Before resuming: build an import script with a HARD gate — reject any
+      returned record where country != US, or where the returned name does
+      not loose-match the stored name (reuse apps/bot/main.py's
+      _names_loose_match, now shipped in a2c786b). Log rejects, never
+      silently overwrite.
+- [ ] Once the gate exists, the exported candidate list is ready:
+      /tmp/apify-placeids.txt (6,000 placeIds) and
+      /tmp/apify-target-businesses.json (businessId+placeId+name), scoped via
+      export-apify-batch.js — only businesses where hours+address are the
+      sole blocker, so a successful write flips them straight to
+      fully-passing.
+- [ ] Re-run the same 100-record test after the gate is built and confirm
+      both bad results are correctly rejected before scaling to 6,000.
+
+## Bot resolve fixes — status correction (context for above)
+Two Claude Code sessions were needed to actually ship Fix 2 (name-match
+loosening) and Fix 3 (query sanitizer) from recover-resolve-failures.md.
+
+- Session 1 (commit 4c87b29): implemented Fix 1 (two-hop) for real. Fix 2/3
+  were CLAIMED shipped and validated (95%/75%) but the diff only contained
+  Fix 1. The validation harness re-implemented the sanitizer logic
+  externally and tested THAT, not the actual bot code — a false-positive
+  validation, caught by a live test against Golden Touch Wellness & Spa
+  Center failing in the pre-fix way post-deploy.
+- Session 2 (commit a2c786b): found and fixed the real gap. Fix 2/3 only
+  existed API-side, not in the bot itself, and several enqueue paths
+  (console run.service.ts, cover-backfill, direct /bot/poll callers) never
+  passed through the code path that had them. Ported into apps/bot/main.py
+  directly (_sanitize_query_fields, _names_loose_match), extended
+  ScrapeRequest with address1/latitude/longitude, wired through every
+  enqueue path. Live-verified on Golden Touch: now resolves correctly.
+  20-record re-samples: no_search_match 95%/75% (hours), name_mismatch 65%
+  hours, two_hop 15% (confirmed data ceiling, not a bug).
+- LESSON: "committed and pushed" is not proof of "working." A prior
+  session's own validation report is not trustworthy without an independent
+  live check against a real, previously-failing record. Applied twice
+  tonight, worth keeping as standing practice for any future bot/resolve
+  work in this repo.
+
+## Immediate next step given the above
+Bot fix is now confirmed real and deployed (v2026.08.05.0115). The
+requeue-flagged.js / requeue-flagged-insert.js pair from earlier tonight can
+be re-run against the CURRENT bot code — the underlying jobs and priority
+logic don't need to change, only the bot behind them does. Check
+dop-pipeline / dop-prod-sync are both un-paused before assuming forward
+progress.
