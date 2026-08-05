@@ -91,8 +91,7 @@ const NOT_BOT_FIXABLE_OK = {
 };
 
 const HAS_PLACEID = { placeId: { $type: "string", $ne: "" } };
-const PROJ = { _id: 1, name: 1, placeId: 1, addressLine1: 1, city: 1, state: 1,
-  latitude: 1, longitude: 1,
+const PROJ = { _id: 1, name: 1, placeId: 1, addressLine1: 1, latitude: 1, longitude: 1,
   "gateStatus.c2_real_cover": 1, "gateStatus.c3_real_hours": 1,
   "gateStatus.c5_valid_address": 1 };
 
@@ -177,7 +176,7 @@ let seq = 0, added = 0, skipped = 0;
 
 // Do not re-queue a business we already handled.
 const live = {};
-const CUTOFF = new Date(Date.now() - 2 * 60 * 60 * 1000);
+const CUTOFF = new Date(Date.now() - 15 * 60 * 1000);
 
 // 1. currently queued or running
 db.dopBotJobs.find(
@@ -192,8 +191,9 @@ db.dopBotJobs.find(
 ).forEach(function (j) { live[j.businessId + "|" + j.type] = 1; });
 
 // 3. tried 5+ times already - it is not going to work on the 6th
+const ATTEMPT_FLOOR = new Date(Date.now() - 4 * 60 * 60 * 1000);
 db.dopBotJobs.aggregate([
-  { $match: { status: { $in: ["done","failed"] } } },
+  { $match: { status: { $in: ["done","failed"] }, completedAt: { $gt: ATTEMPT_FLOOR } } },
   { $group: { _id: { b: "$businessId", t: "$type" }, n: { $sum: 1 } } },
   { $match: { n: { $gte: 5 } } }
 ], { allowDiskUse: true }).forEach(function (r) {
@@ -210,8 +210,6 @@ function queue(list, type) {
       businessId: String(b._id),
       businessName: b.name || "",
       address1: b.addressLine1 || "",
-      city: b.city || "",
-      state: b.state || "",
       latitude: (typeof b.latitude === "number") ? b.latitude : null,
       longitude: (typeof b.longitude === "number") ? b.longitude : null,
       environment: "staging",
