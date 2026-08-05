@@ -252,3 +252,21 @@ be re-run against the CURRENT bot code — the underlying jobs and priority
 logic don't need to change, only the bot behind them does. Check
 dop-pipeline / dop-prod-sync are both un-paused before assuming forward
 progress.
+
+## 13. Production merge path — CRITICAL, do not attempt overwrite as-is
+Discovered 2026-08-05: conflictMode:'overwrite' in migration.service.ts does
+a HARD DELETE + recreate (deleteOne then re-insert), not a field merge.
+New _id every time. Of a 2000-placeId staging sample, 1838 already have an
+active production subscription; 1 is claimed. Running overwrite at any real
+scale would destroy live subscription/claim state with no rollback.
+
+DO NOT run conflictMode:'overwrite' in bulk until a real merge path exists.
+
+Needed: a genuine field-level update endpoint/mode that patches
+regularTiming, addressLine1, cover, etc. on the EXISTING production
+document — preserving _id, isClaimed, activeSubscription, outlets. Test on
+a small manual batch (5-10 records) with before/after subscription-state
+verification, same discipline as everything else in this log.
+
+Also found: 16 duplicate placeId groups already in pinntagProd (from a
+2000-record sample) — worth a cleanup pass, separate from the above.
