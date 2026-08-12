@@ -1,4 +1,11 @@
-import { Controller, HttpException, Logger, Param, Post } from '@nestjs/common';
+import {
+  Controller,
+  HttpException,
+  Logger,
+  Param,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { DiscoveryService } from './discovery.service';
 
 @Controller('seeding/discovery')
@@ -26,6 +33,25 @@ export class DiscoveryController {
       if (e instanceof HttpException) throw e;
       const msg = (e as Error).message ?? String(e);
       this.logger.error(`preview ${regionId} failed: ${msg}`);
+      throw new HttpException(msg, 500);
+    }
+  }
+
+  // Phase 2 hand-picked sample: category-filter, stride-pick `limit`
+  // candidates, resolve each via Places API v1 :searchText, and re-dedup
+  // resolved placeIds against staging + prod. No writes.
+  @Post('regions/:regionId/resolve-sample')
+  async resolveSample(
+    @Param('regionId') regionId: string,
+    @Query('limit') limitStr?: string,
+  ) {
+    const limit = Math.min(Math.max(1, Number(limitStr ?? 15) || 15), 50);
+    try {
+      return await this.discovery.resolveSample(regionId, limit);
+    } catch (e) {
+      if (e instanceof HttpException) throw e;
+      const msg = (e as Error).message ?? String(e);
+      this.logger.error(`resolveSample ${regionId} failed: ${msg}`);
       throw new HttpException(msg, 500);
     }
   }
