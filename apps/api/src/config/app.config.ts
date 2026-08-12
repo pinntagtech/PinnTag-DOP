@@ -26,6 +26,7 @@ export default registerAs('app', () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
   apiPrefix: process.env.API_PREFIX ?? 'api/v1',
   googleApiKey: process.env.GOOGLE_MAPS_API_KEY,
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
   pinntagApiUrl: process.env.PINNTAG_API_URL,
   pinntagApiToken: process.env.PINNTAG_API_TOKEN,
   pinntagInsiderApiKey: process.env.PINNTAG_INSIDER_API_KEY,

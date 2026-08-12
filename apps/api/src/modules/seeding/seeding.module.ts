@@ -70,6 +70,12 @@ import {
 } from './discovery/schemas/discovery-region.schema';
 import { DiscoveryService } from './discovery/discovery.service';
 import { DiscoveryController } from './discovery/discovery.controller';
+import { JudgmentService } from './judgment/judgment.service';
+import { ClaudeClient } from './judgment/claude-client';
+import { TaxonomyLoader } from './judgment/taxonomy-loader';
+import { CategoryJudge } from './judgment/judges/category-judge';
+import { CityJudge } from './judgment/judges/city-judge';
+import { AnomalyJudge } from './judgment/judges/anomaly-judge';
 import { SeedingController } from './seeding.controller';
 import { AuthModule } from '../auth/auth.module';
 import { LocationsModule } from '../locations/locations.module';
@@ -133,6 +139,12 @@ import { LocationsModule } from '../locations/locations.module';
     ProvenanceService,
     RunService,
     DiscoveryService,
+    JudgmentService,
+    ClaudeClient,
+    TaxonomyLoader,
+    CategoryJudge,
+    CityJudge,
+    AnomalyJudge,
   ],
   exports: [
     SeedingSessionService,

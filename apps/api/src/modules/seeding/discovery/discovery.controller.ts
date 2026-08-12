@@ -7,12 +7,17 @@ import {
   Query,
 } from '@nestjs/common';
 import { DiscoveryService } from './discovery.service';
+import { JudgmentService } from '../judgment/judgment.service';
+import { JudgeInput } from '../judgment/types';
 
 @Controller('seeding/discovery')
 export class DiscoveryController {
   private readonly logger = new Logger(DiscoveryController.name);
 
-  constructor(private readonly discovery: DiscoveryService) {}
+  constructor(
+    private readonly discovery: DiscoveryService,
+    private readonly judgment: JudgmentService,
+  ) {}
 
   // Idempotent upsert of the shipped region set. Safe to call repeatedly;
   // only fills gaps and refreshes bbox/priority. Never resets runtime
@@ -52,6 +57,80 @@ export class DiscoveryController {
       if (e instanceof HttpException) throw e;
       const msg = (e as Error).message ?? String(e);
       this.logger.error(`resolveSample ${regionId} failed: ${msg}`);
+      throw new HttpException(msg, 500);
+    }
+  }
+
+  // Phase 3 dry-run: runs the Phase 2 resolveSample pipeline, then runs
+  // every RESOLVED candidate (non-null Places result) through the judgment
+  // layer. Zero-result rows are excluded from the judgment pass — there's
+  // nothing to judge without a Google identity. No DB writes.
+  @Post('regions/:regionId/judge-sample')
+  async judgeSample(
+    @Param('regionId') regionId: string,
+    @Query('limit') limitStr?: string,
+  ) {
+    const limit = Math.min(Math.max(1, Number(limitStr ?? 50) || 50), 50);
+    try {
+      const resolveResult = await this.discovery.resolveSample(regionId, limit);
+      // Only the resolved population goes through judgment.
+      const judgeInputs: JudgeInput[] = resolveResult.sample
+        .filter((s) => s.resolved !== null)
+        .map((s) => ({
+          overture: s.overture,
+          resolved: s.resolved,
+          dedup: s.dedup,
+        }));
+      const judgments = await this.judgment.judgeMany(judgeInputs);
+
+      // Re-attach judgments to the corresponding sample rows (by index
+      // into the resolved subset). Zero-result rows carry `judgment:null`.
+      let jIdx = 0;
+      const augmentedSample = resolveResult.sample.map((s) => {
+        if (s.resolved === null) return { ...s, judgment: null };
+        return { ...s, judgment: judgments[jIdx++] };
+      });
+
+      // Aggregate rollups for the report.
+      const rollup = {
+        judgedCount: judgments.length,
+        needsReview: judgments.filter((j) => j.needsReview).length,
+        acceptedGoogle: judgments.filter(
+          (j) => j.anomaly.decision.action === 'accept_google',
+        ).length,
+        skipped: judgments.filter(
+          (j) => j.anomaly.decision.action === 'skip',
+        ).length,
+        review: judgments.filter(
+          (j) => j.anomaly.decision.action === 'needs_review',
+        ).length,
+        categorySource: {
+          rule: judgments.filter((j) => j.category.source === 'rule').length,
+          claude: judgments.filter((j) => j.category.source === 'claude-api')
+            .length,
+        },
+        citySource: {
+          rule: judgments.filter((j) => j.city.source === 'rule').length,
+          claude: judgments.filter((j) => j.city.source === 'claude-api')
+            .length,
+        },
+        anomalySource: {
+          rule: judgments.filter((j) => j.anomaly.source === 'rule').length,
+          claude: judgments.filter((j) => j.anomaly.source === 'claude-api')
+            .length,
+        },
+      };
+
+      return {
+        region: resolveResult.region,
+        resolveSummary: resolveResult.resolveSummary,
+        rollup,
+        sample: augmentedSample,
+      };
+    } catch (e) {
+      if (e instanceof HttpException) throw e;
+      const msg = (e as Error).message ?? String(e);
+      this.logger.error(`judgeSample ${regionId} failed: ${msg}`);
       throw new HttpException(msg, 500);
     }
   }

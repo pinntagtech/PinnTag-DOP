@@ -20,7 +20,11 @@ import { LocationsModule } from './modules/locations/locations.module';
     ConfigModule.forRoot({
       isGlobal: true,
       load: [appConfig, databaseConfig],
-      envFilePath: '.env',
+      // .env.production is the CLAUDE.md convention for prod secrets kept
+      // out of the general .env. Array = first-defined-wins, so a secret
+      // in .env.production takes precedence and .env stays the source for
+      // everything else (Mongo URIs, Google key, etc.).
+      envFilePath: ['.env.production', '.env'],
     }),
     DatabaseModule,
     AuthModule,
