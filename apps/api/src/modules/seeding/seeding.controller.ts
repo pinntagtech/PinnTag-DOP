@@ -911,12 +911,15 @@ export class SeedingController {
     await this.botJobService.resetStuckJobs();
 
     const jobType = type as BotJobType | undefined;
-    // resolve_business is served exclusively via /bot/poll-batch so the
-    // parallel worker pool owns it. The single-job loop polling here
-    // must never grab a resolve job (which would defeat the pool).
+    // resolve_business and discovery_search are served exclusively via
+    // /bot/poll-batch so their parallel worker pools own them. The
+    // single-job loop polling here must never grab one (which would
+    // defeat the pool).
     const job = await this.botJobService.claimNextJob(
       jobType,
-      jobType ? undefined : [BotJobType.RESOLVE_BUSINESS],
+      jobType
+        ? undefined
+        : [BotJobType.RESOLVE_BUSINESS, BotJobType.DISCOVERY_SEARCH],
     );
 
     if (!job) {

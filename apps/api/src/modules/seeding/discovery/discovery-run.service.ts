@@ -40,15 +40,19 @@ import {
   normalizeName,
 } from './dedup-helpers';
 import { isBlockedOvertureCategory } from './category-blocklist';
-import {
-  resolvePlaceIdBySearchText,
-} from './places-client';
 import { JudgmentService } from '../judgment/judgment.service';
 import { ClaudeClient } from '../judgment/claude-client';
 import {
   insertBusinessOn,
   openStagingConnection,
 } from './business-insert';
+import { BotJobService } from '../bot/bot-job.service';
+import {
+  BotJob,
+  BotJobDocument,
+  BotJobStatus,
+  BotJobType,
+} from '../schemas/bot-job.schema';
 
 const DEDUP_RADIUS_M = 50;
 const NAME_SIM_THRESHOLD = 0.85;
@@ -73,9 +77,12 @@ export class DiscoveryRunService {
     private readonly runModel: Model<DiscoveryRunDocument>,
     @InjectModel(DiscoveryProcessed.name)
     private readonly processedModel: Model<DiscoveryProcessedDocument>,
+    @InjectModel(BotJob.name)
+    private readonly botJobModel: Model<BotJobDocument>,
     private readonly configService: ConfigService,
     private readonly judgment: JudgmentService,
     private readonly claude: ClaudeClient,
+    private readonly botJobService: BotJobService,
   ) {}
 
   // Kick off a run in the background. Returns the runId immediately —
@@ -178,49 +185,101 @@ export class DiscoveryRunService {
       `[${runId}] taking limit=${params.limit}: ${toProcess.length} in this run`,
     );
 
-    // 7. Process with concurrency cap.
+    // 7. Enqueue one DISCOVERY_SEARCH bot job per candidate. The bot
+    //    (running on an operator machine) will search Google Maps for
+    //    each — geo-anchored to the candidate's coords, state-mismatch
+    //    guarded, bbox-restricted — and POST the resolved match back
+    //    via /seeding/discovery/bot-result which writes it to the job
+    //    doc. No Google Places API calls anywhere in this path.
     const stagingUri = this.configService.get<string>('database.pinntagStaging');
     if (!stagingUri) throw new Error('No URI for pinntagStaging');
-    const apiKey = this.configService.get<string>('app.googleApiKey');
-    if (!apiKey) throw new Error('GOOGLE_MAPS_API_KEY not set');
+    const environment =
+      this.configService.get<string>('app.appEnv') || 'staging';
+
+    if (toProcess.length === 0) {
+      // Nothing to do — write terminal stats and return.
+      await this.runModel.updateOne(
+        { runId },
+        {
+          $set: {
+            status: DiscoveryRunStatus.COMPLETED,
+            completedAt: new Date(),
+            'stats.processed': 0,
+            'stats.placesCallsTotal': 0,
+          },
+        },
+      );
+      this.logger.log(`[${runId}] nothing to process`);
+      return;
+    }
+
+    const enqueueRecords = toProcess.map((c) => ({
+      // Discovery has no Business yet — use a synthetic marker so the
+      // BotJob's businessId requirement is satisfied and we can still
+      // trace back to the Overture source in logs.
+      businessId: `discovery:${c.sourceId}`,
+      businessName: c.name,
+      environment,
+      addressLine1: c.address ?? '',
+      city: '',
+      state: '',
+      postalCode: '',
+      latitude: c.lat,
+      longitude: c.lng,
+      discoveryRunId: runId,
+      discoveryRegionId: params.regionId,
+      discoveryOvertureSourceId: c.sourceId,
+      discoveryBboxWest: bbox.west,
+      discoveryBboxSouth: bbox.south,
+      discoveryBboxEast: bbox.east,
+      discoveryBboxNorth: bbox.north,
+    }));
+    const enqueue = await this.botJobService.createJobs({
+      records: enqueueRecords,
+      type: BotJobType.DISCOVERY_SEARCH,
+    });
+    this.logger.log(
+      `[${runId}] enqueued ${enqueue.created} discovery_search jobs ` +
+        `(of ${enqueueRecords.length} candidates)`,
+    );
+
+    // Build a lookup so we can hand the OvertureCandidate to processOne
+    // once its bot job finishes.
+    const candidateBySourceId = new Map<string, OvertureCandidate>();
+    for (const c of toProcess) candidateBySourceId.set(c.sourceId, c);
 
     const stagingConn = await openStagingConnection(stagingUri);
     try {
-      let placesCallsTotal = 0;
-      let placesZeroResult = 0;
+      let botZeroResult = 0;
       let actionAccept = 0;
       let actionReview = 0;
       let actionSkip = 0;
       let actionNotApplicable = 0;
       let actionZeroResult = 0;
       let errorCount = 0;
+      let botErrorCount = 0;
 
-      const inFlight = new Set<Promise<void>>();
-      const processOne = async (c: OvertureCandidate): Promise<void> => {
+      const processOne = async (
+        c: OvertureCandidate,
+        resolvedFromBot:
+          | { placeId: string; name: string; formattedAddress: string; lat: number; lng: number }
+          | null,
+        botError: string,
+      ): Promise<void> => {
         try {
-          placesCallsTotal++;
-          const resolved = await resolvePlaceIdBySearchText(
-            {
-              name: c.name,
-              address: c.address,
-              lat: c.lat,
-              lng: c.lng,
-              boxHalfSideMeters: 250,
-            },
-            apiKey,
-          );
-
-          if (!resolved) {
-            placesZeroResult++;
+          if (!resolvedFromBot) {
+            botZeroResult++;
+            if (botError && botError !== 'no_match') botErrorCount++;
             actionZeroResult++;
             await this.logProcessed(runId, params.regionId, c.sourceId, {
               action: 'zero_result',
               businessId: null,
               resolvedPlaceId: null,
-              reasoning: 'places searchText returned no result inside rectangle',
+              reasoning: `bot: ${botError || 'no_match'}`,
             });
             return;
           }
+          const resolved = resolvedFromBot;
 
           // Compute matchConfirmed BEFORE judgment (judge needs it in input).
           const dist = haversineMeters(c.lat, c.lng, resolved.lat, resolved.lng);
@@ -328,63 +387,170 @@ export class DiscoveryRunService {
         }
       };
 
-      // Simple concurrency pool without a dep.
-      const iter = toProcess[Symbol.iterator]();
-      const workers: Promise<void>[] = [];
-      const spawn = async (): Promise<void> => {
-        while (true) {
-          const next = iter.next();
-          if (next.done) return;
-          await processOne(next.value);
-          // Periodic stats flush so a poller sees progress.
-          if ((placesCallsTotal & 15) === 0) {
-            const u = this.claude.getUsage();
-            await this.runModel
-              .updateOne(
-                { runId },
-                {
-                  $set: {
-                    'stats.processed':
-                      actionAccept + actionReview + actionSkip + actionNotApplicable + actionZeroResult,
-                    'stats.placesCallsTotal': placesCallsTotal,
-                    'stats.placesZeroResult': placesZeroResult,
-                    'stats.claudeCalls': u.calls - startingUsage.calls,
-                    'stats.claudeInputTokens': u.inputTokens - startingUsage.inputTokens,
-                    'stats.claudeOutputTokens': u.outputTokens - startingUsage.outputTokens,
-                    'stats.actionAccept': actionAccept,
-                    'stats.actionReview': actionReview,
-                    'stats.actionSkip': actionSkip,
-                    'stats.actionNotApplicable': actionNotApplicable,
-                    'stats.actionZeroResultNoInsert': actionZeroResult,
-                    'stats.errorCount': errorCount,
-                  },
-                },
-              )
-              .catch(() => undefined);
+      // Drain: poll dopBotJobs for jobs terminal on this runId, run
+      // downstream on each, mark it drained so we don't re-process.
+      // Concurrency limits the downstream work (judgment + insert), not
+      // the bot's Google Maps calls — the bot runs its own pool.
+      const drained = new Set<string>();
+      const totalExpected = toProcess.length;
+      // Hard upper bound: 3 hours. The pilot's expected budget is ~15
+      // minutes at 10 workers × 300 jobs; anything past 3h means the
+      // bot pool is stalled and we should fail-clean rather than hang.
+      const deadline = Date.now() + 3 * 60 * 60 * 1000;
+      const pollIntervalMs = 3000;
+
+      while (drained.size < totalExpected && Date.now() < deadline) {
+        // Pull the batch of newly-terminal jobs for this run that we
+        // haven't drained yet.
+        const terminalJobs = (await this.botJobModel
+          .find(
+            {
+              type: BotJobType.DISCOVERY_SEARCH,
+              discoveryRunId: runId,
+              status: BotJobStatus.DONE,
+            },
+            {
+              _id: 1,
+              discoveryOvertureSourceId: 1,
+              discoveryResult: 1,
+              discoveryError: 1,
+            },
+          )
+          .lean()) as any[];
+
+        const newlyTerminal = terminalJobs.filter(
+          (j) => !drained.has(String(j._id)),
+        );
+
+        // Failure path: jobs that hit max attempts and got marked failed
+        // count as "no match with error" so they can't hang the run.
+        const failedJobs = (await this.botJobModel
+          .find(
+            {
+              type: BotJobType.DISCOVERY_SEARCH,
+              discoveryRunId: runId,
+              status: BotJobStatus.FAILED,
+            },
+            { _id: 1, discoveryOvertureSourceId: 1, error: 1 },
+          )
+          .lean()) as any[];
+        const newlyFailed = failedJobs.filter(
+          (j) => !drained.has(String(j._id)),
+        );
+
+        const tasks: Promise<void>[] = [];
+        const runOne = async (
+          jobId: string,
+          sourceId: string,
+          result: any,
+          err: string,
+        ): Promise<void> => {
+          if (drained.has(jobId)) return;
+          drained.add(jobId);
+          const c = candidateBySourceId.get(sourceId);
+          if (!c) {
+            // Unknown source — the enqueue and processing are on the
+            // same instance so this shouldn't happen; log and drop.
+            this.logger.warn(
+              `[${runId}] terminal job ${jobId} sourceId=${sourceId} ` +
+                `has no candidate mapping — dropping`,
+            );
+            return;
+          }
+          await processOne(c, result || null, err || '');
+        };
+
+        for (const j of newlyTerminal) {
+          const jobId = String(j._id);
+          tasks.push(
+            runOne(
+              jobId,
+              String(j.discoveryOvertureSourceId || ''),
+              j.discoveryResult,
+              j.discoveryError || '',
+            ),
+          );
+        }
+        for (const j of newlyFailed) {
+          const jobId = String(j._id);
+          tasks.push(
+            runOne(
+              jobId,
+              String(j.discoveryOvertureSourceId || ''),
+              null,
+              String(j.error || 'bot_job_failed'),
+            ),
+          );
+        }
+
+        // Bounded concurrency for judgment+insert. We DON'T need it as
+        // wide as params.parallelism for the bot side (the bot's pool
+        // sets that pace); Claude API is the bottleneck here.
+        if (tasks.length > 0) {
+          const cap = Math.max(1, Math.min(params.parallelism, 10));
+          for (let i = 0; i < tasks.length; i += cap) {
+            await Promise.all(tasks.slice(i, i + cap));
           }
         }
-      };
-      for (let i = 0; i < params.parallelism; i++) {
-        workers.push(spawn());
+
+        // Periodic stats flush.
+        const u = this.claude.getUsage();
+        await this.runModel
+          .updateOne(
+            { runId },
+            {
+              $set: {
+                'stats.processed': drained.size,
+                'stats.placesCallsTotal': 0,
+                'stats.botJobsEnqueued': enqueue.created,
+                'stats.botJobsCompleted': drained.size,
+                'stats.botZeroResult': botZeroResult,
+                'stats.botErrorCount': botErrorCount,
+                'stats.claudeCalls': u.calls - startingUsage.calls,
+                'stats.claudeInputTokens':
+                  u.inputTokens - startingUsage.inputTokens,
+                'stats.claudeOutputTokens':
+                  u.outputTokens - startingUsage.outputTokens,
+                'stats.actionAccept': actionAccept,
+                'stats.actionReview': actionReview,
+                'stats.actionSkip': actionSkip,
+                'stats.actionNotApplicable': actionNotApplicable,
+                'stats.actionZeroResultNoInsert': actionZeroResult,
+                'stats.errorCount': errorCount,
+              },
+            },
+          )
+          .catch(() => undefined);
+
+        if (drained.size >= totalExpected) break;
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
       }
-      await Promise.all(workers);
 
       // Final stats write.
       const u = this.claude.getUsage();
       const totalWallSeconds = (Date.now() - t0) / 1000;
+      const timedOut = drained.size < totalExpected;
       await this.runModel.updateOne(
         { runId },
         {
           $set: {
-            status: DiscoveryRunStatus.COMPLETED,
+            status: timedOut
+              ? DiscoveryRunStatus.FAILED
+              : DiscoveryRunStatus.COMPLETED,
             completedAt: new Date(),
-            'stats.processed':
-              actionAccept + actionReview + actionSkip + actionNotApplicable + actionZeroResult,
-            'stats.placesCallsTotal': placesCallsTotal,
-            'stats.placesZeroResult': placesZeroResult,
+            error: timedOut
+              ? `bot pool stalled: drained ${drained.size}/${totalExpected} in 3h`
+              : undefined,
+            'stats.processed': drained.size,
+            'stats.placesCallsTotal': 0,
+            'stats.botJobsEnqueued': enqueue.created,
+            'stats.botJobsCompleted': drained.size,
+            'stats.botZeroResult': botZeroResult,
+            'stats.botErrorCount': botErrorCount,
             'stats.claudeCalls': u.calls - startingUsage.calls,
             'stats.claudeInputTokens': u.inputTokens - startingUsage.inputTokens,
-            'stats.claudeOutputTokens': u.outputTokens - startingUsage.outputTokens,
+            'stats.claudeOutputTokens':
+              u.outputTokens - startingUsage.outputTokens,
             'stats.actionAccept': actionAccept,
             'stats.actionReview': actionReview,
             'stats.actionSkip': actionSkip,
@@ -395,10 +561,11 @@ export class DiscoveryRunService {
         },
       );
       this.logger.log(
-        `[${runId}] DONE in ${totalWallSeconds.toFixed(1)}s: ` +
+        `[${runId}] ${timedOut ? 'TIMED OUT' : 'DONE'} in ` +
+          `${totalWallSeconds.toFixed(1)}s: ` +
           `accept=${actionAccept} review=${actionReview} skip=${actionSkip} ` +
           `not_applicable=${actionNotApplicable} zero_result=${actionZeroResult} ` +
-          `errors=${errorCount}`,
+          `bot_errors=${botErrorCount} errors=${errorCount}`,
       );
     } finally {
       await stagingConn.close();

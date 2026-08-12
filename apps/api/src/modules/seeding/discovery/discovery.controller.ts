@@ -2,16 +2,22 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
   HttpException,
   Logger,
   Param,
   Post,
   Query,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { Public } from '../../auth/decorators/public.decorator';
 import { DiscoveryService } from './discovery.service';
 import { JudgmentService } from '../judgment/judgment.service';
 import { JudgeInput } from '../judgment/types';
 import { DiscoveryRunService } from './discovery-run.service';
+import { BotJob, BotJobDocument, BotJobStatus } from '../schemas/bot-job.schema';
 
 @Controller('seeding/discovery')
 export class DiscoveryController {
@@ -21,6 +27,9 @@ export class DiscoveryController {
     private readonly discovery: DiscoveryService,
     private readonly judgment: JudgmentService,
     private readonly runService: DiscoveryRunService,
+    private readonly configService: ConfigService,
+    @InjectModel(BotJob.name)
+    private readonly botJobModel: Model<BotJobDocument>,
   ) {}
 
   // Idempotent upsert of the shipped region set. Safe to call repeatedly;
@@ -235,5 +244,65 @@ export class DiscoveryController {
     const run = await this.runService.getRun(runId);
     if (!run) throw new HttpException(`No run: ${runId}`, 404);
     return run;
+  }
+
+  // ── Bot result webhook for DISCOVERY_SEARCH jobs ──────────────────────
+  //
+  // The discovery bot POSTs the resolved Google Maps match (or an error)
+  // here after handling one discovery_search job. We persist the result
+  // onto the job doc — the run orchestrator polls dopBotJobs for
+  // terminal jobs on its runId and drives the downstream judge/insert
+  // pipeline. No Business exists yet at this point; creating one is
+  // downstream of judgment.
+  //
+  // Public + x-bot-secret guarded inline, matching the pattern used by
+  // /seeding/resolve-business/webhook and /seeding/bot/webhook.
+  @Public()
+  @Post('bot-result')
+  async botResult(
+    @Body()
+    payload: {
+      jobId: string;
+      result?: {
+        placeId: string;
+        name: string;
+        formattedAddress: string;
+        lat: number;
+        lng: number;
+      } | null;
+      error?: string;
+    },
+    @Headers('x-bot-secret') secret: string,
+  ): Promise<{ ok: true }> {
+    const expected = this.configService.get<string>('app.botWebhookSecret');
+    if (expected && secret !== expected) {
+      throw new HttpException('Unauthorized', 401);
+    }
+    if (!payload || !payload.jobId) {
+      throw new HttpException('jobId is required', 400);
+    }
+
+    const update: Record<string, any> = {};
+    if (payload.result && payload.result.placeId) {
+      update.discoveryResult = {
+        placeId: String(payload.result.placeId),
+        name: String(payload.result.name ?? ''),
+        formattedAddress: String(payload.result.formattedAddress ?? ''),
+        lat: Number(payload.result.lat),
+        lng: Number(payload.result.lng),
+      };
+      update.discoveryError = '';
+    } else {
+      update.discoveryResult = null;
+      // Preserve the reason so the orchestrator can distinguish
+      // "bot said no match" from "not yet processed". Empty string
+      // stays "unknown"; any non-empty value overrides.
+      update.discoveryError = String(payload.error || 'no_match');
+    }
+    update.status = BotJobStatus.DONE;
+    update.completedAt = new Date();
+
+    await this.botJobModel.updateOne({ _id: payload.jobId }, { $set: update });
+    return { ok: true };
   }
 }

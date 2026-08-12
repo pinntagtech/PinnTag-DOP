@@ -22,6 +22,11 @@ const BOT_JOB_TYPE_TO_BUCKET: Record<
   // value is never actually incremented for them.
   [BotJobType.RESOLVE_BUSINESS]: 'reviews',
   [BotJobType.EMAIL_SCRAPE]: 'reviews',
+  // DISCOVERY_SEARCH runs outside sessions (no seeding session bucket
+  // applies). The fallback value is never consulted — the code only
+  // touches the bucket when job.sessionId is set, which discovery
+  // jobs never have.
+  [BotJobType.DISCOVERY_SEARCH]: 'reviews',
 };
 
 @Injectable()
@@ -57,7 +62,10 @@ export class BotJobService {
 
   async createJobs(payload: {
     records: {
-      placeId: string;
+      // Optional for RESOLVE_BUSINESS + DISCOVERY_SEARCH (they run
+      // from address/name+coords alone). Required for every other type;
+      // enforced by the filter below.
+      placeId?: string;
       businessId: string;
       businessName: string;
       environment: string;
@@ -80,6 +88,16 @@ export class BotJobService {
       // Website URL is required for EMAIL_SCRAPE — the bot fetches this
       // page (plus a few contact/about links) to extract emails.
       website?: string;
+      // Discovery Phase 4 context — only set on DISCOVERY_SEARCH jobs.
+      // businessId on a discovery job is a synthetic marker (the
+      // overtureSourceId, prefixed) since no Business exists yet.
+      discoveryRunId?: string;
+      discoveryRegionId?: string;
+      discoveryOvertureSourceId?: string;
+      discoveryBboxWest?: number | null;
+      discoveryBboxSouth?: number | null;
+      discoveryBboxEast?: number | null;
+      discoveryBboxNorth?: number | null;
     }[];
     // Optional: RESOLVE_BUSINESS jobs aren't bound to a seeding session
     // (they run from the operator-triggered resolve queue), so they
@@ -95,10 +113,22 @@ export class BotJobService {
     // job. The businessId requirement is universal.
     const isResolve = payload.type === BotJobType.RESOLVE_BUSINESS;
     const isEmailScrape = payload.type === BotJobType.EMAIL_SCRAPE;
+    const isDiscoverySearch = payload.type === BotJobType.DISCOVERY_SEARCH;
     const docs = payload.records
       .filter((r) => {
         if (!r.businessId) return false;
         if (isResolve) return true; // resolve runs from address alone
+        if (isDiscoverySearch) {
+          // Discovery jobs need name + environment + a discoveryRunId so
+          // the orchestrator can find them again. Coords/address are
+          // usually present too but not required — a name-only search
+          // still gets the region bbox as viewport anchor.
+          return (
+            !!(r.businessName && r.businessName.trim()) &&
+            !!(r.environment && r.environment.trim()) &&
+            !!(r.discoveryRunId && r.discoveryRunId.trim())
+          );
+        }
         if (isEmailScrape) {
           // email_scrape needs businessId + businessName + environment.
           // placeId is not needed. website may be empty — the bot
@@ -133,6 +163,15 @@ export class BotJobService {
         latitude: r.latitude ?? null,
         longitude: r.longitude ?? null,
         website: r.website ?? '',
+        discoveryRunId: r.discoveryRunId ?? '',
+        discoveryRegionId: r.discoveryRegionId ?? '',
+        discoveryOvertureSourceId: r.discoveryOvertureSourceId ?? '',
+        discoveryBboxWest: r.discoveryBboxWest ?? null,
+        discoveryBboxSouth: r.discoveryBboxSouth ?? null,
+        discoveryBboxEast: r.discoveryBboxEast ?? null,
+        discoveryBboxNorth: r.discoveryBboxNorth ?? null,
+        discoveryResult: null,
+        discoveryError: '',
         attempts: 0,
       }));
 

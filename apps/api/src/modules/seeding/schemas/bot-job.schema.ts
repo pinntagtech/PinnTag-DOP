@@ -18,6 +18,15 @@ export enum BotJobType {
   // email address. No inference, no third-party enrichment. Backs the
   // c10_verified_email gate criterion.
   EMAIL_SCRAPE = 'email_scrape',
+  // Discovery Phase 4 resolver. Given an Overture candidate (name,
+  // address, coords) and the region bbox, the bot searches Google Maps
+  // for the matching business — reuses the resolve_business geo-anchor
+  // and state-mismatch guards — and returns {placeId, name,
+  // formattedAddress, lat, lng}. Replaces the Places API call so the
+  // whole discovery path is bot-only. No Business doc exists yet, so
+  // the result is written back to the job doc itself (discoveryResult
+  // field), not to a Business.
+  DISCOVERY_SEARCH = 'discovery_search',
 }
 
 @Schema({ timestamps: true, collection: 'dopBotJobs' })
@@ -94,6 +103,54 @@ export class BotJob {
 
   @Prop({ type: Number, default: 0 })
   attempts!: number;
+
+  // ── Discovery Phase 4 fields (only set on DISCOVERY_SEARCH jobs) ──
+  // The discovery pipeline has no Business doc at enqueue time — the
+  // Business is created after judgment. So the job doc itself carries
+  // both the input (region context + overture candidate) and the
+  // output (bot-resolved match), and the orchestrator polls
+  // dopBotJobs for terminal jobs on its runId to drive downstream
+  // (dedup2 → judge → insert).
+  @Prop({ type: String, default: '' })
+  discoveryRunId?: string;
+
+  @Prop({ type: String, default: '' })
+  discoveryRegionId?: string;
+
+  @Prop({ type: String, default: '' })
+  discoveryOvertureSourceId?: string;
+
+  // Region bbox — bot uses (a) the centroid as the @lat,lng viewport
+  // anchor when the candidate lacks coords, and (b) as a hard
+  // reject: if the resolved place lands outside this rectangle we
+  // return null rather than accept a cross-region match.
+  @Prop({ type: Number, default: null })
+  discoveryBboxWest?: number | null;
+  @Prop({ type: Number, default: null })
+  discoveryBboxSouth?: number | null;
+  @Prop({ type: Number, default: null })
+  discoveryBboxEast?: number | null;
+  @Prop({ type: Number, default: null })
+  discoveryBboxNorth?: number | null;
+
+  // Bot-written result — mirrors PlacesResolveResult shape so the
+  // downstream judgment/insert path stays byte-identical to the old
+  // Places-API-based resolver.
+  @Prop({ type: Object, default: null })
+  discoveryResult?: {
+    placeId: string;
+    name: string;
+    formattedAddress: string;
+    lat: number;
+    lng: number;
+  } | null;
+
+  // Diagnostic: why the bot returned no match (state_mismatch, bbox
+  // reject, no_search_match, …). Non-null even when discoveryResult
+  // is also null — the orchestrator maps this to a zero_result
+  // outcome without a downstream judge/insert.
+  @Prop({ type: String, default: '' })
+  discoveryError?: string;
 }
 
 export type BotJobDocument = BotJob & Document;
