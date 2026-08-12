@@ -95,6 +95,44 @@ export class DiscoveryController {
       const rollup = {
         judgedCount: judgments.length,
         needsReview: judgments.filter((j) => j.needsReview).length,
+        // Per-judge review counts — lets an operator see which judge is
+        // dominating the review queue without unpacking every record.
+        needsReviewByJudge: {
+          category: judgments.filter((j) => j.needsReviewByJudge.category)
+            .length,
+          city: judgments.filter((j) => j.needsReviewByJudge.city).length,
+          anomaly: judgments.filter((j) => j.needsReviewByJudge.anomaly)
+            .length,
+          onlyCategory: judgments.filter(
+            (j) =>
+              j.needsReviewByJudge.category &&
+              !j.needsReviewByJudge.city &&
+              !j.needsReviewByJudge.anomaly,
+          ).length,
+          onlyCity: judgments.filter(
+            (j) =>
+              !j.needsReviewByJudge.category &&
+              j.needsReviewByJudge.city &&
+              !j.needsReviewByJudge.anomaly,
+          ).length,
+          onlyAnomaly: judgments.filter(
+            (j) =>
+              !j.needsReviewByJudge.category &&
+              !j.needsReviewByJudge.city &&
+              j.needsReviewByJudge.anomaly,
+          ).length,
+          multiple: judgments.filter((j) => {
+            const b = j.needsReviewByJudge;
+            const n = (b.category ? 1 : 0) + (b.city ? 1 : 0) + (b.anomaly ? 1 : 0);
+            return n >= 2;
+          }).length,
+          none: judgments.filter(
+            (j) =>
+              !j.needsReviewByJudge.category &&
+              !j.needsReviewByJudge.city &&
+              !j.needsReviewByJudge.anomaly,
+          ).length,
+        },
         acceptedGoogle: judgments.filter(
           (j) => j.anomaly.decision.action === 'accept_google',
         ).length,

@@ -26,11 +26,16 @@ export class JudgmentService {
       this.cityJudge.run(input),
       this.anomalyJudge.run(input),
     ]);
+    const needsReviewByJudge = {
+      category: !!category.belowThreshold,
+      city: !!city.belowThreshold,
+      anomaly: !!anomaly.belowThreshold,
+    };
     const needsReview =
-      !!category.belowThreshold ||
-      !!city.belowThreshold ||
-      !!anomaly.belowThreshold;
-    return { category, city, anomaly, needsReview };
+      needsReviewByJudge.category ||
+      needsReviewByJudge.city ||
+      needsReviewByJudge.anomaly;
+    return { category, city, anomaly, needsReviewByJudge, needsReview };
   }
 
   // Batched judge. Sequential across records (Claude quota-friendly) —

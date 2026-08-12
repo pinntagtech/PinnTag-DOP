@@ -51,10 +51,24 @@ export interface AnomalyDecision {
   action: 'accept_google' | 'skip' | 'needs_review';
 }
 
+export interface NeedsReviewByJudge {
+  category: boolean;
+  city: boolean;
+  anomaly: boolean;
+}
+
 export interface RecordJudgment {
   category: JudgmentDecision<CategoryDecision>;
   city: JudgmentDecision<CityDecision>;
   anomaly: JudgmentDecision<AnomalyDecision>;
+  // Per-judge review flags — set independently by each judge based on
+  // its own belowThreshold. Downstream consumers (portal review queue,
+  // manual triage) can key off the specific judge that flagged so
+  // reviewers only see the failing dimension.
+  needsReviewByJudge: NeedsReviewByJudge;
+  // Overall = OR of the per-judge flags. Kept as the top-level
+  // convenience field for existing callers that don't want to unpack
+  // per-judge state (backward-compat).
   needsReview: boolean;
 }
 
