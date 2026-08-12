@@ -14,12 +14,42 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const MODEL_ID = 'claude-haiku-4-5-20251001';
 
+export interface ClaudeUsageSnapshot {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+}
+
 @Injectable()
 export class ClaudeClient {
   private readonly logger = new Logger(ClaudeClient.name);
   private client: Anthropic | null = null;
+  // Process-wide accumulators. A single deployment serves one run at a
+  // time in practice (pilot batch is blocking-with-runId); if we ever
+  // interleave batches, reset via resetUsage() at run start and snapshot
+  // via getUsage() at end.
+  private usage: ClaudeUsageSnapshot = {
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+  };
 
   constructor(private readonly configService: ConfigService) {}
+
+  getUsage(): ClaudeUsageSnapshot {
+    return { ...this.usage };
+  }
+
+  resetUsage(): void {
+    this.usage = {
+      calls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+    };
+  }
 
   private getClient(): Anthropic {
     if (this.client) return this.client;
@@ -48,6 +78,14 @@ export class ClaudeClient {
         system: opts.system,
         messages: [{ role: 'user', content: opts.user }],
       });
+      // Accumulate usage — safe under concurrency (single-thread event loop,
+      // += on numbers is atomic in JS).
+      this.usage.calls += 1;
+      this.usage.inputTokens += res.usage?.input_tokens ?? 0;
+      this.usage.outputTokens += res.usage?.output_tokens ?? 0;
+      this.usage.cachedInputTokens +=
+        (res.usage as any)?.cache_read_input_tokens ?? 0;
+
       const text = res.content
         .filter((b) => b.type === 'text')
         .map((b) => (b as any).text)
@@ -60,6 +98,9 @@ export class ClaudeClient {
       }
       return JSON.parse(match[0]) as T;
     } catch (e) {
+      // Count failed calls too — they still bill for input tokens if the
+      // request reached Anthropic. Conservative for cost reporting.
+      this.usage.calls += 1;
       const msg = (e as Error).message ?? String(e);
       this.logger.warn(`Claude call failed: ${msg}`);
       return null;

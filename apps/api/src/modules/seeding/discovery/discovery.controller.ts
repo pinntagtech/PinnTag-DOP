@@ -1,5 +1,7 @@
 import {
+  Body,
   Controller,
+  Get,
   HttpException,
   Logger,
   Param,
@@ -9,6 +11,7 @@ import {
 import { DiscoveryService } from './discovery.service';
 import { JudgmentService } from '../judgment/judgment.service';
 import { JudgeInput } from '../judgment/types';
+import { DiscoveryRunService } from './discovery-run.service';
 
 @Controller('seeding/discovery')
 export class DiscoveryController {
@@ -17,6 +20,7 @@ export class DiscoveryController {
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly judgment: JudgmentService,
+    private readonly runService: DiscoveryRunService,
   ) {}
 
   // Idempotent upsert of the shipped region set. Safe to call repeatedly;
@@ -171,5 +175,65 @@ export class DiscoveryController {
       this.logger.error(`judgeSample ${regionId} failed: ${msg}`);
       throw new HttpException(msg, 500);
     }
+  }
+
+  // Phase 4 pilot-batch runner. Kicks off a background run and returns
+  // the runId immediately — poll GET /seeding/discovery/runs/:runId for
+  // progress. Real writes to staging.businesses (draft state, invisible
+  // to consumer app via the isActive+outlet gate).
+  //
+  // Guarded by adminPassword to match the CVB / dedup endpoint pattern
+  // — a large paid run shouldn't be one accidental curl away.
+  @Post('regions/:regionId/run-batch')
+  async runBatch(
+    @Param('regionId') regionId: string,
+    @Body()
+    body: {
+      limit?: number;
+      parallelism?: number;
+      minOvertureConfidence?: number;
+      adminPassword?: string;
+    },
+  ) {
+    const configured = process.env.DOP_ADMIN_PASSWORD;
+    if (!configured || body.adminPassword !== configured) {
+      throw new HttpException('Invalid admin password', 403);
+    }
+    const limit = Math.min(Math.max(1, Number(body.limit ?? 100) || 100), 5000);
+    const parallelism = Math.min(
+      Math.max(1, Number(body.parallelism ?? 10) || 10),
+      20,
+    );
+    const minOvertureConfidence = Math.max(
+      0,
+      Math.min(1, Number(body.minOvertureConfidence ?? 0.6) || 0.6),
+    );
+    try {
+      const runId = await this.runService.startRun({
+        regionId,
+        limit,
+        parallelism,
+        minOvertureConfidence,
+      });
+      return {
+        runId,
+        regionId,
+        params: { limit, parallelism, minOvertureConfidence },
+        status: 'running',
+        pollAt: `/api/v1/seeding/discovery/runs/${runId}`,
+      };
+    } catch (e) {
+      if (e instanceof HttpException) throw e;
+      const msg = (e as Error).message ?? String(e);
+      this.logger.error(`runBatch ${regionId} failed to start: ${msg}`);
+      throw new HttpException(msg, 500);
+    }
+  }
+
+  @Get('runs/:runId')
+  async getRun(@Param('runId') runId: string) {
+    const run = await this.runService.getRun(runId);
+    if (!run) throw new HttpException(`No run: ${runId}`, 404);
+    return run;
   }
 }

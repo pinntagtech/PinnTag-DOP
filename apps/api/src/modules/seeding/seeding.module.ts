@@ -68,7 +68,16 @@ import {
   DiscoveryRegion,
   DiscoveryRegionSchema,
 } from './discovery/schemas/discovery-region.schema';
+import {
+  DiscoveryRun,
+  DiscoveryRunSchema,
+} from './discovery/schemas/discovery-run.schema';
+import {
+  DiscoveryProcessed,
+  DiscoveryProcessedSchema,
+} from './discovery/schemas/discovery-processed.schema';
 import { DiscoveryService } from './discovery/discovery.service';
+import { DiscoveryRunService } from './discovery/discovery-run.service';
 import { DiscoveryController } from './discovery/discovery.controller';
 import { JudgmentService } from './judgment/judgment.service';
 import { ClaudeClient } from './judgment/claude-client';
@@ -93,6 +102,8 @@ import { LocationsModule } from '../locations/locations.module';
       { name: CoverageSnapshot.name, schema: CoverageSnapshotSchema },
       { name: ConsoleRun.name, schema: ConsoleRunSchema },
       { name: DiscoveryRegion.name, schema: DiscoveryRegionSchema },
+      { name: DiscoveryRun.name, schema: DiscoveryRunSchema },
+      { name: DiscoveryProcessed.name, schema: DiscoveryProcessedSchema },
     ]),
     AuthModule,
     LocationsModule,
@@ -139,6 +150,7 @@ import { LocationsModule } from '../locations/locations.module';
     ProvenanceService,
     RunService,
     DiscoveryService,
+    DiscoveryRunService,
     JudgmentService,
     ClaudeClient,
     TaxonomyLoader,

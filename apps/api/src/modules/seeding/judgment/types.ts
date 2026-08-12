@@ -63,6 +63,19 @@ export interface NeedsReviewByJudge {
   anomaly: boolean;
 }
 
+// The pipeline-level routing decision for a record. Derived in
+// JudgmentService from the three per-judge outputs — not one of the
+// judges' own outputs. Kept as a separate concept from
+// AnomalyDecision.action (which is what the anomaly judge itself
+// concluded) because "not_applicable" is a cross-judge signal:
+// category says "not a consumer-app business" AND anomaly says the
+// record is a valid real business — different question, same record.
+export type FinalAction =
+  | 'accept'          // insert as clean draft; ready for downstream pipeline
+  | 'review'          // insert as draft with needsReview:true
+  | 'skip'            // do not insert; junk / exact duplicate / wrong tenant
+  | 'not_applicable'; // do not insert; real business but out of scope for consumer directory
+
 export interface RecordJudgment {
   category: JudgmentDecision<CategoryDecision>;
   city: JudgmentDecision<CityDecision>;
@@ -72,10 +85,13 @@ export interface RecordJudgment {
   // manual triage) can key off the specific judge that flagged so
   // reviewers only see the failing dimension.
   needsReviewByJudge: NeedsReviewByJudge;
-  // Overall = OR of the per-judge flags. Kept as the top-level
-  // convenience field for existing callers that don't want to unpack
-  // per-judge state (backward-compat).
+  // Overall = OR of the per-judge flags, EXCEPT records with
+  // finalAction=='not_applicable' are cleared (they aren't inserted
+  // at all, so they don't belong in a review queue).
   needsReview: boolean;
+  // Pipeline routing decision — see FinalAction.
+  finalAction: FinalAction;
+  finalActionReasoning: string;
 }
 
 // The judge input — a normalized view of one Phase-2 resolved candidate.

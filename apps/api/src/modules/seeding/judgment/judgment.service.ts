@@ -7,7 +7,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CategoryJudge } from './judges/category-judge';
 import { CityJudge } from './judges/city-judge';
 import { AnomalyJudge } from './judges/anomaly-judge';
-import { JudgeInput, RecordJudgment } from './types';
+import {
+  CONFIDENCE_THRESHOLD,
+  FinalAction,
+  JudgeInput,
+  RecordJudgment,
+} from './types';
 
 @Injectable()
 export class JudgmentService {
@@ -31,11 +36,57 @@ export class JudgmentService {
       city: !!city.belowThreshold,
       anomaly: !!anomaly.belowThreshold,
     };
-    const needsReview =
+    const anyBelow =
       needsReviewByJudge.category ||
       needsReviewByJudge.city ||
       needsReviewByJudge.anomaly;
-    return { category, city, anomaly, needsReviewByJudge, needsReview };
+
+    // Derive the pipeline routing decision. See FinalAction docs on types.ts.
+    let finalAction: FinalAction;
+    let finalActionReasoning: string;
+    const catDec = category.decision;
+
+    if (
+      catDec.industryLabel === null &&
+      catDec.industryConfidence >= CONFIDENCE_THRESHOLD &&
+      anomaly.decision.action !== 'skip'
+    ) {
+      // Cross-judge signal: category is confident this isn't a consumer-app
+      // business, and anomaly didn't flag it as junk. It's a real business
+      // — just not for us. Pre-empts skip/review.
+      finalAction = 'not_applicable';
+      finalActionReasoning =
+        `category judge: not a consumer-app business ` +
+        `(industryConfidence=${catDec.industryConfidence.toFixed(2)})`;
+    } else if (anomaly.decision.action === 'skip') {
+      finalAction = 'skip';
+      finalActionReasoning = `anomaly.skip: ${anomaly.reasoning ?? ''}`;
+    } else if (anomaly.decision.action === 'accept_google' && !anyBelow) {
+      finalAction = 'accept';
+      finalActionReasoning = 'anomaly.accept_google + all judges above threshold';
+    } else {
+      finalAction = 'review';
+      const reasons = [
+        anomaly.decision.action === 'needs_review' ? 'anomaly.needs_review' : null,
+        needsReviewByJudge.category ? 'category.belowThreshold' : null,
+        needsReviewByJudge.city ? 'city.belowThreshold' : null,
+        needsReviewByJudge.anomaly ? 'anomaly.belowThreshold' : null,
+      ].filter(Boolean);
+      finalActionReasoning = reasons.join(', ');
+    }
+
+    // needsReview excludes not_applicable — those never enter the queue.
+    const needsReview = finalAction === 'not_applicable' ? false : anyBelow;
+
+    return {
+      category,
+      city,
+      anomaly,
+      needsReviewByJudge,
+      needsReview,
+      finalAction,
+      finalActionReasoning,
+    };
   }
 
   // Batched judge. Sequential across records (Claude quota-friendly) —
