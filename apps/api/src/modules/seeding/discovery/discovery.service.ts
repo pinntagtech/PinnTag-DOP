@@ -81,6 +81,13 @@ export interface DiscoveryResolveSampleResult {
     nullCategory: number;
     blockedCategory: number;
   };
+  resolveSummary: {
+    picked: number;
+    resolvedNonNull: number;
+    zeroResult: number;
+    matchConfirmed: number;
+    matchUnconfirmed: number;
+  };
   sample: Array<{
     overture: {
       name: string;
@@ -300,8 +307,12 @@ export class DiscoveryService {
     // to OVERTURE_RELEASE.
     const picked = this.stridePick(eligible, limit);
 
-    // Places API resolution — sequential, small volume (≤15). Parallelizing
-    // this is easy but not worth the complexity at Phase 2 sample scale.
+    // Places API resolution — sequential, small volume (typically ≤50).
+    // 250m half-side gives a ~500m box around each candidate, hard-bound
+    // via locationRestriction.rectangle so Google can't fall back to a
+    // name-only match hundreds of km away (see the Phase 2 Chesley Brown
+    // 19km false-match). Trade-off: legit-but-slightly-outside results
+    // return null, which we count as zeroResult.
     const apiKey = this.configService.get<string>('app.googleApiKey') ?? '';
     if (!apiKey) throw new Error('GOOGLE_MAPS_API_KEY not set');
     const tPlaces0 = Date.now();
@@ -313,13 +324,14 @@ export class DiscoveryService {
           address: c.address,
           lat: c.lat,
           lng: c.lng,
-          radiusMeters: 100,
+          boxHalfSideMeters: 250,
         },
         apiKey,
       );
       resolved.push(r);
     }
     const placesResolveSeconds = (Date.now() - tPlaces0) / 1000;
+    const zeroResultCount = resolved.filter((r) => r === null).length;
 
     // Dedup pass 2 — batched $in query per environment.
     const tDedup20 = Date.now();
@@ -377,12 +389,20 @@ export class DiscoveryService {
       };
     });
 
+    const matchConfirmedCount = sample.filter(
+      (s) => s.resolved?.matchConfirmed,
+    ).length;
+    const matchUnconfirmedCount = sample.filter(
+      (s) => s.resolved && !s.resolved.matchConfirmed,
+    ).length;
+
     const totalSeconds = (Date.now() - t0) / 1000;
     this.logger.log(
       `[discovery.resolveSample ${regionId}] overture=${candidates.length} ` +
         `seededInBbox=${seeded.length} newAfterPass1=${newCandidates.length} ` +
         `filteredEligible=${eligible.length} picked=${picked.length} ` +
-        `resolved=${resolved.filter((r) => r).length} ` +
+        `resolved=${picked.length - zeroResultCount} zeroResult=${zeroResultCount} ` +
+        `confirmed=${matchConfirmedCount} unconfirmed=${matchUnconfirmedCount} ` +
         `(${totalSeconds.toFixed(1)}s)`,
     );
 
@@ -399,6 +419,13 @@ export class DiscoveryService {
       categoryDrops: {
         nullCategory: nullDrops,
         blockedCategory: blockedDrops,
+      },
+      resolveSummary: {
+        picked: picked.length,
+        resolvedNonNull: picked.length - zeroResultCount,
+        zeroResult: zeroResultCount,
+        matchConfirmed: matchConfirmedCount,
+        matchUnconfirmed: matchUnconfirmedCount,
       },
       sample,
       timings: {

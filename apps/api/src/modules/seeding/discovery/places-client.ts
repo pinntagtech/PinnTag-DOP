@@ -7,9 +7,18 @@
 // searchText is preferred over :autocomplete for this pipeline: given a
 // (name, coord) pair we want the top matching place, not a prefix-match
 // suggestion list.
+//
+// Spatial scoping uses `locationRestriction.rectangle` (a hard bound)
+// rather than `locationBias.circle` (a hint). The circle was letting
+// Google fall back to name-search when nothing matched inside the bias
+// radius — see the Chesley Brown 19km false-match in the Phase 2 pilot.
+// Rectangle trades that off for the possibility of a legit-but-slightly-
+// outside-box place returning zero results; we surface that as a caller-
+// visible null rather than a silent miss.
 
 import axios from 'axios';
 import { Logger } from '@nestjs/common';
+import { metersToLatDeg, metersToLngDeg } from './dedup-helpers';
 
 const log = new Logger('PlacesClient');
 
@@ -22,7 +31,9 @@ export interface PlacesResolveInput {
   address: string | null;
   lat: number;
   lng: number;
-  radiusMeters?: number; // default 100
+  // Half-width of the search rectangle in meters. Default 250 → ~500m
+  // square around the candidate coord.
+  boxHalfSideMeters?: number;
 }
 
 export interface PlacesResolveResult {
@@ -41,12 +52,21 @@ export async function resolvePlaceIdBySearchText(
   const query = input.address
     ? `${input.name}, ${input.address}`
     : input.name;
+  const halfSide = input.boxHalfSideMeters ?? 250;
+  const dLat = metersToLatDeg(halfSide);
+  const dLng = metersToLngDeg(halfSide, input.lat);
   const body = {
     textQuery: query,
-    locationBias: {
-      circle: {
-        center: { latitude: input.lat, longitude: input.lng },
-        radius: input.radiusMeters ?? 100,
+    locationRestriction: {
+      rectangle: {
+        low: {
+          latitude: input.lat - dLat,
+          longitude: input.lng - dLng,
+        },
+        high: {
+          latitude: input.lat + dLat,
+          longitude: input.lng + dLng,
+        },
       },
     },
     maxResultCount: 1,
