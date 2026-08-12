@@ -64,6 +64,12 @@ import {
   ConsoleRunSchema,
 } from './console/console-run.schema';
 import { ConsoleController } from './console/console.controller';
+import {
+  DiscoveryRegion,
+  DiscoveryRegionSchema,
+} from './discovery/schemas/discovery-region.schema';
+import { DiscoveryService } from './discovery/discovery.service';
+import { DiscoveryController } from './discovery/discovery.controller';
 import { SeedingController } from './seeding.controller';
 import { AuthModule } from '../auth/auth.module';
 import { LocationsModule } from '../locations/locations.module';
@@ -80,6 +86,7 @@ import { LocationsModule } from '../locations/locations.module';
       { name: DopSyncState.name, schema: DopSyncStateSchema },
       { name: CoverageSnapshot.name, schema: CoverageSnapshotSchema },
       { name: ConsoleRun.name, schema: ConsoleRunSchema },
+      { name: DiscoveryRegion.name, schema: DiscoveryRegionSchema },
     ]),
     AuthModule,
     LocationsModule,
@@ -95,6 +102,7 @@ import { LocationsModule } from '../locations/locations.module';
     BotSourceController,
     CoverBackfillController,
     ConsoleController,
+    DiscoveryController,
   ],
   providers: [
     SeedingLogService,
@@ -124,6 +132,7 @@ import { LocationsModule } from '../locations/locations.module';
     ConsoleService,
     ProvenanceService,
     RunService,
+    DiscoveryService,
   ],
   exports: [
     SeedingSessionService,
