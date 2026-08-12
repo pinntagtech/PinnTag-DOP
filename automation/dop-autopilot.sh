@@ -36,17 +36,16 @@ for phase_file in "$QUEUE_DIR"/*.md; do
   if grep -qiE "$GATE_PATTERNS" "$phase_file"; then
     echo "GATE: '$name' matches a hard-stop pattern. Not auto-running."
     echo "Review the file yourself and run it manually if it's safe to proceed:"
-    echo "  claude -p \"\$(cat $phase_file)\" --cwd $REPO --output-format json"
+    echo "  (cd $REPO && claude -p \"\$(cat $phase_file)\" --output-format json)"
     exit 2
   fi
 
   run_log="$LOG_DIR/${name%.md}.$(date +%s).json"
 
-  claude -p "$(cat "$phase_file")" \
-    --cwd "$REPO" \
+  (cd "$REPO" && claude -p "$(cat "$phase_file")" \
     --output-format json \
     --allowedTools "Bash,Read,Edit,Write" \
-    --permission-mode acceptEdits \
+    --permission-mode acceptEdits) \
     > "$run_log" 2> "$LOG_DIR/${name%.md}.stderr.log" || {
       echo "Claude Code run FAILED for $name. See $LOG_DIR/${name%.md}.stderr.log"
       exit 1
@@ -80,3 +79,4 @@ for phase_file in "$QUEUE_DIR"/*.md; do
 done
 
 echo "=== Queue drained. All phases either completed or gated. ==="
+
