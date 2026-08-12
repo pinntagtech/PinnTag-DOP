@@ -2,20 +2,28 @@
 //
 // Tier 1 (rule): lookupGoogleCategory — the 9-entry Beauty & Wellness
 // map in resolve/google-category-map.ts. If it hits, we have the real
-// industryId + categoryIds and confidence is 1.0.
+// industryId + categoryIds; industryConfidence=1.0, categoryConfidence=1.0.
 //
 // Tier 2 (local-llm): deferred — Ollama slot in later without changing
 // this file's exported interface. When it lands, insert between rule
 // and Claude.
 //
-// Tier 3 (claude-api): Claude proposes freeform industry/category
-// labels. We match those labels against the real staging taxonomy
-// (loaded once via TaxonomyLoader). If a proposed label matches an
-// existing industry/category by normalized name → use the real ID
-// and confidence is Claude's self-reported. If it doesn't match →
-// keep the label, no ID, mark belowThreshold so the record routes
-// to review. **We never auto-create a taxonomy entry** — that's a
-// deliberate manual decision per Rahul.
+// Tier 3 (claude-api): TWO-pass.
+//   Pass 1: given the full industry list from staging, Claude picks
+//           the industry. We match the label back to a real industryId.
+//   Pass 2: given ONLY the real category names that live under Claude's
+//           picked industry, Claude picks up to 3 categories. Because
+//           the list is constrained to real names, matches are ~100%
+//           when Claude picks anything at all — no cap-on-miss logic
+//           needed (which was the source of the flattened-0.55 problem
+//           in the first Phase 3 pilot). Each pass reports its own
+//           confidence and the two live on the decision separately.
+//
+// belowThreshold on this judge keys off categoryConfidence specifically
+// so an industry-only-confident record (industry match found, but no
+// suitable child category in the taxonomy) routes to review, while a
+// category-confident record with unknown industry (shouldn't happen —
+// pass 2 requires pass 1) also does.
 
 import { Injectable } from '@nestjs/common';
 import { lookupGoogleCategory } from '../../resolve/google-category-map';
@@ -48,20 +56,24 @@ export class CategoryJudge {
       const cats = ruleHit.categoryIds
         .map((id) => snap.categories.find((c) => c.id === id))
         .filter((c): c is (typeof snap.categories)[number] => !!c);
+      const decision: CategoryDecision = {
+        industryLabel: industry?.name ?? null,
+        industryId: ruleHit.industryId,
+        industryConfidence: 1.0,
+        categoryLabels: cats.map((c) => c.name),
+        categoryIds: cats.map((c) => c.id),
+        categoryConfidence: 1.0,
+      };
       return {
-        decision: {
-          industryLabel: industry?.name ?? null,
-          industryId: ruleHit.industryId,
-          categoryLabels: cats.map((c) => c.name),
-          categoryIds: cats.map((c) => c.id),
-        },
+        decision,
         confidence: 1.0,
         source: 'rule',
         reasoning: `google-category-map hit: "${overtureCategory}" → ${ruleHit.proposedLabel}`,
+        belowThreshold: false,
       };
     }
 
-    // Tier 3: Claude. (Local-LLM tier 2 deferred.)
+    // Tier 3: Claude two-pass. (Local-LLM tier 2 deferred.)
     const snap = await this.taxonomy.load();
     return await this.escalateClaude(input, snap);
   }
@@ -75,104 +87,222 @@ export class CategoryJudge {
       input.resolved?.formattedAddress || input.overture.address || '';
     const overtureCategory = input.overture.category || '(none)';
 
+    // ── Pass 1: industry ────────────────────────────────────────────
     const industryList = snap.industries.map((i) => i.name).join(', ');
-
-    const system = [
+    const industrySystem = [
       'You are a business taxonomy classifier for a consumer-app business directory.',
       'Given a business (name, address, and its raw Overture category label),',
-      'pick the single best-fit industry from the provided list, plus up to 3',
-      'category labels that describe the business. If the business is not a',
-      'consumer-app business at all (e.g. residential, government-only, defunct),',
-      'set industryLabel to null and reflect that in confidence.',
+      'pick the single best-fit industry from the provided list. If the business',
+      'is not a consumer-app business at all (e.g. residential, government-only,',
+      'defunct), set industryLabel to null.',
       '',
       'Respond with ONLY a JSON object of the form:',
-      '{"industryLabel": string|null, "categoryLabels": string[], "confidence": number, "reasoning": string}',
-      'confidence is 0.0-1.0; be conservative — below 0.7 routes to human review.',
+      '{"industryLabel": string|null, "confidence": number, "reasoning": string}',
+      'confidence is 0.0-1.0.',
     ].join('\n');
-
-    const user = [
+    const industryUser = [
       `Business name: "${businessName}"`,
       `Address: ${address}`,
       `Raw Overture category: "${overtureCategory}"`,
       '',
-      `Available industry list (pick one exactly, or null):`,
+      'Available industry list (pick one exactly, or null):',
       industryList,
     ].join('\n');
-
-    type ClaudeReply = {
+    type IndustryReply = {
       industryLabel: string | null;
-      categoryLabels: string[];
       confidence: number;
       reasoning: string;
     };
-    const reply = await this.claude.askJson<ClaudeReply>({
-      system,
-      user,
-      maxTokens: 400,
+    const industryReply = await this.claude.askJson<IndustryReply>({
+      system: industrySystem,
+      user: industryUser,
+      maxTokens: 300,
     });
 
-    if (!reply) {
+    if (!industryReply) {
+      return this.emptyDecision(
+        'claude-api',
+        'Claude industry-pass failed / no JSON returned',
+      );
+    }
+
+    const industryMatch = this.taxonomy.matchIndustry(
+      industryReply.industryLabel,
+      snap,
+    );
+    const industryConfidence = clamp01(industryReply.confidence);
+    const industryReasonPrefix = industryReply.reasoning || '';
+
+    // If industry didn't resolve to a real ID (either Claude returned null
+    // or the label doesn't exist in staging), we can't run pass 2 — there's
+    // no restricted category list to draw from. Return with industry
+    // context, categoryConfidence=0, belowThreshold=true.
+    if (!industryMatch) {
+      const decision: CategoryDecision = {
+        industryLabel: industryReply.industryLabel,
+        industryId: null,
+        industryConfidence,
+        categoryLabels: [],
+        categoryIds: [],
+        categoryConfidence: 0,
+      };
+      const reasoning = [
+        industryReasonPrefix,
+        industryReply.industryLabel
+          ? `industryLabel "${industryReply.industryLabel}" not in staging taxonomy`
+          : 'industryLabel returned null',
+      ]
+        .filter(Boolean)
+        .join(' — ');
       return {
-        decision: {
-          industryLabel: null,
-          industryId: null,
-          categoryLabels: [],
-          categoryIds: [],
-        },
+        decision,
+        confidence: Math.min(industryConfidence, 0),
+        source: 'claude-api',
+        reasoning,
+        belowThreshold: true, // categoryConfidence=0 is always below threshold
+      };
+    }
+
+    // ── Pass 2: categories, constrained to the picked industry ──────
+    const categoriesUnderIndustry = snap.categories.filter(
+      (c) => c.industryId === industryMatch.id,
+    );
+    if (categoriesUnderIndustry.length === 0) {
+      // Industry exists but has no child categories in staging — record
+      // industry, no categories to pick, needs review to add categories.
+      const decision: CategoryDecision = {
+        industryLabel: industryMatch.name,
+        industryId: industryMatch.id,
+        industryConfidence,
+        categoryLabels: [],
+        categoryIds: [],
+        categoryConfidence: 0,
+      };
+      return {
+        decision,
         confidence: 0,
         source: 'claude-api',
-        reasoning: 'Claude call failed / no JSON returned',
+        reasoning: [
+          industryReasonPrefix,
+          `industry "${industryMatch.name}" has no categories in staging taxonomy`,
+        ]
+          .filter(Boolean)
+          .join(' — '),
         belowThreshold: true,
       };
     }
 
-    // Match Claude's proposed labels against the real taxonomy.
-    const industryMatch = this.taxonomy.matchIndustry(
-      reply.industryLabel,
-      snap,
-    );
-    const categoryMatches = (reply.categoryLabels ?? [])
-      .map((l) => this.taxonomy.matchCategory(l, snap))
-      .filter((c): c is NonNullable<typeof c> => !!c);
+    const categoryNamesForPrompt = categoriesUnderIndustry
+      .map((c) => c.name)
+      .join(', ');
+    const categorySystem = [
+      'You are a business taxonomy classifier. The industry has already been',
+      'chosen. Pick up to 3 categories from the provided list that best',
+      'describe this business. Only pick from the list — do not invent new',
+      'category names. If none of the listed categories fit, return an empty',
+      'array and low confidence.',
+      '',
+      'Respond with ONLY a JSON object of the form:',
+      '{"categoryLabels": string[], "confidence": number, "reasoning": string}',
+      'confidence is 0.0-1.0.',
+    ].join('\n');
+    const categoryUser = [
+      `Business name: "${businessName}"`,
+      `Address: ${address}`,
+      `Raw Overture category: "${overtureCategory}"`,
+      `Chosen industry: "${industryMatch.name}"`,
+      '',
+      'Categories under this industry (pick up to 3 exactly from this list):',
+      categoryNamesForPrompt,
+    ].join('\n');
+    type CategoryReply = {
+      categoryLabels: string[];
+      confidence: number;
+      reasoning: string;
+    };
+    const categoryReply = await this.claude.askJson<CategoryReply>({
+      system: categorySystem,
+      user: categoryUser,
+      maxTokens: 300,
+    });
 
-    const claudeConfidence = Math.max(
-      0,
-      Math.min(1, Number(reply.confidence) || 0),
-    );
+    if (!categoryReply) {
+      const decision: CategoryDecision = {
+        industryLabel: industryMatch.name,
+        industryId: industryMatch.id,
+        industryConfidence,
+        categoryLabels: [],
+        categoryIds: [],
+        categoryConfidence: 0,
+      };
+      return {
+        decision,
+        confidence: 0,
+        source: 'claude-api',
+        reasoning: [
+          industryReasonPrefix,
+          'Claude category-pass failed / no JSON returned',
+        ]
+          .filter(Boolean)
+          .join(' — '),
+        belowThreshold: true,
+      };
+    }
 
-    // If Claude proposed an industry but we couldn't map it to a real
-    // taxonomy entry, we still HAVE a labeled proposal — but we can't
-    // seed a categoryId from it, so downgrade the confidence + flag.
-    const industryMapped = !!industryMatch;
-    const anyCategoryMapped = categoryMatches.length > 0;
-    let confidence = claudeConfidence;
-    let reasoningExtras: string[] = [];
-    if (reply.industryLabel && !industryMapped) {
-      confidence = Math.min(confidence, 0.5);
-      reasoningExtras.push(
-        `industryLabel "${reply.industryLabel}" not in staging taxonomy`,
-      );
-    }
-    if ((reply.categoryLabels?.length ?? 0) > 0 && !anyCategoryMapped) {
-      confidence = Math.min(confidence, 0.55);
-      reasoningExtras.push(
-        `none of ${reply.categoryLabels?.length} proposed categories matched taxonomy`,
-      );
-    }
+    // Match Claude's picks against the real category list (case-insensitive).
+    const matches = (categoryReply.categoryLabels ?? [])
+      .map((label) => this.taxonomy.matchCategory(label, snap))
+      .filter((c): c is NonNullable<typeof c> => !!c)
+      // Only accept matches that belong to the chosen industry —
+      // guards against name-collision across industries.
+      .filter((c) => c.industryId === industryMatch.id);
+
+    const categoryConfidence = clamp01(categoryReply.confidence);
+    const overall = Math.min(industryConfidence, categoryConfidence);
+
+    const decision: CategoryDecision = {
+      industryLabel: industryMatch.name,
+      industryId: industryMatch.id,
+      industryConfidence,
+      categoryLabels: categoryReply.categoryLabels ?? [],
+      categoryIds: matches.map((c) => c.id),
+      categoryConfidence,
+    };
 
     return {
-      decision: {
-        industryLabel: reply.industryLabel,
-        industryId: industryMatch?.id ?? null,
-        categoryLabels: reply.categoryLabels ?? [],
-        categoryIds: categoryMatches.map((c) => c.id),
-      },
-      confidence,
+      decision,
+      confidence: overall,
       source: 'claude-api',
-      reasoning: [reply.reasoning, ...reasoningExtras]
+      reasoning: [industryReasonPrefix, categoryReply.reasoning]
         .filter(Boolean)
         .join(' — '),
-      belowThreshold: confidence < CONFIDENCE_THRESHOLD,
+      belowThreshold: categoryConfidence < CONFIDENCE_THRESHOLD,
     };
   }
+
+  private emptyDecision(
+    source: 'rule' | 'claude-api',
+    reasoning: string,
+  ): JudgmentDecision<CategoryDecision> {
+    return {
+      decision: {
+        industryLabel: null,
+        industryId: null,
+        industryConfidence: 0,
+        categoryLabels: [],
+        categoryIds: [],
+        categoryConfidence: 0,
+      },
+      confidence: 0,
+      source,
+      reasoning,
+      belowThreshold: true,
+    };
+  }
+}
+
+function clamp01(n: unknown): number {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
 }

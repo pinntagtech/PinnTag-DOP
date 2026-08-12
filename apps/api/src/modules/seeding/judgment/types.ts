@@ -22,8 +22,14 @@ export interface JudgmentDecision<T = unknown> {
 export interface CategoryDecision {
   industryLabel: string | null; // human-readable, e.g. "Restaurants & Dining"
   industryId: string | null; // resolved from staging businessindustries by name; null if unmatched
+  industryConfidence: number; // 0.0-1.0 — how sure we are about the industry pick
   categoryLabels: string[]; // human-readable list
   categoryIds: string[]; // resolved from staging businesscategories by name; empty if unmatched
+  categoryConfidence: number; // 0.0-1.0 — how sure we are about the category pick
+  // needsReviewByJudge.category keys off categoryConfidence specifically —
+  // industry can be high-confidence while categories are unknown, and vice
+  // versa. Keeping them separate avoids the earlier flattened-cap issue
+  // where a category-miss dragged industry-confidence down with it.
 }
 
 export interface CityDecision {
