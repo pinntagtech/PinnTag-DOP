@@ -155,18 +155,41 @@ export class DiscoveryController {
         review: judgments.filter(
           (j) => j.anomaly.decision.action === 'needs_review',
         ).length,
-        categorySource: {
+//        categorySource: {
+//        rule: judgments.filter((j) => j.category.source === 'rule').length,
+//          claude: judgments.filter((j) => j.category.source === 'claude-api')
+//            .length,
+//        },
+//        citySource: {
+//          rule: judgments.filter((j) => j.city.source === 'rule').length,
+//          claude: judgments.filter((j) => j.city.source === 'claude-api')
+//            .length,
+//        },
+//        anomalySource: {
+//          rule: judgments.filter((j) => j.anomaly.source === 'rule').length,
+//          claude: judgments.filter((j) => j.anomaly.source === 'claude-api')
+//           .length,
+//        },
+categorySource: {
           rule: judgments.filter((j) => j.category.source === 'rule').length,
+          localLlm: judgments.filter(
+            (j) => j.category.source === 'local-llm',
+          ).length,
           claude: judgments.filter((j) => j.category.source === 'claude-api')
             .length,
         },
         citySource: {
           rule: judgments.filter((j) => j.city.source === 'rule').length,
+          localLlm: judgments.filter((j) => j.city.source === 'local-llm')
+            .length,
           claude: judgments.filter((j) => j.city.source === 'claude-api')
             .length,
         },
         anomalySource: {
           rule: judgments.filter((j) => j.anomaly.source === 'rule').length,
+          localLlm: judgments.filter(
+            (j) => j.anomaly.source === 'local-llm',
+          ).length,
           claude: judgments.filter((j) => j.anomaly.source === 'claude-api')
             .length,
         },

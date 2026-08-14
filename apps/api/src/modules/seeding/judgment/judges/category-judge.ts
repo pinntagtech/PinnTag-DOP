@@ -4,11 +4,17 @@
 // map in resolve/google-category-map.ts. If it hits, we have the real
 // industryId + categoryIds; industryConfidence=1.0, categoryConfidence=1.0.
 //
-// Tier 2 (local-llm): deferred — Ollama slot in later without changing
-// this file's exported interface. When it lands, insert between rule
-// and Claude.
+// Tier 2 (local-llm): OllamaClient, same two-pass shape as Claude (industry,
+// then category constrained to that industry). When OLLAMA_HOST is set
+// this tier is PRIMARY AND FINAL — whatever Ollama returns, high or low
+// confidence, is the answer. Low confidence flows through to needsReview
+// via the normal belowThreshold path. If Ollama itself fails (network,
+// timeout, bad JSON) we return a low-confidence local-llm result rather
+// than falling through to Claude, so infra failures surface honestly
+// instead of being masked by a second-opinion escalation.
 //
-// Tier 3 (claude-api): TWO-pass.
+// Tier 3 (claude-api): TWO-pass, unchanged from before. Only reached when
+// OLLAMA_HOST is unset — Ollama is disabled at the infra level.
 //   Pass 1: given the full industry list from staging, Claude picks
 //           the industry. We match the label back to a real industryId.
 //   Pass 2: given ONLY the real category names that live under Claude's
@@ -28,6 +34,7 @@
 import { Injectable } from '@nestjs/common';
 import { lookupGoogleCategory } from '../../resolve/google-category-map';
 import { ClaudeClient } from '../claude-client';
+import { OllamaClient } from '../ollama-client';
 import { TaxonomyLoader, TaxonomySnapshot } from '../taxonomy-loader';
 import {
   CategoryDecision,
@@ -36,10 +43,23 @@ import {
   JudgmentDecision,
 } from '../types';
 
+type IndustryReply = {
+  industryLabel: string | null;
+  confidence: number;
+  reasoning: string;
+};
+
+type CategoryReply = {
+  categoryLabels: string[];
+  confidence: number;
+  reasoning: string;
+};
+
 @Injectable()
 export class CategoryJudge {
   constructor(
     private readonly claude: ClaudeClient,
+    private readonly ollama: OllamaClient,
     private readonly taxonomy: TaxonomyLoader,
   ) {}
 
@@ -73,15 +93,42 @@ export class CategoryJudge {
       };
     }
 
-    // Tier 3: Claude two-pass. (Local-LLM tier 2 deferred.)
     const snap = await this.taxonomy.load();
-    return await this.escalateClaude(input, snap);
+
+    // Tier 2: local-llm (Ollama). PRIMARY AND FINAL when enabled — no
+    // Claude escalation, even on belowThreshold or infra failure. A null
+    // return from runTwoPass means the Ollama call itself failed; surface
+    // that as a low-confidence local-llm result so it routes to review.
+    if (this.ollama.enabled) {
+      const local = await this.runTwoPass(input, snap, this.ollama, 'local-llm');
+      return (
+        local ??
+        this.emptyDecision('local-llm', 'Ollama call failed / no JSON returned')
+      );
+    }
+
+    // Tier 3: Claude two-pass. Only reached when Ollama is disabled.
+    const claudeResult = await this.runTwoPass(input, snap, this.claude, 'claude-api');
+    return (
+      claudeResult ??
+      this.emptyDecision('claude-api', 'Claude two-pass returned no result')
+    );
   }
 
-  private async escalateClaude(
+  /**
+   * Shared two-pass implementation used by BOTH the Ollama tier and the
+   * Claude tier — same prompts, same taxonomy-matching logic, only the
+   * client (and reported source) differs. This guarantees the local model
+   * is judged on an identical task to Claude, so the comparison in the
+   * judge-sample rollup (categorySource: {rule, localLlm, claude}) is
+   * apples-to-apples.
+   */
+  private async runTwoPass(
     input: JudgeInput,
     snap: TaxonomySnapshot,
-  ): Promise<JudgmentDecision<CategoryDecision>> {
+    client: ClaudeClient | OllamaClient,
+    source: 'local-llm' | 'claude-api',
+  ): Promise<JudgmentDecision<CategoryDecision> | null> {
     const businessName = input.resolved?.name || input.overture.name;
     const address =
       input.resolved?.formattedAddress || input.overture.address || '';
@@ -108,22 +155,19 @@ export class CategoryJudge {
       'Available industry list (pick one exactly, or null):',
       industryList,
     ].join('\n');
-    type IndustryReply = {
-      industryLabel: string | null;
-      confidence: number;
-      reasoning: string;
-    };
-    const industryReply = await this.claude.askJson<IndustryReply>({
+
+    const industryReply = await client.askJson<IndustryReply>({
       system: industrySystem,
       user: industryUser,
       maxTokens: 300,
     });
 
     if (!industryReply) {
-      return this.emptyDecision(
-        'claude-api',
-        'Claude industry-pass failed / no JSON returned',
-      );
+      // For the local-llm tier this just means "fall through to Claude" —
+      // caller checks for null/belowThreshold and re-tries with Claude.
+      return source === 'local-llm'
+        ? null
+        : this.emptyDecision(source, 'Industry pass failed / no JSON returned');
     }
 
     const industryMatch = this.taxonomy.matchIndustry(
@@ -133,10 +177,6 @@ export class CategoryJudge {
     const industryConfidence = clamp01(industryReply.confidence);
     const industryReasonPrefix = industryReply.reasoning || '';
 
-    // If industry didn't resolve to a real ID (either Claude returned null
-    // or the label doesn't exist in staging), we can't run pass 2 — there's
-    // no restricted category list to draw from. Return with industry
-    // context, categoryConfidence=0, belowThreshold=true.
     if (!industryMatch) {
       const decision: CategoryDecision = {
         industryLabel: industryReply.industryLabel,
@@ -157,9 +197,9 @@ export class CategoryJudge {
       return {
         decision,
         confidence: Math.min(industryConfidence, 0),
-        source: 'claude-api',
+        source,
         reasoning,
-        belowThreshold: true, // categoryConfidence=0 is always below threshold
+        belowThreshold: true,
       };
     }
 
@@ -168,8 +208,6 @@ export class CategoryJudge {
       (c) => c.industryId === industryMatch.id,
     );
     if (categoriesUnderIndustry.length === 0) {
-      // Industry exists but has no child categories in staging — record
-      // industry, no categories to pick, needs review to add categories.
       const decision: CategoryDecision = {
         industryLabel: industryMatch.name,
         industryId: industryMatch.id,
@@ -181,7 +219,7 @@ export class CategoryJudge {
       return {
         decision,
         confidence: 0,
-        source: 'claude-api',
+        source,
         reasoning: [
           industryReasonPrefix,
           `industry "${industryMatch.name}" has no categories in staging taxonomy`,
@@ -215,18 +253,15 @@ export class CategoryJudge {
       'Categories under this industry (pick up to 3 exactly from this list):',
       categoryNamesForPrompt,
     ].join('\n');
-    type CategoryReply = {
-      categoryLabels: string[];
-      confidence: number;
-      reasoning: string;
-    };
-    const categoryReply = await this.claude.askJson<CategoryReply>({
+
+    const categoryReply = await client.askJson<CategoryReply>({
       system: categorySystem,
       user: categoryUser,
       maxTokens: 300,
     });
 
     if (!categoryReply) {
+      if (source === 'local-llm') return null;
       const decision: CategoryDecision = {
         industryLabel: industryMatch.name,
         industryId: industryMatch.id,
@@ -238,10 +273,10 @@ export class CategoryJudge {
       return {
         decision,
         confidence: 0,
-        source: 'claude-api',
+        source,
         reasoning: [
           industryReasonPrefix,
-          'Claude category-pass failed / no JSON returned',
+          'Category pass failed / no JSON returned',
         ]
           .filter(Boolean)
           .join(' — '),
@@ -249,12 +284,9 @@ export class CategoryJudge {
       };
     }
 
-    // Match Claude's picks against the real category list (case-insensitive).
     const matches = (categoryReply.categoryLabels ?? [])
       .map((label) => this.taxonomy.matchCategory(label, snap))
       .filter((c): c is NonNullable<typeof c> => !!c)
-      // Only accept matches that belong to the chosen industry —
-      // guards against name-collision across industries.
       .filter((c) => c.industryId === industryMatch.id);
 
     const categoryConfidence = clamp01(categoryReply.confidence);
@@ -272,7 +304,7 @@ export class CategoryJudge {
     return {
       decision,
       confidence: overall,
-      source: 'claude-api',
+      source,
       reasoning: [industryReasonPrefix, categoryReply.reasoning]
         .filter(Boolean)
         .join(' — '),
@@ -281,7 +313,7 @@ export class CategoryJudge {
   }
 
   private emptyDecision(
-    source: 'rule' | 'claude-api',
+    source: 'rule' | 'local-llm' | 'claude-api',
     reasoning: string,
   ): JudgmentDecision<CategoryDecision> {
     return {

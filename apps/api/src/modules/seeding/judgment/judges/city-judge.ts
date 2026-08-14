@@ -5,18 +5,23 @@
 // take second-to-last as city. State comes from the last segment. Suburb
 // (neighborhood between street and city) is not extractable from a plain
 // USPS-format address string, so the rule always returns suburb=null and
-// only Claude proposes one for the town/village-legal-split cases the spec
-// calls out.
+// only the LLM tiers propose one for the town/village-legal-split cases the
+// spec calls out.
 //
-// Tier 2 (local-llm): deferred.
+// Tier 2 (local-llm): OllamaClient, same single-pass shape as Claude below.
+// When OLLAMA_HOST is set this tier is PRIMARY AND FINAL — whatever Ollama
+// returns, high or low confidence, is the answer. Low confidence flows
+// through to needsReview via the normal belowThreshold path. On infra
+// failure (null return) we surface a low-confidence local-llm result
+// rather than falling through to Claude.
 //
 // Tier 3 (claude-api): parse the address as prose, propose city + suburb +
-// state. Only invoked when the rule fails (ambiguous_reason non-null) OR
-// when the rule returned a city but the address contains a suburb hint
-// like "Buckhead" or "Midtown" that the plain rule can't surface.
+// state. Only invoked when the rule fails AND Ollama is disabled at the
+// infra level (OLLAMA_HOST unset) — never as a per-record fallback.
 
 import { Injectable } from '@nestjs/common';
 import { ClaudeClient } from '../claude-client';
+import { OllamaClient } from '../ollama-client';
 import {
   CityDecision,
   CONFIDENCE_THRESHOLD,
@@ -25,9 +30,6 @@ import {
 } from '../types';
 
 const STATE_ZIP_RE = /^[A-Za-z]{2}\s+\d{5}(-\d{4})?$/;
-// Anything that looks like a state code in the tail. Case-insensitive
-// so we don't need to duplicate.
-const STATE_CODE_RE = /\b([A-Z]{2})\s+\d{5}(?:-\d{4})?\s*(?:,\s*USA)?\s*$/i;
 
 function deriveCityAndState(address: string): {
   city: string | null;
@@ -60,9 +62,20 @@ function deriveCityAndState(address: string): {
   return { city: candidate, state };
 }
 
+type LlmReply = {
+  city: string | null;
+  suburb: string | null;
+  state: string | null;
+  confidence: number;
+  reasoning: string;
+};
+
 @Injectable()
 export class CityJudge {
-  constructor(private readonly claude: ClaudeClient) {}
+  constructor(
+    private readonly claude: ClaudeClient,
+    private readonly ollama: OllamaClient,
+  ) {}
 
   async run(input: JudgeInput): Promise<JudgmentDecision<CityDecision>> {
     // Prefer Google's canonical formattedAddress — it's already
@@ -73,7 +86,7 @@ export class CityJudge {
     const ruleOut = deriveCityAndState(address);
     if (ruleOut.city && ruleOut.state) {
       // Rule was decisive. Suburb stays null; if we want suburb signal
-      // we escalate to Claude in a follow-up (out of Phase 3 pilot scope).
+      // we escalate to an LLM tier in a follow-up (out of Phase 3 scope).
       return {
         decision: {
           city: ruleOut.city,
@@ -86,15 +99,60 @@ export class CityJudge {
       };
     }
 
-    // Rule failed → escalate.
-    return await this.escalateClaude(input, address, ruleOut.reason ?? null);
+    // Rule failed → tier 2: local-llm. PRIMARY AND FINAL when enabled —
+    // whatever Ollama returns is the answer; low confidence routes to
+    // review via belowThreshold. Null (Ollama failure) is surfaced as a
+    // low-confidence local-llm result, NOT escalated to Claude.
+    if (this.ollama.enabled) {
+      const local = await this.escalate(
+        input,
+        address,
+        ruleOut.reason ?? null,
+        this.ollama,
+        'local-llm',
+      );
+      return (
+        local ?? {
+          decision: { city: null, suburb: null, state: null },
+          confidence: 0,
+          source: 'local-llm',
+          reasoning: 'Ollama call failed / no JSON returned',
+          belowThreshold: true,
+        }
+      );
+    }
+
+    // Tier 3: Claude fallback. Only reached when Ollama is disabled.
+    const claudeResult = await this.escalate(
+      input,
+      address,
+      ruleOut.reason ?? null,
+      this.claude,
+      'claude-api',
+    );
+    return (
+      claudeResult ?? {
+        decision: { city: null, suburb: null, state: null },
+        confidence: 0,
+        source: 'claude-api',
+        reasoning: 'Claude call failed / no JSON returned',
+        belowThreshold: true,
+      }
+    );
   }
 
-  private async escalateClaude(
+  /**
+   * Shared single-pass implementation used by BOTH the Ollama tier and the
+   * Claude tier — identical prompt, only the client (and reported source)
+   * differs, so the judge-sample rollup comparison stays apples-to-apples.
+   */
+  private async escalate(
     input: JudgeInput,
     address: string,
     ruleReason: string | null,
-  ): Promise<JudgmentDecision<CityDecision>> {
+    client: ClaudeClient | OllamaClient,
+    source: 'local-llm' | 'claude-api',
+  ): Promise<JudgmentDecision<CityDecision> | null> {
     const businessName = input.resolved?.name || input.overture.name;
     const lat = input.overture.lat;
     const lng = input.overture.lng;
@@ -120,31 +178,26 @@ export class CityJudge {
       .filter(Boolean)
       .join('\n');
 
-    type ClaudeReply = {
-      city: string | null;
-      suburb: string | null;
-      state: string | null;
-      confidence: number;
-      reasoning: string;
-    };
-    const reply = await this.claude.askJson<ClaudeReply>({
+    const reply = await client.askJson<LlmReply>({
       system,
       user,
       maxTokens: 300,
     });
+
     if (!reply) {
+      // local-llm tier: null means "fall through to Claude", not a
+      // terminal failure — caller handles this.
+      if (source === 'local-llm') return null;
       return {
         decision: { city: null, suburb: null, state: null },
         confidence: 0,
-        source: 'claude-api',
+        source,
         reasoning: 'Claude call failed / no JSON returned',
         belowThreshold: true,
       };
     }
-    const confidence = Math.max(
-      0,
-      Math.min(1, Number(reply.confidence) || 0),
-    );
+
+    const confidence = Math.max(0, Math.min(1, Number(reply.confidence) || 0));
     return {
       decision: {
         city: reply.city,
@@ -152,7 +205,7 @@ export class CityJudge {
         state: reply.state,
       },
       confidence,
-      source: 'claude-api',
+      source,
       reasoning: reply.reasoning,
       belowThreshold: confidence < CONFIDENCE_THRESHOLD,
     };

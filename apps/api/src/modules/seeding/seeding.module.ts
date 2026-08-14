@@ -81,6 +81,7 @@ import { DiscoveryRunService } from './discovery/discovery-run.service';
 import { DiscoveryController } from './discovery/discovery.controller';
 import { JudgmentService } from './judgment/judgment.service';
 import { ClaudeClient } from './judgment/claude-client';
+import { OllamaClient } from './judgment/ollama-client';
 import { TaxonomyLoader } from './judgment/taxonomy-loader';
 import { CategoryJudge } from './judgment/judges/category-judge';
 import { CityJudge } from './judgment/judges/city-judge';
@@ -153,6 +154,7 @@ import { LocationsModule } from '../locations/locations.module';
     DiscoveryRunService,
     JudgmentService,
     ClaudeClient,
+    OllamaClient,
     TaxonomyLoader,
     CategoryJudge,
     CityJudge,

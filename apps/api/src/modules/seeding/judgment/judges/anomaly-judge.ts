@@ -10,7 +10,12 @@
 //   - wrong country: Overture coord inside US bbox + Google's
 //     formattedAddress country segment is not US (or vice versa)
 //
-// Tier 2 (local-llm): deferred.
+// Tier 2 (local-llm): OllamaClient, same classification task as Claude
+// below. When OLLAMA_HOST is set this tier is PRIMARY AND FINAL —
+// whatever Ollama returns is the answer, including belowThreshold and
+// needs_review, which route through the normal review path. Infra
+// failure (null return) is surfaced as a low-confidence local-llm
+// result, NOT escalated to Claude.
 //
 // Tier 3 (claude-api): for anything that survives the rules and has
 // matchConfirmed=false, ask Claude to categorize: is this a rename
@@ -22,6 +27,7 @@
 
 import { Injectable } from '@nestjs/common';
 import { ClaudeClient } from '../claude-client';
+import { OllamaClient } from '../ollama-client';
 import {
   AnomalyDecision,
   AnomalyKind,
@@ -43,12 +49,8 @@ const GEO_LABEL_RE =
 function looksLikeJunkName(name: string): boolean {
   if (!name || !name.trim()) return true;
   const trimmed = name.trim();
-  // Pure geographic label like "Atlanta, GA - Downtown"
   if (GEO_LABEL_RE.test(trimmed)) return true;
-  // Single all-caps single-word (Overture had "MCDONALD" as a
-  // cards_and_stationery_store — clearly garbled)
   if (/^[A-Z]{4,}$/.test(trimmed) && !trimmed.includes(' ')) return true;
-  // Only non-word characters
   if (!/[A-Za-z]/.test(trimmed)) return true;
   return false;
 }
@@ -67,35 +69,35 @@ function addressCountryIsUs(address: string | null): boolean | null {
   const tail = address.trim().toLowerCase();
   if (/,\s*usa\s*$/.test(tail)) return true;
   if (/,\s*united states\s*$/.test(tail)) return true;
-  // Google formatted addresses ~always tail with USA for US places; if
-  // no country tail, we can't be sure — return null (unknown).
   return null;
 }
 
+type LlmReply = {
+  isValidBusiness: boolean;
+  anomalies: AnomalyKind[];
+  action: 'accept_google' | 'skip' | 'needs_review';
+  confidence: number;
+  reasoning: string;
+};
+
 @Injectable()
 export class AnomalyJudge {
-  constructor(private readonly claude: ClaudeClient) {}
+  constructor(
+    private readonly claude: ClaudeClient,
+    private readonly ollama: OllamaClient,
+  ) {}
 
   async run(input: JudgeInput): Promise<JudgmentDecision<AnomalyDecision>> {
     const anomalies: AnomalyKind[] = [];
     const overtureName = input.overture.name;
-    const resolvedName = input.resolved?.name ?? '';
     const resolvedAddr = input.resolved?.formattedAddress ?? null;
 
-    // Rule: junk name (checks BOTH Overture name and — if Google gave
-    // us one — Google's resolved name).
     if (looksLikeJunkName(overtureName)) anomalies.push('junk_name');
 
-    // Rule: exact duplicate — dedup pass 2 already told us the placeId
-    // is present in one or both target envs. That's not "near", it's
-    // exact by placeId. Skip.
     if (input.dedup?.existsInStaging || input.dedup?.existsInProd) {
       anomalies.push('exact_duplicate');
     }
 
-    // Rule: wrong country. Overture coord is inside the US bbox but
-    // Google's address explicitly tails with a non-US country marker
-    // (or vice versa). Empty/unknown tail is not an anomaly signal.
     const inUs = inUsBox(input.overture.lat, input.overture.lng);
     const addrUs = addressCountryIsUs(resolvedAddr);
     if (inUs && addrUs === false) anomalies.push('wrong_country');
@@ -149,15 +151,60 @@ export class AnomalyJudge {
       };
     }
 
-    // Escalate: matchConfirmed=false OR anomaly flags fired but no
-    // rule was decisive.
-    return await this.escalateClaude(input, anomalies);
+    // Tier 2: local-llm. PRIMARY AND FINAL when enabled — no Claude
+    // escalation. Null (Ollama failure) is surfaced as a low-confidence
+    // local-llm result routed to review.
+    if (this.ollama.enabled) {
+      const local = await this.escalate(input, anomalies, this.ollama, 'local-llm');
+      return (
+        local ?? {
+          decision: {
+            isValidBusiness: true,
+            anomalies: anomalies.length ? anomalies : (['none'] as AnomalyKind[]),
+            action: 'needs_review',
+          },
+          confidence: 0,
+          source: 'local-llm',
+          reasoning: 'Ollama call failed / no JSON returned',
+          belowThreshold: true,
+        }
+      );
+    }
+
+    // Tier 3: Claude fallback. Only reached when Ollama is disabled.
+    const claudeResult = await this.escalate(
+      input,
+      anomalies,
+      this.claude,
+      'claude-api',
+    );
+    return (
+      claudeResult ?? {
+        decision: {
+          isValidBusiness: true,
+          anomalies: anomalies.length ? anomalies : (['none'] as AnomalyKind[]),
+          action: 'needs_review',
+        },
+        confidence: 0,
+        source: 'claude-api',
+        reasoning: 'Claude call failed / no JSON returned',
+        belowThreshold: true,
+      }
+    );
   }
 
-  private async escalateClaude(
+  /**
+   * Shared classification task used by BOTH the Ollama tier and the
+   * Claude tier — identical prompt, only the client (and reported
+   * source) differs, so the judge-sample rollup comparison stays
+   * apples-to-apples.
+   */
+  private async escalate(
     input: JudgeInput,
     ruleAnomalies: AnomalyKind[],
-  ): Promise<JudgmentDecision<AnomalyDecision>> {
+    client: ClaudeClient | OllamaClient,
+    source: 'local-llm' | 'claude-api',
+  ): Promise<JudgmentDecision<AnomalyDecision> | null> {
     const system = [
       'You inspect a business-directory candidate that failed automatic match confirmation.',
       'The candidate has an Overture-source (name, address, category, coord) and a Google',
@@ -217,19 +264,14 @@ export class AnomalyJudge {
         : 'No deterministic rule flags fired.',
     ].join('\n');
 
-    type ClaudeReply = {
-      isValidBusiness: boolean;
-      anomalies: AnomalyKind[];
-      action: 'accept_google' | 'skip' | 'needs_review';
-      confidence: number;
-      reasoning: string;
-    };
-    const reply = await this.claude.askJson<ClaudeReply>({
+    const reply = await client.askJson<LlmReply>({
       system,
       user,
       maxTokens: 400,
     });
+
     if (!reply) {
+      if (source === 'local-llm') return null;
       return {
         decision: {
           isValidBusiness: true,
@@ -237,22 +279,19 @@ export class AnomalyJudge {
           action: 'needs_review',
         },
         confidence: 0,
-        source: 'claude-api',
+        source,
         reasoning: 'Claude call failed / no JSON returned',
         belowThreshold: true,
       };
     }
-    const confidence = Math.max(
-      0,
-      Math.min(1, Number(reply.confidence) || 0),
-    );
-    // Merge rule-fired flags with Claude's (dedupe).
+
+    const confidence = Math.max(0, Math.min(1, Number(reply.confidence) || 0));
     const merged = Array.from(
       new Set([...(reply.anomalies ?? []), ...ruleAnomalies]),
     ) as AnomalyKind[];
-    // needs_review action always routes to review regardless of confidence.
     const belowThreshold =
       confidence < CONFIDENCE_THRESHOLD || reply.action === 'needs_review';
+
     return {
       decision: {
         isValidBusiness: !!reply.isValidBusiness,
@@ -260,7 +299,7 @@ export class AnomalyJudge {
         action: reply.action,
       },
       confidence,
-      source: 'claude-api',
+      source,
       reasoning: reply.reasoning,
       belowThreshold,
     };
