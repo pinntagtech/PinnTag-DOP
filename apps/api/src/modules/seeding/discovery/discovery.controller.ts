@@ -283,6 +283,7 @@ categorySource: {
       dryRun?: boolean;
       limit?: number;
       parallelism?: number;
+      scope?: 'review' | 'all';
       adminPassword?: string;
     },
   ) {
@@ -292,12 +293,14 @@ categorySource: {
     }
     if (!body.runId) throw new HttpException('runId required', 400);
     const dryRun = body.dryRun !== false; // default true
+    const scope = body.scope === 'all' ? 'all' : 'review';
     try {
       return await this.runService.reJudgeRun({
         runId: body.runId,
         dryRun,
         limit: body.limit,
         parallelism: body.parallelism,
+        scope,
       });
     } catch (e) {
       if (e instanceof HttpException) throw e;

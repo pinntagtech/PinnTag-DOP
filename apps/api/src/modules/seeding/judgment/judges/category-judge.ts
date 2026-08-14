@@ -38,10 +38,20 @@ import { OllamaClient } from '../ollama-client';
 import { TaxonomyLoader, TaxonomySnapshot } from '../taxonomy-loader';
 import {
   CategoryDecision,
-  CONFIDENCE_THRESHOLD,
   JudgeInput,
   JudgmentDecision,
 } from '../types';
+
+// Stricter than the shared CONFIDENCE_THRESHOLD (0.7). Category is the
+// only judge where a wrong-but-confident answer causes durable damage
+// (a business ends up filed under the wrong industry in the consumer
+// app). BOTH industryConfidence and categoryConfidence must clear this
+// bar — a taxonomy force-fit like "Public Storage → Serviced Apartment"
+// at industry=0.9 / category=0.8 should route to needsReview, not
+// accept. Rule tier is unaffected (hard-coded 1.0). Creating new
+// taxonomy entries is deliberately out of scope; this is only a
+// stricter gate on the EXISTING taxonomy.
+const CATEGORY_CONFIDENCE_THRESHOLD = 0.9;
 
 type IndustryReply = {
   industryLabel: string | null;
@@ -308,7 +318,10 @@ export class CategoryJudge {
       reasoning: [industryReasonPrefix, categoryReply.reasoning]
         .filter(Boolean)
         .join(' — '),
-      belowThreshold: categoryConfidence < CONFIDENCE_THRESHOLD,
+      // Stricter gate: BOTH industry and category confidence must clear
+      // CATEGORY_CONFIDENCE_THRESHOLD, i.e. their min must. Guards
+      // against confident-but-wrong taxonomy force-fits.
+      belowThreshold: overall < CATEGORY_CONFIDENCE_THRESHOLD,
     };
   }
 

@@ -444,17 +444,28 @@ export class DiscoveryRunService {
     dryRun: boolean;
     limit?: number;
     parallelism?: number;
+    // 'review' (default): only touch docs currently needsReview:true.
+    // 'all': also re-judge docs that were previously accepted, so a
+    //         stricter gate change can correct wrong-accepts too.
+    scope?: 'review' | 'all';
   }): Promise<{
     runId: string;
     regionId: string;
     dryRun: boolean;
+    scope: 'review' | 'all';
     examined: number;
     missingOverture: number;
-    flips: {
-      reviewToAccept: number;
-      reviewToSkip: number;
-      reviewToNotApplicable: number;
-      stillReview: number;
+    fromReview: {
+      toAccept: number;
+      toSkip: number;
+      toNotApplicable: number;
+      stayReview: number;
+    };
+    fromAccept: {
+      toReview: number;
+      toSkip: number;
+      toNotApplicable: number;
+      stayAccept: number;
     };
     updates?: number;
   }> {
@@ -490,11 +501,12 @@ export class DiscoveryRunService {
           'businesses',
         );
 
+      const scope: 'review' | 'all' = opts.scope ?? 'review';
       const query: Record<string, any> = {
         'seedProvenance.runId': opts.runId,
-        needsReview: true,
         isDeleted: { $ne: true },
       };
+      if (scope === 'review') query.needsReview = true;
       const findOpts = opts.limit && opts.limit > 0 ? { limit: opts.limit } : {};
       const docs = (await BusinessModel.find(query, {
         _id: 1,
@@ -503,6 +515,7 @@ export class DiscoveryRunService {
         addressLine1: 1,
         latitude: 1,
         longitude: 1,
+        needsReview: 1,
         seedProvenance: 1,
       }, findOpts).lean()) as any[];
 
@@ -511,11 +524,17 @@ export class DiscoveryRunService {
       );
 
       let missingOverture = 0;
+      let updates = 0;
+      // From-review flips.
       let reviewToAccept = 0;
       let reviewToSkip = 0;
       let reviewToNotApplicable = 0;
-      let stillReview = 0;
-      let updates = 0;
+      let stayReview = 0;
+      // From-accept flips (only populated when scope='all').
+      let acceptToReview = 0;
+      let acceptToSkip = 0;
+      let acceptToNotApplicable = 0;
+      let stayAccept = 0;
 
       const parallelism = Math.max(1, Math.min(opts.parallelism ?? 5, 15));
       let cursor = 0;
@@ -561,10 +580,18 @@ export class DiscoveryRunService {
           dedup: null,
         });
 
-        if (judgment.finalAction === 'accept') reviewToAccept++;
-        else if (judgment.finalAction === 'skip') reviewToSkip++;
-        else if (judgment.finalAction === 'not_applicable') reviewToNotApplicable++;
-        else stillReview++;
+        const wasReview = !!doc.needsReview;
+        if (wasReview) {
+          if (judgment.finalAction === 'accept') reviewToAccept++;
+          else if (judgment.finalAction === 'skip') reviewToSkip++;
+          else if (judgment.finalAction === 'not_applicable') reviewToNotApplicable++;
+          else stayReview++;
+        } else {
+          if (judgment.finalAction === 'accept') stayAccept++;
+          else if (judgment.finalAction === 'skip') acceptToSkip++;
+          else if (judgment.finalAction === 'not_applicable') acceptToNotApplicable++;
+          else acceptToReview++;
+        }
 
         if (!opts.dryRun) {
           await BusinessModel.updateOne(
@@ -591,17 +618,18 @@ export class DiscoveryRunService {
             this.logger.warn(
               `[reJudgeRun ${opts.runId}] doc ${docs[i]?._id} failed: ${(err as Error).message ?? err}`,
             );
-            stillReview++;
+            if (docs[i]?.needsReview) stayReview++;
+            else stayAccept++;
           }
         }
       });
       await Promise.all(workers);
 
       this.logger.log(
-        `[reJudgeRun ${opts.runId}] ${opts.dryRun ? 'DRY-RUN' : 'APPLIED'} ` +
-          `examined=${docs.length} missingOverture=${missingOverture} ` +
-          `→ accept=${reviewToAccept} skip=${reviewToSkip} ` +
-          `not_applicable=${reviewToNotApplicable} stillReview=${stillReview} ` +
+        `[reJudgeRun ${opts.runId}] ${opts.dryRun ? 'DRY-RUN' : 'APPLIED'} scope=${scope} ` +
+          `examined=${docs.length} missingOverture=${missingOverture} | ` +
+          `fromReview→ accept=${reviewToAccept} skip=${reviewToSkip} na=${reviewToNotApplicable} stay=${stayReview} | ` +
+          `fromAccept→ review=${acceptToReview} skip=${acceptToSkip} na=${acceptToNotApplicable} stay=${stayAccept} | ` +
           `updates=${updates}`,
       );
 
@@ -609,13 +637,20 @@ export class DiscoveryRunService {
         runId: opts.runId,
         regionId: String(run.regionId),
         dryRun: opts.dryRun,
+        scope,
         examined: docs.length,
         missingOverture,
-        flips: {
-          reviewToAccept,
-          reviewToSkip,
-          reviewToNotApplicable,
-          stillReview,
+        fromReview: {
+          toAccept: reviewToAccept,
+          toSkip: reviewToSkip,
+          toNotApplicable: reviewToNotApplicable,
+          stayReview,
+        },
+        fromAccept: {
+          toReview: acceptToReview,
+          toSkip: acceptToSkip,
+          toNotApplicable: acceptToNotApplicable,
+          stayAccept,
         },
         updates: opts.dryRun ? undefined : updates,
       };
