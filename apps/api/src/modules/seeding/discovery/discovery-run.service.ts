@@ -428,6 +428,202 @@ export class DiscoveryRunService {
     return this.runModel.findOne({ runId }).lean() as any;
   }
 
+  // One-off re-judgment for a specific run's needsReview cohort. Rebuilds
+  // each record's JudgeInput from stored doc fields plus a re-pulled
+  // Overture-by-sourceId map (overture name/address/coord aren't kept on
+  // the Business doc after insert, so we reconstruct them from the same
+  // parquet the original run used). Dedup is passed as null — recomputing
+  // it against staging would trivially match the doc against itself and
+  // wrongly flag every record as exact_duplicate.
+  //
+  // Used to recover the atlanta-ga run that ran while Ollama was down and
+  // dumped 1449 records into review as fail-honestly placeholders. Same
+  // pattern is fine for any future "GPU was down mid-run" recovery.
+  async reJudgeRun(opts: {
+    runId: string;
+    dryRun: boolean;
+    limit?: number;
+    parallelism?: number;
+  }): Promise<{
+    runId: string;
+    regionId: string;
+    dryRun: boolean;
+    examined: number;
+    missingOverture: number;
+    flips: {
+      reviewToAccept: number;
+      reviewToSkip: number;
+      reviewToNotApplicable: number;
+      stillReview: number;
+    };
+    updates?: number;
+  }> {
+    const run = await this.runModel.findOne({ runId: opts.runId }).lean();
+    if (!run) throw new Error(`No run: ${opts.runId}`);
+    const region = await this.regionModel.findOne({ regionId: run.regionId }).lean();
+    if (!region) throw new Error(`No region: ${run.regionId}`);
+
+    const bbox = {
+      west: region.bbox.west,
+      south: region.bbox.south,
+      east: region.bbox.east,
+      north: region.bbox.north,
+    };
+
+    this.logger.log(`[reJudgeRun ${opts.runId}] pulling Overture for bbox…`);
+    const candidates = await fetchOverturePlacesInBbox(bbox);
+    const bySourceId = new Map<string, OvertureCandidate>();
+    for (const c of candidates) bySourceId.set(c.sourceId, c);
+    this.logger.log(
+      `[reJudgeRun ${opts.runId}] overture rows=${candidates.length}, indexed=${bySourceId.size}`,
+    );
+
+    const stagingUri = this.configService.get<string>('database.pinntagStaging');
+    if (!stagingUri) throw new Error('No URI for pinntagStaging');
+    const conn = await openStagingConnection(stagingUri);
+    try {
+      const BusinessModel =
+        conn.models['Business'] ||
+        conn.model(
+          'Business',
+          new mongoose.Schema({}, { strict: false }),
+          'businesses',
+        );
+
+      const query: Record<string, any> = {
+        'seedProvenance.runId': opts.runId,
+        needsReview: true,
+        isDeleted: { $ne: true },
+      };
+      const findOpts = opts.limit && opts.limit > 0 ? { limit: opts.limit } : {};
+      const docs = (await BusinessModel.find(query, {
+        _id: 1,
+        placeId: 1,
+        name: 1,
+        addressLine1: 1,
+        latitude: 1,
+        longitude: 1,
+        seedProvenance: 1,
+      }, findOpts).lean()) as any[];
+
+      this.logger.log(
+        `[reJudgeRun ${opts.runId}] needsReview docs=${docs.length}`,
+      );
+
+      let missingOverture = 0;
+      let reviewToAccept = 0;
+      let reviewToSkip = 0;
+      let reviewToNotApplicable = 0;
+      let stillReview = 0;
+      let updates = 0;
+
+      const parallelism = Math.max(1, Math.min(opts.parallelism ?? 5, 15));
+      let cursor = 0;
+
+      const processOne = async (doc: any): Promise<void> => {
+        const sourceId = doc?.seedProvenance?.overtureSourceId as string | undefined;
+        const overture = sourceId ? bySourceId.get(sourceId) : undefined;
+        if (!overture) {
+          missingOverture++;
+          return;
+        }
+        const resolved = {
+          placeId: String(doc.placeId),
+          name: String(doc.name),
+          formattedAddress: String(doc.addressLine1 ?? ''),
+          lat: Number(doc.latitude),
+          lng: Number(doc.longitude),
+        };
+        const dist = haversineMeters(
+          overture.lat,
+          overture.lng,
+          resolved.lat,
+          resolved.lng,
+        );
+        const sim = nameSimilarity(
+          normalizeName(overture.name),
+          normalizeName(resolved.name),
+        );
+        const matchConfirmed =
+          dist <= MATCH_CONFIRM_MAX_DIST_M && sim >= MATCH_CONFIRM_MIN_NAME_SIM;
+        const matchReason = `name_sim=${sim.toFixed(2)} dist=${dist.toFixed(0)}m`;
+
+        const judgment = await this.judgment.judgeRecord({
+          overture: {
+            name: overture.name,
+            address: overture.address,
+            lat: overture.lat,
+            lng: overture.lng,
+            category: overture.overtureCategory,
+            sourceId: overture.sourceId,
+          },
+          resolved: { ...resolved, matchConfirmed, matchReason },
+          dedup: null,
+        });
+
+        if (judgment.finalAction === 'accept') reviewToAccept++;
+        else if (judgment.finalAction === 'skip') reviewToSkip++;
+        else if (judgment.finalAction === 'not_applicable') reviewToNotApplicable++;
+        else stillReview++;
+
+        if (!opts.dryRun) {
+          await BusinessModel.updateOne(
+            { _id: doc._id },
+            {
+              $set: {
+                llmJudgment: judgment,
+                needsReview: judgment.needsReview,
+                needsReviewByJudge: judgment.needsReviewByJudge,
+              },
+            },
+          );
+          updates++;
+        }
+      };
+
+      const workers = Array.from({ length: parallelism }, async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= docs.length) return;
+          try {
+            await processOne(docs[i]);
+          } catch (err) {
+            this.logger.warn(
+              `[reJudgeRun ${opts.runId}] doc ${docs[i]?._id} failed: ${(err as Error).message ?? err}`,
+            );
+            stillReview++;
+          }
+        }
+      });
+      await Promise.all(workers);
+
+      this.logger.log(
+        `[reJudgeRun ${opts.runId}] ${opts.dryRun ? 'DRY-RUN' : 'APPLIED'} ` +
+          `examined=${docs.length} missingOverture=${missingOverture} ` +
+          `→ accept=${reviewToAccept} skip=${reviewToSkip} ` +
+          `not_applicable=${reviewToNotApplicable} stillReview=${stillReview} ` +
+          `updates=${updates}`,
+      );
+
+      return {
+        runId: opts.runId,
+        regionId: String(run.regionId),
+        dryRun: opts.dryRun,
+        examined: docs.length,
+        missingOverture,
+        flips: {
+          reviewToAccept,
+          reviewToSkip,
+          reviewToNotApplicable,
+          stillReview,
+        },
+        updates: opts.dryRun ? undefined : updates,
+      };
+    } finally {
+      await conn.close();
+    }
+  }
+
   private async markFailed(runId: string, error: string): Promise<void> {
     await this.runModel.updateOne(
       { runId },

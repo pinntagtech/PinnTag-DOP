@@ -269,6 +269,44 @@ categorySource: {
     return run;
   }
 
+  // One-off recovery endpoint: re-judge the needsReview cohort for a
+  // specific run using stored doc data + a re-pulled Overture map. Built
+  // to recover the atlanta-ga run that dumped ~1449 records into review
+  // as "Ollama call failed" placeholders while the GPU was down. Dry-run
+  // by default; pass dryRun=false to actually write llmJudgment /
+  // needsReview / needsReviewByJudge back to each doc.
+  @Post('re-judge-run')
+  async reJudgeRun(
+    @Body()
+    body: {
+      runId: string;
+      dryRun?: boolean;
+      limit?: number;
+      parallelism?: number;
+      adminPassword?: string;
+    },
+  ) {
+    const configured = process.env.DOP_ADMIN_PASSWORD;
+    if (!configured || body.adminPassword !== configured) {
+      throw new HttpException('Invalid admin password', 403);
+    }
+    if (!body.runId) throw new HttpException('runId required', 400);
+    const dryRun = body.dryRun !== false; // default true
+    try {
+      return await this.runService.reJudgeRun({
+        runId: body.runId,
+        dryRun,
+        limit: body.limit,
+        parallelism: body.parallelism,
+      });
+    } catch (e) {
+      if (e instanceof HttpException) throw e;
+      const msg = (e as Error).message ?? String(e);
+      this.logger.error(`reJudgeRun ${body.runId} failed: ${msg}`);
+      throw new HttpException(msg, 500);
+    }
+  }
+
   // ── Bot result webhook for DISCOVERY_SEARCH jobs ──────────────────────
   //
   // The discovery bot POSTs the resolved Google Maps match (or an error)
