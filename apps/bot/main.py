@@ -256,12 +256,90 @@ def _detect_system_chrome() -> Optional[str]:
 _LAUNCH_LOGGED = False
 
 
+# ── Off-screen windowed launch ─────────────────────────────────────
+#
+# Push the visible browser window off the monitor via
+# --window-position=-2400,-2400 so the operator's screen stays clean
+# during long scrapes, WITHOUT switching to headless (Google's headful
+# fingerprint is much less flagged than headless — keep the real rendered
+# behavior, just move it off-screen).
+#
+# Behavior per environment (feature-flag: BOT_OFFSCREEN, default true):
+#   - macOS                              → apply offscreen args
+#   - Linux + $DISPLAY / $WAYLAND_DISPLAY → apply offscreen args
+#     (unreliable on Wayland but harmless; best-effort)
+#   - Linux + no display, Xvfb installed → start Xvfb :99, apply args
+#   - Linux + no display, no Xvfb        → skip, log warning
+#     (do NOT silently switch to headless — detection risk out of scope)
+#
+# Detection runs once at import; the Xvfb subprocess (if started) is
+# kept alive for the process lifetime and killed at exit.
+def _detect_offscreen_mode():
+    import subprocess
+    import shutil
+    import atexit
+    import time as _time
+
+    if os.getenv("BOT_OFFSCREEN", "true").lower() in ("false", "0", "no"):
+        return [], "disabled_by_env", None
+
+    is_mac = sys.platform == "darwin"
+    has_display = is_mac or bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
+    offscreen_args = ["--window-position=-2400,-2400", "--window-size=1280,800"]
+
+    if has_display:
+        mode = "mac" if is_mac else (
+            "linux_wayland" if os.environ.get("WAYLAND_DISPLAY") else "linux_x11"
+        )
+        return offscreen_args, mode, None
+
+    # No display — try Xvfb.
+    xvfb_path = shutil.which("Xvfb")
+    if not xvfb_path:
+        return [], "no_display_no_xvfb", None
+
+    try:
+        proc = subprocess.Popen(
+            [xvfb_path, ":99", "-screen", "0", "1280x800x24"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        # Xvfb needs a moment to bind. Small blocking sleep is fine —
+        # this runs once at import, not per launch.
+        _time.sleep(0.5)
+        atexit.register(lambda: (proc.terminate(), proc.wait(timeout=2)))
+        return offscreen_args, "xvfb", proc
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[BROWSER] Xvfb start failed: {e}; falling back to no-offscreen"
+        )
+        return [], "xvfb_failed", None
+
+
+_OFFSCREEN_ARGS, _OFFSCREEN_MODE, _XVFB_PROC = _detect_offscreen_mode()
+
+
 async def launch_browser(p, *, headless: bool, args: list):
     """Single launch path for every scrape. Resolves the browser by the
     priority documented above so the SAME code runs on Mac (bundled) and
-    Ubuntu 26.04 (system Chrome) with no per-machine config."""
+    Ubuntu 26.04 (system Chrome) with no per-machine config. Also merges
+    off-screen positioning args (see _detect_offscreen_mode) unless the
+    caller already supplied a conflicting --window-position/--window-size,
+    in which case the caller wins."""
     global _LAUNCH_LOGGED
-    kwargs = dict(headless=headless, args=args)
+    merged_args = list(args)
+    caller_has_position = any(a.startswith("--window-position") for a in args)
+    caller_has_size = any(a.startswith("--window-size") for a in args)
+    for oa in _OFFSCREEN_ARGS:
+        if oa.startswith("--window-position") and caller_has_position:
+            continue
+        if oa.startswith("--window-size") and caller_has_size:
+            continue
+        merged_args.append(oa)
+    kwargs = dict(headless=headless, args=merged_args)
     chosen = None
 
     if BOT_BROWSER_CHANNEL:
@@ -300,7 +378,7 @@ async def launch_browser(p, *, headless: bool, args: list):
                     )
 
     if not _LAUNCH_LOGGED:
-        logger.info(f"[BROWSER] using {chosen}")
+        logger.info(f"[BROWSER] using {chosen} (offscreen: {_OFFSCREEN_MODE})")
         _LAUNCH_LOGGED = True
 
     return await p.chromium.launch(**kwargs)
