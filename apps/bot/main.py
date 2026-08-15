@@ -381,7 +381,60 @@ async def launch_browser(p, *, headless: bool, args: list):
         logger.info(f"[BROWSER] using {chosen} (offscreen: {_OFFSCREEN_MODE})")
         _LAUNCH_LOGGED = True
 
-    return await p.chromium.launch(**kwargs)
+    browser = await p.chromium.launch(**kwargs)
+
+    # macOS-only follow-up. --window-position moves the window off the
+    # visible screen, but macOS still steals focus and re-shows new /
+    # navigating windows regardless. Wrap browser.new_context so every
+    # context's first page also gets a CDP minimize — belt-and-suspenders
+    # that keeps the window hidden even when focus gets stolen. Kept
+    # macOS-only per spec; Linux (x11 / wayland / xvfb / no-display)
+    # behavior is unchanged.
+    if sys.platform == "darwin" and _OFFSCREEN_MODE == "mac":
+        _install_mac_minimize_hook(browser)
+
+    return browser
+
+
+def _install_mac_minimize_hook(browser):
+    """Monkey-patch browser.new_context on macOS so each new context's
+    initial page gets a CDP `Browser.setWindowBounds windowState:minimized`
+    applied right after creation. Silent no-op on any failure (Playwright
+    proxy that disallows attribute assignment, CDP session failure,
+    etc.) — the --window-position offset is still in place."""
+    try:
+        original_new_context = browser.new_context
+    except Exception as e:
+        logger.warning(f"[BROWSER] macOS minimize hook: cannot read new_context ({e})")
+        return
+
+    async def _minimize_page(context, page):
+        try:
+            cdp = await context.new_cdp_session(page)
+            info = await cdp.send("Browser.getWindowForTarget")
+            await cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": info["windowId"], "bounds": {"windowState": "minimized"}},
+            )
+            await cdp.detach()
+        except Exception as e:
+            logger.warning(f"[BROWSER] macOS window minimize failed: {e}")
+
+    async def wrapped_new_context(*args, **kwargs):
+        context = await original_new_context(*args, **kwargs)
+        # context.on('page') fires for every new page in the context,
+        # including popups. Minimizing an already-minimized window is a
+        # no-op, so a re-fire on new pages is harmless.
+        context.on(
+            "page",
+            lambda page: asyncio.create_task(_minimize_page(context, page)),
+        )
+        return context
+
+    try:
+        browser.new_context = wrapped_new_context
+    except Exception as e:
+        logger.warning(f"[BROWSER] macOS minimize hook: cannot patch new_context ({e})")
 
 SKIP_FOLDERS = {
     'all',
