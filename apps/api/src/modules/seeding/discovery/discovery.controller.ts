@@ -284,6 +284,9 @@ categorySource: {
       limit?: number;
       parallelism?: number;
       scope?: 'review' | 'all';
+      // Pass the previous call's passId to resume an interrupted sweep;
+      // omit to start a fresh pass.
+      passId?: string;
       adminPassword?: string;
     },
   ) {
@@ -301,6 +304,7 @@ categorySource: {
         limit: body.limit,
         parallelism: body.parallelism,
         scope,
+        passId: body.passId,
       });
     } catch (e) {
       if (e instanceof HttpException) throw e;

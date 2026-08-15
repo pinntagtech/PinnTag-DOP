@@ -448,11 +448,23 @@ export class DiscoveryRunService {
     // 'all': also re-judge docs that were previously accepted, so a
     //         stricter gate change can correct wrong-accepts too.
     scope?: 'review' | 'all';
+    // Resumable pass marker. Every successful re-judge write stamps
+    // reJudgeRunId onto the business doc. Passing the same passId on a
+    // later invocation skips docs already stamped with it, so a
+    // mid-flight restart (pm2 restart, deploy, crash) resumes instead
+    // of redoing the whole sweep. Omit to auto-generate a fresh passId
+    // for a from-scratch sweep. Ignored when dryRun=true (no writes,
+    // nothing to resume).
+    passId?: string;
   }): Promise<{
     runId: string;
     regionId: string;
     dryRun: boolean;
     scope: 'review' | 'all';
+    passId: string;
+    // Docs in cohort that already matched this passId — skipped up front
+    // (resume-from-restart case). Zero on a fresh pass.
+    alreadyFreshCount: number;
     examined: number;
     missingOverture: number;
     fromReview: {
@@ -502,13 +514,38 @@ export class DiscoveryRunService {
         );
 
       const scope: 'review' | 'all' = opts.scope ?? 'review';
-      const query: Record<string, any> = {
+      const passId =
+        opts.passId ??
+        `rejudge_${Date.now()}_${randomUUID().slice(0, 8)}`;
+      // Base cohort selector — same as before.
+      const cohortQuery: Record<string, any> = {
         'seedProvenance.runId': opts.runId,
         isDeleted: { $ne: true },
       };
-      if (scope === 'review') query.needsReview = true;
+      if (scope === 'review') cohortQuery.needsReview = true;
+
+      // For resumability, exclude docs already stamped with this
+      // passId (stamped by a prior invocation that got interrupted).
+      // Dry-run mode intentionally does not stamp, so nothing is ever
+      // "already fresh" under dryRun — and we don't filter here either
+      // (running two dry-runs shouldn't silently drop coverage).
+      const workQuery: Record<string, any> = { ...cohortQuery };
+      if (!opts.dryRun) {
+        workQuery.$or = [
+          { reJudgeRunId: { $exists: false } },
+          { reJudgeRunId: { $ne: passId } },
+        ];
+      }
+
+      const alreadyFreshCount = opts.dryRun
+        ? 0
+        : await BusinessModel.countDocuments({
+            ...cohortQuery,
+            reJudgeRunId: passId,
+          });
+
       const findOpts = opts.limit && opts.limit > 0 ? { limit: opts.limit } : {};
-      const docs = (await BusinessModel.find(query, {
+      const docs = (await BusinessModel.find(workQuery, {
         _id: 1,
         placeId: 1,
         name: 1,
@@ -520,7 +557,8 @@ export class DiscoveryRunService {
       }, findOpts).lean()) as any[];
 
       this.logger.log(
-        `[reJudgeRun ${opts.runId}] needsReview docs=${docs.length}`,
+        `[reJudgeRun ${opts.runId}] passId=${passId} scope=${scope} ` +
+          `alreadyFresh=${alreadyFreshCount} docsToProcess=${docs.length}`,
       );
 
       let missingOverture = 0;
@@ -601,6 +639,11 @@ export class DiscoveryRunService {
                 llmJudgment: judgment,
                 needsReview: judgment.needsReview,
                 needsReviewByJudge: judgment.needsReviewByJudge,
+                // Freshness marker for resumable re-judge sweeps. Set
+                // atomically with the judgment fields so a mid-write
+                // crash never leaves a doc "stamped fresh but stale".
+                reJudgeRunId: passId,
+                lastReJudgedAt: new Date(),
               },
             },
           );
@@ -627,7 +670,8 @@ export class DiscoveryRunService {
 
       this.logger.log(
         `[reJudgeRun ${opts.runId}] ${opts.dryRun ? 'DRY-RUN' : 'APPLIED'} scope=${scope} ` +
-          `examined=${docs.length} missingOverture=${missingOverture} | ` +
+          `passId=${passId} alreadyFresh=${alreadyFreshCount} examined=${docs.length} ` +
+          `missingOverture=${missingOverture} | ` +
           `fromReview→ accept=${reviewToAccept} skip=${reviewToSkip} na=${reviewToNotApplicable} stay=${stayReview} | ` +
           `fromAccept→ review=${acceptToReview} skip=${acceptToSkip} na=${acceptToNotApplicable} stay=${stayAccept} | ` +
           `updates=${updates}`,
@@ -638,6 +682,8 @@ export class DiscoveryRunService {
         regionId: String(run.regionId),
         dryRun: opts.dryRun,
         scope,
+        passId,
+        alreadyFreshCount,
         examined: docs.length,
         missingOverture,
         fromReview: {
