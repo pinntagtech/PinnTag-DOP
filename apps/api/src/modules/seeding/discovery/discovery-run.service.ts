@@ -49,6 +49,7 @@ import {
 import { resolvePlaceIdBySearchText } from './places-client';
 import { BotJobService } from '../bot/bot-job.service';
 import { BotJobType } from '../schemas/bot-job.schema';
+import { DriveActivationService } from '../activation/drive-activation.service';
 
 const DEDUP_RADIUS_M = 50;
 const NAME_SIM_THRESHOLD = 0.85;
@@ -323,15 +324,21 @@ export class DiscoveryRunService {
             reasoning: judgment.finalActionReasoning,
           });
 
-          // Auto-queue enrichment for the accept path. Discovery inserts
-          // only carry name/address/coord/category — the production gate
-          // (c2 real_cover, c3 real_hours) needs hours + cover before the
-          // record is migration-eligible. Reuse the placeId already
-          // resolved during discovery — the bot's resolve_business +
-          // cover_sync handlers do the rest. Errors here are non-fatal:
-          // a failed enqueue must not fail the insert; the enrichment
-          // backfill can retry later.
+          // Auto-provision enrichment for the accept path. Discovery
+          // inserts only carry name/address/coord/category — the
+          // production gate (c2 real_cover, c3 real_hours) needs hours
+          // + cover before the record is migration-eligible.
+          //
+          // Two steps, both best-effort (never fail the insert):
+          //   1. Create the Drive + Gallery folder skeleton so the
+          //      cover_sync webhook doesn't abort with "No drive
+          //      found" — reuses DriveActivationService, same helper
+          //      PostPublishService uses for the seeding-pipeline path.
+          //   2. Queue resolve_business (hours) + cover_sync (cover)
+          //      bot jobs against the placeId already resolved during
+          //      discovery.
           if (!needsReview) {
+            await this.provisionBusinessDrive(runId, businessId, stagingConn);
             await this.enqueueEnrichmentJobs(runId, businessId, resolved);
           }
         } catch (err) {
@@ -441,6 +448,46 @@ export class DiscoveryRunService {
 
   async getRun(runId: string): Promise<DiscoveryRunDocument | null> {
     return this.runModel.findOne({ runId }).lean() as any;
+  }
+
+  // Creates the Drive + Gallery folder skeleton for a discovery-inserted
+  // business so downstream media handlers (cover_sync, gallery_menu,
+  // image_sync) don't abort with "No drive found for business …".
+  // Same helper the seeding-pipeline path uses via PostPublishService;
+  // both methods are idempotent (safe on re-run). Best-effort — a
+  // provisioning failure is logged but does not fail the insert.
+  private async provisionBusinessDrive(
+    runId: string,
+    businessId: string,
+    conn: mongoose.Connection,
+  ): Promise<void> {
+    try {
+      const svc = new DriveActivationService();
+      const drive = await svc.createDriveForBusiness({
+        businessId,
+        targetConnection: conn,
+      });
+      if (!drive.success) {
+        this.logger.warn(
+          `[${runId}] drive create failed for business ${businessId}: ${drive.message}`,
+        );
+        return;
+      }
+      const folder = await svc.createGalleryFolder({
+        businessId,
+        driveId: drive.driveId,
+        targetConnection: conn,
+      });
+      if (!folder.success) {
+        this.logger.warn(
+          `[${runId}] gallery folder create failed for business ${businessId}: ${folder.message}`,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `[${runId}] drive provisioning failed for business ${businessId}: ${(err as Error).message ?? err}`,
+      );
+    }
   }
 
   // Queues the two enrichment jobs that a fresh discovery-accept doc
