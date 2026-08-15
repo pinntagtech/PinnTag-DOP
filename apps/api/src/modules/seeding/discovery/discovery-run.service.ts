@@ -47,6 +47,8 @@ import {
   openStagingConnection,
 } from './business-insert';
 import { resolvePlaceIdBySearchText } from './places-client';
+import { BotJobService } from '../bot/bot-job.service';
+import { BotJobType } from '../schemas/bot-job.schema';
 
 const DEDUP_RADIUS_M = 50;
 const NAME_SIM_THRESHOLD = 0.85;
@@ -74,6 +76,7 @@ export class DiscoveryRunService {
     private readonly configService: ConfigService,
     private readonly judgment: JudgmentService,
     private readonly claude: ClaudeClient,
+    private readonly botJobService: BotJobService,
   ) {}
 
   // Kick off a run in the background. Returns the runId immediately —
@@ -319,6 +322,18 @@ export class DiscoveryRunService {
             resolvedPlaceId: resolved.placeId,
             reasoning: judgment.finalActionReasoning,
           });
+
+          // Auto-queue enrichment for the accept path. Discovery inserts
+          // only carry name/address/coord/category — the production gate
+          // (c2 real_cover, c3 real_hours) needs hours + cover before the
+          // record is migration-eligible. Reuse the placeId already
+          // resolved during discovery — the bot's resolve_business +
+          // cover_sync handlers do the rest. Errors here are non-fatal:
+          // a failed enqueue must not fail the insert; the enrichment
+          // backfill can retry later.
+          if (!needsReview) {
+            await this.enqueueEnrichmentJobs(runId, businessId, resolved);
+          }
         } catch (err) {
           errorCount++;
           this.logger.warn(
@@ -426,6 +441,47 @@ export class DiscoveryRunService {
 
   async getRun(runId: string): Promise<DiscoveryRunDocument | null> {
     return this.runModel.findOne({ runId }).lean() as any;
+  }
+
+  // Queues the two enrichment jobs that a fresh discovery-accept doc
+  // needs before it can clear the production gate. Non-fatal on failure —
+  // the enqueue is best-effort and cover-backfill / a re-triggered
+  // resolve can pick up stragglers later.
+  private async enqueueEnrichmentJobs(
+    runId: string,
+    businessId: string,
+    resolved: {
+      placeId: string;
+      name: string;
+      formattedAddress: string;
+      lat: number;
+      lng: number;
+    },
+  ): Promise<void> {
+    const record = {
+      placeId: resolved.placeId,
+      businessId,
+      businessName: resolved.name,
+      environment: 'staging',
+      addressLine1: resolved.formattedAddress,
+      address1: resolved.formattedAddress,
+      latitude: resolved.lat,
+      longitude: resolved.lng,
+    };
+    try {
+      await this.botJobService.createJobs({
+        records: [record],
+        type: BotJobType.RESOLVE_BUSINESS,
+      });
+      await this.botJobService.createJobs({
+        records: [record],
+        type: BotJobType.COVER_SYNC,
+      });
+    } catch (err) {
+      this.logger.warn(
+        `[${runId}] enrichment enqueue failed for business ${businessId}: ${(err as Error).message ?? err}`,
+      );
+    }
   }
 
   // One-off re-judgment for a specific run's needsReview cohort. Rebuilds
