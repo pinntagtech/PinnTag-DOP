@@ -180,22 +180,31 @@ async def lifespan(app: FastAPI):
         f'Resolve pool: workers={RESOLVE_WORKERS} '
         f'jitter_ms={RESOLVE_JITTER_MS}'
     )
+    logger.info(
+        f'Discovery pool: workers={DISCOVERY_WORKERS} '
+        f'jitter_ms={DISCOVERY_JITTER_MS}'
+    )
 
     # Start background polling loops:
-    #  - polling_loop:    serial path for gallery_menu / reviews / image_sync
-    #                     / cover_sync (claims via /bot/poll, resolve excluded
-    #                     server-side so the pool below owns it).
-    #  - resolve_pool_loop: parallel worker pool for resolve_business jobs
-    #                     using a shared Chromium + per-job context.
+    #  - polling_loop:      serial path for gallery_menu / reviews /
+    #                       image_sync / cover_sync (claims via /bot/poll,
+    #                       resolve + discovery excluded server-side so
+    #                       the pools below own them).
+    #  - resolve_pool_loop: parallel worker pool for resolve_business
+    #                       jobs, shared Chromium + per-job context.
+    #  - discovery_pool_loop: same shape as resolve, for DISCOVERY_SEARCH
+    #                       jobs. Independent Chromium so a discovery
+    #                       burst can't starve resolve or vice versa.
     poll_task = asyncio.create_task(polling_loop())
     resolve_pool_task = asyncio.create_task(resolve_pool_loop())
+    discovery_pool_task = asyncio.create_task(discovery_pool_loop())
 
     yield
 
     logger.info('PinnTag Bot Service shutting down')
-    for t in (poll_task, resolve_pool_task):
+    for t in (poll_task, resolve_pool_task, discovery_pool_task):
         t.cancel()
-    for t in (poll_task, resolve_pool_task):
+    for t in (poll_task, resolve_pool_task, discovery_pool_task):
         try:
             await t
         except (asyncio.CancelledError, Exception):
@@ -846,6 +855,13 @@ BOT_VERSION = _read_local_version() or 'unknown'
 # launch), and sleeps a jittered delay between jobs.
 RESOLVE_WORKERS = max(1, int(os.getenv('RESOLVE_WORKERS', '3') or '3'))
 RESOLVE_JITTER_MS = max(0, int(os.getenv('RESOLVE_JITTER_MS', '800') or '0'))
+
+# Same knobs for the DISCOVERY_SEARCH parallel pool. Kept independent of
+# RESOLVE_* so operators can throttle discovery separately (its per-job
+# cost is lower — no hours read, no drill-in for tenant lists, single
+# geo-anchored /maps/search hop for most candidates).
+DISCOVERY_WORKERS = max(1, int(os.getenv('DISCOVERY_WORKERS', '3') or '3'))
+DISCOVERY_JITTER_MS = max(0, int(os.getenv('DISCOVERY_JITTER_MS', '800') or '0'))
 
 
 def load_cookies():
@@ -3852,3 +3868,880 @@ async def post_webhook(data: dict):
             f'Webhook POST failed for {data.get("placeId")}: '
             f'{type(e).__name__}: {e}'
         )
+
+
+# ─── DISCOVERY_SEARCH handler ─────────────────────────────────────
+#
+# Given an Overture candidate (name, address, coords) and the region
+# bbox, search Google Maps for the matching business and return
+# {placeId, name, formattedAddress, lat, lng} or null with an error
+# reason. Purpose-built for the discovery pipeline — no hours,
+# no rating/cover/category, no state cross-validation (discovery
+# candidates carry no stored state). Bbox reject IS the geo-side
+# confident-match gate: a resolved place outside the region rectangle
+# is a cross-region miss, not a real match.
+#
+# Reuses the primitives already proven in _resolve_in_context:
+#   - _sanitize_query_fields  (query hygiene)
+#   - _names_loose_match      (drill-in scoring; >=50 threshold, same
+#                              as resolve_business)
+#   - viewport-anchored /maps/search URL (@lat,lng,14z)
+#   - h1 hydration wait + drill-in via "At this place" / results list
+#   - ChIJ scan across initstate / url / script / content / dom
+# Intentionally does NOT modify _resolve_in_context or any other
+# existing handler.
+
+_MAPS_URL_LATLNG_RE = _re.compile(
+    r'/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)(?:,\d+(?:\.\d+)?z)?'
+)
+# Google embeds the place's own coords as !3d<lat>!4d<lng> inside
+# the data= param. Present even when the /@lat,lng URL segment is
+# missing (which happens on /maps/place/<Name>/data=... links). Use
+# THIS in preference to @lat,lng where both exist — @lat,lng is the
+# viewport centre, not the place, and can drift on drill-in.
+_MAPS_URL_DATA_LATLNG_RE = _re.compile(
+    r'!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)'
+)
+
+
+def _extract_latlng_from_url(url: str):
+    """Parse the place's lat/lng out of a Google Maps URL. Prefers
+    !3d/!4d (the place's own coords) over @lat,lng (viewport centre).
+    Returns (lat, lng) as floats or (None, None) if not present /
+    unparseable.
+    """
+    if not url:
+        return (None, None)
+    m = _MAPS_URL_DATA_LATLNG_RE.search(url)
+    if not m:
+        m = _MAPS_URL_LATLNG_RE.search(url)
+    if not m:
+        return (None, None)
+    try:
+        return (float(m.group(1)), float(m.group(2)))
+    except (TypeError, ValueError):
+        return (None, None)
+
+
+async def _discovery_search_in_context(context, job: dict) -> dict:
+    """Run one DISCOVERY_SEARCH job on the given BrowserContext.
+
+    Returns a dict shaped to POST straight to /discovery/bot-result:
+        { 'result': {placeId, name, formattedAddress, lat, lng} | None,
+          'error': str | '' }
+    """
+    import re
+    from urllib.parse import quote_plus
+
+    business_name = (job.get('businessName') or '').strip()
+    address_line1 = job.get('addressLine1') or ''
+    lat_in = job.get('latitude')
+    lng_in = job.get('longitude')
+    bbox_w = job.get('discoveryBboxWest')
+    bbox_s = job.get('discoveryBboxSouth')
+    bbox_e = job.get('discoveryBboxEast')
+    bbox_n = job.get('discoveryBboxNorth')
+    src_id = job.get('discoveryOvertureSourceId') or '(none)'
+
+    # Log id: source id + trimmed name so a batch summary can grep back
+    # to the exact candidate in Overture.
+    tag = f'{src_id[:12]}/{business_name[:40]}'
+
+    # Same sanitizer path as resolve_business. Discovery jobs carry
+    # empty city/state (the API strips them since Overture doesn't
+    # provide them on candidates), so most fields drop out — the
+    # sanitizer still guards addressLine1 against phone/URL junk.
+    sq = _sanitize_query_fields(
+        address_line1, '',                    # addressLine1 + legacy address1
+        job.get('city') or '', job.get('state') or '',
+        lat_in, lng_in,
+    )
+    sanitized_addr = sq['addressLine1']
+
+    # Viewport anchor. Prefer the candidate's own coords when present
+    # (a tighter anchor than the region centroid), else fall back to
+    # the bbox centroid so we still bias ranking into the region.
+    has_geo_anchor = False
+    anchor_lat = None
+    anchor_lng = None
+    if (
+        isinstance(lat_in, (int, float))
+        and isinstance(lng_in, (int, float))
+        and -90 <= float(lat_in) <= 90
+        and -180 <= float(lng_in) <= 180
+        and not (float(lat_in) == 0.0 and float(lng_in) == 0.0)
+    ):
+        anchor_lat = float(lat_in)
+        anchor_lng = float(lng_in)
+        has_geo_anchor = True
+    elif (
+        isinstance(bbox_w, (int, float))
+        and isinstance(bbox_s, (int, float))
+        and isinstance(bbox_e, (int, float))
+        and isinstance(bbox_n, (int, float))
+    ):
+        anchor_lat = (float(bbox_s) + float(bbox_n)) / 2.0
+        anchor_lng = (float(bbox_w) + float(bbox_e)) / 2.0
+        has_geo_anchor = True
+    geo_anchor_suffix = (
+        f'/@{anchor_lat},{anchor_lng},14z' if has_geo_anchor else ''
+    )
+
+    if not business_name:
+        return {'result': None, 'error': 'no_business_name'}
+
+    query_parts = [business_name, sanitized_addr]
+    query = ' '.join([p for p in query_parts if p])
+    target_url = (
+        f'https://www.google.com/maps/search/{quote_plus(query)}'
+        f'{geo_anchor_suffix}'
+    )
+
+    logger.info(
+        f'[DISCOVERY-SEARCH] {tag} '
+        f'geo_anchor={"present" if has_geo_anchor else "missing"} '
+        f'→ {target_url[:160]}'
+    )
+
+    resolved_name = None
+    resolved_place_id = None
+    resolved_lat = None
+    resolved_lng = None
+    resolved_formatted = None
+    error_msg = ''
+
+    page = await context.new_page()
+    try:
+        await page.goto(
+            target_url,
+            wait_until='domcontentloaded',
+            timeout=40000,
+        )
+
+        for sel in [
+            'button[aria-label*="Accept all"]',
+            'button[aria-label*="Accept"]',
+            'button[aria-label*="Agree"]',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=1500):
+                    await btn.click()
+                    await page.wait_for_timeout(600)
+                    break
+            except Exception:
+                pass
+
+        # Wait for either a single business panel (h1) or a results
+        # feed. If Google lands us on a results list, we drill into
+        # the best-name-match entry.
+        h1_present = False
+        try:
+            await page.wait_for_selector(
+                'h1.DUwDvf, h1.fontHeadlineLarge',
+                timeout=15000,
+            )
+            h1_present = True
+            await page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+        # If we DIDN'T land directly on a business, try the results
+        # list. Same selectors + same _names_loose_match scoring as
+        # the resolve_business drill-in above.
+        candidates: list = []
+        if h1_present:
+            try:
+                resolved_name = (
+                    await page.locator(
+                        'h1.DUwDvf, h1.fontHeadlineLarge'
+                    ).first.inner_text(timeout=5000)
+                ).strip()
+            except Exception:
+                resolved_name = None
+
+        # Address-title detection: search landed on the building panel
+        # (h1 == the address we searched) instead of a business.
+        addr_for_compare = sanitized_addr.strip().lower()
+        name_looks_like_address = bool(
+            resolved_name
+            and addr_for_compare
+            and (
+                resolved_name.lower() in addr_for_compare
+                or addr_for_compare in resolved_name.lower()
+            )
+        )
+
+        need_drill_in = (not resolved_name) or name_looks_like_address
+
+        if need_drill_in:
+            try:
+                candidates = await page.evaluate(r"""() => {
+                    const out = [];
+                    const seen = new Set();
+                    const selectors = [
+                        'a.hfpxzc[aria-label]',
+                        'a[href*="/maps/place/"][aria-label]',
+                        'div[role="feed"] a[href*="/maps/place/"]',
+                        'div[role="article"] a[href*="/maps/place/"]',
+                        'a[jsaction][href*="/maps/place/"]',
+                    ];
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            const aria =
+                                el.getAttribute('aria-label') || '';
+                            const inner = (
+                                el.innerText || el.textContent || ''
+                            ).trim();
+                            const raw = aria || inner.split('\n')[0];
+                            const name = (raw || '').trim();
+                            if (!name || name.length < 2) continue;
+                            const href = el.href || '';
+                            if (
+                                !href ||
+                                !href.includes('/maps/place/')
+                            ) continue;
+                            const key = name + '|' + href;
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            out.push({ name, href });
+                        }
+                        if (out.length > 0) break;
+                    }
+                    return out;
+                }""") or []
+            except Exception:
+                candidates = []
+
+            best_entry = None
+            best_score = 0
+            best_rule = 'no_match'
+            for c in candidates:
+                name = (c.get('name') or '').strip()
+                if not name:
+                    continue
+                # Same scoring the resolve drill-in uses. City=None
+                # because discovery jobs don't carry a stored city.
+                m = _names_loose_match(business_name, name, city=None)
+                if m['match']:
+                    score = {
+                        'equal': 100, 'contains': 90,
+                        'equal_suffixed': 80,
+                        'overlap': 60, 'jaccard': 60,
+                    }.get(m['rule'], 50)
+                else:
+                    # Legacy fallback (same as resolve): raw
+                    # max-set token overlap so we don't newly
+                    # reject anything the old code would take.
+                    tgt_norm = re.sub(
+                        r'[^\w\s]', '', business_name.lower(),
+                    ).strip()
+                    tgt_toks = (
+                        set(tgt_norm.split()) if tgt_norm else set()
+                    )
+                    name_norm = re.sub(
+                        r'[^\w\s]', '', name.lower(),
+                    ).strip()
+                    name_toks = (
+                        set(name_norm.split()) if name_norm else set()
+                    )
+                    score = 0
+                    if tgt_toks and name_toks:
+                        overlap = len(name_toks & tgt_toks)
+                        if overlap > 0:
+                            denom = max(len(name_toks), len(tgt_toks))
+                            score = int((overlap / denom) * 60)
+                if score > best_score:
+                    best_score = score
+                    best_entry = c
+                    best_rule = m['rule'] if m['match'] else 'legacy'
+
+            if best_entry and best_score >= 50:
+                href = best_entry.get('href', '')
+                logger.info(
+                    f'[DISCOVERY-SEARCH] {tag} drill-in: matched '
+                    f'"{best_entry.get("name")}" '
+                    f'(score={best_score} rule={best_rule}) '
+                    f'→ {href[:100]}'
+                )
+                try:
+                    await page.goto(
+                        href,
+                        wait_until='domcontentloaded',
+                        timeout=40000,
+                    )
+                    for sel in [
+                        'button[aria-label*="Accept all"]',
+                        'button[aria-label*="Accept"]',
+                        'button[aria-label*="Agree"]',
+                    ]:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=1000):
+                                await btn.click()
+                                await page.wait_for_timeout(400)
+                                break
+                        except Exception:
+                            pass
+                    try:
+                        await page.wait_for_selector(
+                            'h1.DUwDvf, h1.fontHeadlineLarge',
+                            timeout=15000,
+                        )
+                        await page.wait_for_timeout(1200)
+                        h1_present = True
+                        try:
+                            resolved_name = (
+                                await page.locator(
+                                    'h1.DUwDvf, h1.fontHeadlineLarge'
+                                ).first.inner_text(timeout=5000)
+                            ).strip()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(
+                        f'[DISCOVERY-SEARCH] {tag} drill-in nav '
+                        f'failed: {e}'
+                    )
+            else:
+                error_msg = 'no_confident_match'
+                logger.info(
+                    f'[DISCOVERY-SEARCH] {tag} no confident match '
+                    f'(entries={len(candidates)} '
+                    f'best_score={best_score})'
+                )
+
+        # ── placeId (ChIJ) — reuse the multi-source scan pattern ──
+        if h1_present:
+            try:
+                chij_dump = await page.evaluate(r"""() => {
+                    const CHIJ = /ChIJ[A-Za-z0-9_-]{20,}/g;
+                    const collect = (s) => {
+                        if (!s) return [];
+                        const m = String(s).match(CHIJ);
+                        return m ? Array.from(m) : [];
+                    };
+                    const out = {
+                        initstate: [], url: [],
+                        script: [], content: [], dom: [],
+                    };
+                    try {
+                        const init = window.APP_INITIALIZATION_STATE;
+                        if (init) out.initstate = collect(
+                            JSON.stringify(init),
+                        );
+                    } catch (e) {}
+                    try { out.url = collect(location.href); }
+                    catch (e) {}
+                    try {
+                        for (const sc of document.querySelectorAll(
+                            'script',
+                        )) {
+                            for (const v of collect(sc.textContent)) {
+                                out.script.push(v);
+                            }
+                        }
+                    } catch (e) {}
+                    try {
+                        out.content = collect(
+                            document.documentElement.outerHTML,
+                        );
+                    } catch (e) {}
+                    try {
+                        const main = document.querySelector(
+                            'div[role="main"], div.bJzME',
+                        );
+                        if (main) {
+                            for (const attr of [
+                                'data-pid', 'data-place-id',
+                            ]) {
+                                const el = main.querySelector(
+                                    `[${attr}]`,
+                                );
+                                if (el) for (const v of collect(
+                                    el.getAttribute(attr),
+                                )) out.dom.push(v);
+                            }
+                        }
+                        for (const a of document.querySelectorAll(
+                            'a[href*="/maps/place/"]',
+                        )) {
+                            for (const v of collect(a.href)) {
+                                out.dom.push(v);
+                            }
+                        }
+                    } catch (e) {}
+                    return out;
+                }""")
+                if isinstance(chij_dump, dict):
+                    for src in (
+                        'initstate', 'url', 'script', 'content', 'dom',
+                    ):
+                        for cand in chij_dump.get(src, []) or []:
+                            if cand:
+                                resolved_place_id = cand
+                                break
+                        if resolved_place_id:
+                            break
+            except Exception:
+                pass
+
+        # ── lat/lng of the RESOLVED PLACE (not the anchor) ──
+        # Ordering is important — we've been burned once already:
+        #   1) meta[itemprop=latitude|longitude]  — the place's own
+        #      coords, embedded by Google in the panel head. Most
+        #      trustworthy source when present.
+        #   2) !3d<lat>!4d<lng> in the URL — the place's coords
+        #      embedded in the data= param. Present on /maps/place/
+        #      URLs (i.e. after a drill-in or when Google rewrote
+        #      the URL post-hydration). Trustworthy.
+        #   3) @lat,lng in a /maps/place/ URL — viewport centre,
+        #      usually close to the place. Acceptable fallback.
+        #   4) @lat,lng in a /maps/search/ URL — the ANCHOR we sent
+        #      in the request, NOT the place. Explicitly rejected:
+        #      returning it would zero-out the input-vs-resolved
+        #      distance signal downstream and let cross-street /
+        #      cross-city misses slip through.
+        # A naive initstate [num,num] scan was tried once and rejected
+        # — it matched viewport corners and bounds rects, producing
+        # NaN coords that later tripped bbox_reject with a misleading
+        # (nan,nan) log line.
+        if h1_present:
+            try:
+                cur_url = page.url or ''
+            except Exception:
+                cur_url = ''
+
+            # 1) !3d<lat>!4d<lng> in the current URL — the place's own
+            # coords embedded in the data= param. Present on
+            # /maps/place/ URLs (drilled-in cases).
+            data_m = _MAPS_URL_DATA_LATLNG_RE.search(cur_url)
+            if data_m:
+                try:
+                    resolved_lat = float(data_m.group(1))
+                    resolved_lng = float(data_m.group(2))
+                except (TypeError, ValueError):
+                    pass
+
+            # 2) DOM anchor scan for the place's own /maps/place/...
+            # link (contains !3d/!4d). Google renders a directions
+            # button + a share link + a hero-image link, all pointing
+            # at the current place — so a same-page anchor with real
+            # coords is almost always available even on /maps/search/
+            # URLs where the location bar stays at @anchor.
+            if resolved_lat is None or resolved_lng is None:
+                try:
+                    href_coords = await page.evaluate(r"""() => {
+                        // Same-page anchors that carry the current
+                        // place's !3d/!4d. Restrict to /maps/place/
+                        // links so we don't grab a related-place
+                        // link elsewhere in the page.
+                        const anchors = document.querySelectorAll(
+                            'a[href*="/maps/place/"][href*="!3d"]'
+                            + '[href*="!4d"]',
+                        );
+                        const re = /!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/;
+                        for (const a of anchors) {
+                            const m = (a.href || '').match(re);
+                            if (m) {
+                                return [
+                                    parseFloat(m[1]),
+                                    parseFloat(m[2]),
+                                ];
+                            }
+                        }
+                        return null;
+                    }""")
+                    if (
+                        isinstance(href_coords, list)
+                        and len(href_coords) == 2
+                        and _re.match(
+                            r'^-?\d', str(href_coords[0])
+                        )
+                    ):
+                        resolved_lat = float(href_coords[0])
+                        resolved_lng = float(href_coords[1])
+                except Exception:
+                    pass
+
+            # 3) Fallback: @lat,lng from the current URL. On
+            # /maps/place/ URLs this is the viewport centre (usually
+            # ≈ the place). On /maps/search/ URLs — the case Google
+            # never rewrites for direct-hit resolutions — it's the
+            # anchor we sent. That means input-vs-resolved distance
+            # ≈ 0 for those, which loses the geo-side sanity signal
+            # but doesn't break correctness: name similarity is
+            # still enforced downstream (nameSimilarity in
+            # discovery-run.service.ts) and catches cross-place
+            # misses. Not returning coords at all was worse — the
+            # entire cohort of direct-search resolutions gets
+            # rejected as no_coords_extracted despite having a
+            # perfectly valid resolved placeId + name. Bbox reject
+            # still functions on drill-in cases where !3d/!4d gives
+            # us the true place coords.
+            if resolved_lat is None or resolved_lng is None:
+                at_m = _MAPS_URL_LATLNG_RE.search(cur_url)
+                if at_m:
+                    try:
+                        resolved_lat = float(at_m.group(1))
+                        resolved_lng = float(at_m.group(2))
+                    except (TypeError, ValueError):
+                        pass
+
+        # ── formatted address ──
+        try:
+            addr_txt = await page.locator(
+                'button[data-item-id="address"] div.fontBodyMedium',
+            ).first.inner_text(timeout=800)
+            if addr_txt and addr_txt.strip():
+                resolved_formatted = re.sub(
+                    r'\s+', ' ', addr_txt,
+                ).strip()
+        except Exception:
+            pass
+        if not resolved_formatted:
+            try:
+                aria = await page.locator(
+                    'button[data-item-id="address"]',
+                ).first.get_attribute('aria-label', timeout=800)
+                if aria:
+                    cleaned = re.sub(
+                        r'^\s*address[:,\s]+',
+                        '',
+                        aria,
+                        flags=re.IGNORECASE,
+                    )
+                    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                    if cleaned:
+                        resolved_formatted = cleaned
+            except Exception:
+                pass
+
+    except Exception as e:
+        import traceback
+        error_msg = f'{type(e).__name__}: {e}'
+        logger.error(
+            f'[DISCOVERY-SEARCH] {tag} failed: '
+            f'{e}\n{traceback.format_exc()}'
+        )
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    # ── Post-nav confident-match gates ──
+    # If we haven't already set an error and something's missing to
+    # ship a valid result, downgrade to null with the reason. NaN
+    # counts as missing — a stray NaN slipping into a valid-looking
+    # payload would fail the bbox check with misleading (nan,nan)
+    # log lines and pollute downstream.
+    def _finite(x) -> bool:
+        try:
+            return isinstance(x, (int, float)) and x == x  # NaN != NaN
+        except Exception:
+            return False
+
+    if not error_msg:
+        if not resolved_place_id:
+            error_msg = 'no_place_id_extracted'
+        elif not (_finite(resolved_lat) and _finite(resolved_lng)):
+            error_msg = 'no_coords_extracted'
+
+    # Bbox reject (schema comment: "hard reject: if the resolved place
+    # lands outside this rectangle we return null rather than accept
+    # a cross-region match"). Only enforceable when we have both
+    # coords and a valid bbox.
+    if (
+        not error_msg
+        and resolved_lat is not None
+        and resolved_lng is not None
+        and isinstance(bbox_w, (int, float))
+        and isinstance(bbox_s, (int, float))
+        and isinstance(bbox_e, (int, float))
+        and isinstance(bbox_n, (int, float))
+    ):
+        if not (
+            float(bbox_w) <= float(resolved_lng) <= float(bbox_e)
+            and float(bbox_s) <= float(resolved_lat) <= float(bbox_n)
+        ):
+            logger.warning(
+                f'[DISCOVERY-SEARCH] {tag} bbox_reject: resolved '
+                f'({resolved_lat:.5f},{resolved_lng:.5f}) outside '
+                f'[W {bbox_w}, S {bbox_s}, E {bbox_e}, N {bbox_n}]'
+            )
+            error_msg = 'bbox_reject'
+
+    if error_msg:
+        return {'result': None, 'error': error_msg}
+
+    logger.info(
+        f'[DISCOVERY-SEARCH] {tag} ✓ placeId={resolved_place_id} '
+        f'name={resolved_name!r} '
+        f'coords=({resolved_lat:.5f},{resolved_lng:.5f}) '
+        f'addr={(resolved_formatted or "")[:60]!r}'
+    )
+    return {
+        'result': {
+            'placeId': resolved_place_id,
+            'name': resolved_name or '',
+            'formattedAddress': resolved_formatted or '',
+            'lat': resolved_lat,
+            'lng': resolved_lng,
+        },
+        'error': '',
+    }
+
+
+async def _poll_discovery_batch(limit: int) -> list:
+    """Atomically claim up to `limit` discovery_search jobs. Same
+    /bot/poll-batch endpoint the resolve pool uses — the server-side
+    excludes discovery from the single-job /bot/poll, so pool is the
+    only intake path.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f'{DOP_API_URL}/api/v1/seeding/bot/poll-batch',
+                params={'type': 'discovery_search', 'limit': limit},
+                headers={'x-bot-secret': DOP_WEBHOOK_SECRET},
+            )
+    except Exception as e:
+        logger.warning(f'[DISCOVERY-POOL] poll-batch request failed: {e}')
+        return []
+    if r.status_code != 200:
+        logger.warning(
+            f'[DISCOVERY-POOL] poll-batch HTTP {r.status_code}: '
+            f'{r.text[:160]}'
+        )
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        return []
+    return data.get('jobs') or []
+
+
+async def _post_discovery_result(job_id: str, payload: dict) -> bool:
+    """POST the bot-result to /discovery/bot-result. Returns True on
+    2xx. Note the endpoint atomically sets the job to DONE, so we do
+    NOT need a separate /bot/job/:id/complete call — that would be a
+    no-op that also risks re-triggering the session-bucket increment.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f'{DOP_API_URL}/api/v1/seeding/discovery/bot-result',
+                json={'jobId': job_id, **payload},
+                headers={
+                    'Content-Type': 'application/json',
+                    'x-bot-secret': DOP_WEBHOOK_SECRET,
+                },
+            )
+            if r.status_code in (200, 201):
+                return True
+            logger.error(
+                f'[DISCOVERY-POOL] bot-result HTTP {r.status_code}: '
+                f'{r.text[:200]}'
+            )
+            return False
+    except Exception as e:
+        logger.error(
+            f'[DISCOVERY-POOL] bot-result POST failed: '
+            f'{type(e).__name__}: {e}'
+        )
+        return False
+
+
+async def _discovery_worker(
+    worker_id: int,
+    queue: 'asyncio.Queue',
+    browser,
+    cookies,
+    jitter_ms: int,
+):
+    """Persistent worker: pull (job, stats) off the queue, run the
+    discovery search on a fresh context off the shared browser, post
+    the bot-result, tally outcome, sleep jittered, repeat.
+
+    A failure inside a single job does NOT propagate — the worker
+    marks that job failed and moves on. If bot-result POST fails,
+    the job stays in RUNNING until resetStuckJobs flips it back.
+    """
+    while True:
+        job, stats = await queue.get()
+        job_id = str(job.get('_id') or '')
+        try:
+            context = await _resolve_make_context(browser, cookies)
+            try:
+                payload = await _discovery_search_in_context(
+                    context, job,
+                )
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+            posted = await _post_discovery_result(job_id, payload)
+            if not posted:
+                stats['failed'] += 1
+            elif payload.get('result'):
+                stats['resolved'] += 1
+            else:
+                # Bot successfully decided "no confident match" —
+                # counts as a completed job, not a failure. The
+                # discovery orchestrator maps it to zero_result.
+                stats['no_match'] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            stats['failed'] += 1
+            logger.error(
+                f'[DISCOVERY-POOL] worker {worker_id} '
+                f'job {job_id} failed: {type(e).__name__}: {e}'
+            )
+            # Best-effort: tell the API this job failed so it doesn't
+            # linger in RUNNING for 10min until resetStuckJobs
+            # rescues it. Uses the shared /bot/job/:id/complete path
+            # — the discovery bot-result endpoint would also mark
+            # DONE but we didn't successfully compute a result.
+            try:
+                async with httpx.AsyncClient(timeout=10) as c:
+                    await c.post(
+                        f'{DOP_API_URL}/api/v1/seeding/bot/job/'
+                        f'{job_id}/complete',
+                        json={
+                            'success': False,
+                            'error': f'{type(e).__name__}: {e}',
+                        },
+                        headers={'x-bot-secret': DOP_WEBHOOK_SECRET},
+                    )
+            except Exception as ce:
+                logger.warning(
+                    f'[DISCOVERY-POOL] worker {worker_id} '
+                    f'job/complete post failed: {ce}'
+                )
+
+        queue.task_done()
+
+        if jitter_ms > 0:
+            try:
+                delay = random.uniform(
+                    jitter_ms * 0.5, jitter_ms * 1.5,
+                ) / 1000.0
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+
+
+async def discovery_pool_loop():
+    """Top-level pool loop for DISCOVERY_SEARCH jobs. Mirrors
+    resolve_pool_loop: claim a batch, dispatch across workers, log a
+    per-batch summary, repeat. Shared Chromium is launched lazily on
+    the first non-empty batch.
+    """
+    logger.info(
+        f'[DISCOVERY-POOL] Starting (workers={DISCOVERY_WORKERS} '
+        f'jitter_ms={DISCOVERY_JITTER_MS})'
+    )
+
+    from playwright.async_api import async_playwright
+
+    cookies = load_cookies()
+    queue: asyncio.Queue = asyncio.Queue()
+    worker_tasks: list = []
+    pw = None
+    browser = None
+
+    try:
+        pw = await async_playwright().start()
+        while True:
+            try:
+                jobs = await _poll_discovery_batch(DISCOVERY_WORKERS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f'[DISCOVERY-POOL] poll-batch failed: {e}')
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            if not jobs:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            if browser is None:
+                try:
+                    browser = await launch_browser(
+                        pw,
+                        headless=HEADLESS,
+                        args=[
+                            '--no-sandbox',
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-dev-shm-usage',
+                        ],
+                    )
+                    logger.info(
+                        '[DISCOVERY-POOL] Shared Chromium launched',
+                    )
+                except Exception as e:
+                    logger.error(
+                        f'[DISCOVERY-POOL] Chromium launch failed: {e}'
+                    )
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+
+            if not worker_tasks:
+                worker_tasks = [
+                    asyncio.create_task(
+                        _discovery_worker(
+                            i, queue, browser, cookies,
+                            DISCOVERY_JITTER_MS,
+                        )
+                    )
+                    for i in range(DISCOVERY_WORKERS)
+                ]
+
+            batch_start = time.time()
+            stats = {'resolved': 0, 'no_match': 0, 'failed': 0}
+            claimed = len(jobs)
+            logger.info(
+                f'[DISCOVERY-POOL] Batch claimed: {claimed} job(s)'
+            )
+
+            for job in jobs:
+                await queue.put((job, stats))
+
+            await queue.join()
+
+            elapsed = time.time() - batch_start
+            logger.info(
+                f'[DISCOVERY-POOL] Batch done — claimed={claimed} '
+                f'resolved={stats["resolved"]} '
+                f'no_match={stats["no_match"]} '
+                f'failed={stats["failed"]} '
+                f'elapsed={elapsed:.1f}s'
+            )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        for t in worker_tasks:
+            t.cancel()
+        for t in worker_tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
