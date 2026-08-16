@@ -284,6 +284,9 @@ categorySource: {
       limit?: number;
       parallelism?: number;
       scope?: 'review' | 'all';
+      // Optional narrowing filter — restrict re-judgment to docs whose
+      // seedProvenance.overtureCategory matches one of these values.
+      overtureCategories?: string[];
       // Pass the previous call's passId to resume an interrupted sweep;
       // omit to start a fresh pass.
       passId?: string;
@@ -304,6 +307,7 @@ categorySource: {
         limit: body.limit,
         parallelism: body.parallelism,
         scope,
+        overtureCategories: body.overtureCategories,
         passId: body.passId,
       });
     } catch (e) {

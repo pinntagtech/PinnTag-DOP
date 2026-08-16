@@ -551,6 +551,12 @@ export class DiscoveryRunService {
     // 'all': also re-judge docs that were previously accepted, so a
     //         stricter gate change can correct wrong-accepts too.
     scope?: 'review' | 'all';
+    // Optional narrowing filter: restrict re-judgment to docs whose
+    // seedProvenance.overtureCategory matches one of these values. Used
+    // to run a targeted sweep after adding rule-tier entries for a
+    // specific set of overtureCategory values, so the before/after
+    // comparison isn't muddied by LLM noise on unrelated docs.
+    overtureCategories?: string[];
     // Resumable pass marker. Every successful re-judge write stamps
     // reJudgeRunId onto the business doc. Passing the same passId on a
     // later invocation skips docs already stamped with it, so a
@@ -626,6 +632,12 @@ export class DiscoveryRunService {
         isDeleted: { $ne: true },
       };
       if (scope === 'review') cohortQuery.needsReview = true;
+      const ovCats = (opts.overtureCategories ?? []).filter(
+        (s) => typeof s === 'string' && s.length > 0,
+      );
+      if (ovCats.length > 0) {
+        cohortQuery['seedProvenance.overtureCategory'] = { $in: ovCats };
+      }
 
       // For resumability, exclude docs already stamped with this
       // passId (stamped by a prior invocation that got interrupted).
