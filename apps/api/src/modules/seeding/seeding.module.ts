@@ -79,6 +79,8 @@ import {
 import { DiscoveryService } from './discovery/discovery.service';
 import { DiscoveryRunService } from './discovery/discovery-run.service';
 import { DiscoveryController } from './discovery/discovery.controller';
+import { GpuControlController } from './discovery/gpu-control.controller';
+import { GpuControlService } from './discovery/gpu-control.service';
 import { JudgmentService } from './judgment/judgment.service';
 import { ClaudeClient } from './judgment/claude-client';
 import { OllamaClient } from './judgment/ollama-client';
@@ -121,6 +123,7 @@ import { LocationsModule } from '../locations/locations.module';
     CoverBackfillController,
     ConsoleController,
     DiscoveryController,
+    GpuControlController,
   ],
   providers: [
     SeedingLogService,
@@ -159,6 +162,7 @@ import { LocationsModule } from '../locations/locations.module';
     CategoryJudge,
     CityJudge,
     AnomalyJudge,
+    GpuControlService,
   ],
   exports: [
     SeedingSessionService,
