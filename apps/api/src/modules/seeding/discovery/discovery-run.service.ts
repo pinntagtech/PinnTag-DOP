@@ -763,6 +763,18 @@ export class DiscoveryRunService {
             },
           );
           updates++;
+
+          // Review→accept flip: the doc was inserted as needsReview:true
+          // so executeRun's post-insert wire (af7a5ae + 3602972) never
+          // fired. reJudgeRun doesn't call insertBusinessOn, but the
+          // flip lands the doc in the same downstream state an accept
+          // path would have — so provision the same Drive skeleton +
+          // enrichment jobs here. Both helpers are idempotent and
+          // non-fatal on failure; the re-judge write already committed.
+          if (wasReview && judgment.finalAction === 'accept') {
+            await this.provisionBusinessDrive(opts.runId, String(doc._id), conn);
+            await this.enqueueEnrichmentJobs(opts.runId, String(doc._id), resolved);
+          }
         }
       };
 
