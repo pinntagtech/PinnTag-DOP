@@ -48,7 +48,12 @@ import {
 } from './business-insert';
 import { resolvePlaceIdBySearchText } from './places-client';
 import { BotJobService } from '../bot/bot-job.service';
-import { BotJobType } from '../schemas/bot-job.schema';
+import {
+  BotJob,
+  BotJobDocument,
+  BotJobStatus,
+  BotJobType,
+} from '../schemas/bot-job.schema';
 import { DriveActivationService } from '../activation/drive-activation.service';
 
 const DEDUP_RADIUS_M = 50;
@@ -74,6 +79,8 @@ export class DiscoveryRunService {
     private readonly runModel: Model<DiscoveryRunDocument>,
     @InjectModel(DiscoveryProcessed.name)
     private readonly processedModel: Model<DiscoveryProcessedDocument>,
+    @InjectModel(BotJob.name)
+    private readonly botJobModel: Model<BotJobDocument>,
     private readonly configService: ConfigService,
     private readonly judgment: JudgmentService,
     private readonly claude: ClaudeClient,
@@ -829,6 +836,392 @@ export class DiscoveryRunService {
       };
     } finally {
       await conn.close();
+    }
+  }
+
+  // Drain bot-completed DISCOVERY_SEARCH jobs into the downstream
+  // pipeline: judgment → insert → discoveryProcessed → mark BotJob
+  // consumed. Built to recover orphan runs where executeRun errored
+  // out before draining the bot pool (either the "revert to Places
+  // API" window that left the bot-side path unwired, or a 3h drain
+  // deadline that hit before the bot's handler shipped). Reusable for
+  // any future run whose bot jobs completed after the run doc gave up.
+  //
+  // Zero_result / error jobs are also marked consumed with a matching
+  // discoveryProcessed row so the audit trail is complete and a
+  // second consumer sweep is a no-op.
+  //
+  // Idempotent: only claims jobs where status:'done' AND consumed:false.
+  // Cross-run duplicate sourceIds (same overtureSourceId processed
+  // earlier for this region) are marked consumed but skipped for
+  // insert — discoveryProcessed's unique (regionId, sourceId) index is
+  // the source of truth, and the dedup2 check would flag them as
+  // exact_duplicate anyway.
+  async consumeBotResults(opts: {
+    runId: string;
+    parallelism?: number;
+    finalizeRunStatus?: boolean;
+  }): Promise<{
+    runId: string;
+    regionId: string;
+    totalDone: number;
+    alreadyConsumed: number;
+    processedNow: number;
+    withResult: number;
+    withZeroResult: number;
+    alreadyProcessedOtherRun: number;
+    missingOverture: number;
+    inserted: number;
+    accept: number;
+    review: number;
+    skip: number;
+    notApplicable: number;
+    zeroResult: number;
+    errors: number;
+    driveProvisioned: number;
+    enrichmentQueued: number;
+  }> {
+    const run = await this.runModel.findOne({ runId: opts.runId }).lean();
+    if (!run) throw new Error(`No run: ${opts.runId}`);
+    const region = await this.regionModel.findOne({ regionId: run.regionId }).lean();
+    if (!region) throw new Error(`No region: ${run.regionId}`);
+
+    const bbox = {
+      west: region.bbox.west,
+      south: region.bbox.south,
+      east: region.bbox.east,
+      north: region.bbox.north,
+    };
+
+    // Re-pull Overture and index by sourceId — the bot jobs carry only
+    // the sourceId (not the full candidate). Same technique reJudgeRun
+    // uses.
+    this.logger.log(`[consume ${opts.runId}] pulling Overture for bbox…`);
+    const candidates = await fetchOverturePlacesInBbox(bbox);
+    const bySourceId = new Map<string, OvertureCandidate>();
+    for (const c of candidates) bySourceId.set(c.sourceId, c);
+    this.logger.log(
+      `[consume ${opts.runId}] overture rows=${candidates.length}, indexed=${bySourceId.size}`,
+    );
+
+    const totalDone = await this.botJobModel.countDocuments({
+      type: BotJobType.DISCOVERY_SEARCH,
+      discoveryRunId: opts.runId,
+      status: BotJobStatus.DONE,
+    });
+    const alreadyConsumed = await this.botJobModel.countDocuments({
+      type: BotJobType.DISCOVERY_SEARCH,
+      discoveryRunId: opts.runId,
+      status: BotJobStatus.DONE,
+      consumed: true,
+    });
+
+    const jobs = (await this.botJobModel
+      .find({
+        type: BotJobType.DISCOVERY_SEARCH,
+        discoveryRunId: opts.runId,
+        status: BotJobStatus.DONE,
+        $or: [{ consumed: { $exists: false } }, { consumed: false }],
+      })
+      .lean()) as any[];
+    this.logger.log(
+      `[consume ${opts.runId}] totalDone=${totalDone} alreadyConsumed=${alreadyConsumed} toProcess=${jobs.length}`,
+    );
+
+    // Pre-load which sourceIds for this region already have a
+    // discoveryProcessed row (from a prior run or a prior partial
+    // consume). Same-run dupes (bot re-enqueued the same sourceId)
+    // are handled the same way — first wins.
+    const priorProcessed = await this.processedModel
+      .find({ regionId: run.regionId }, { overtureSourceId: 1 })
+      .lean();
+    const priorSet = new Set(
+      (priorProcessed as any[]).map((d) => String(d.overtureSourceId)),
+    );
+
+    const stagingUri = this.configService.get<string>('database.pinntagStaging');
+    if (!stagingUri) throw new Error('No URI for pinntagStaging');
+    const stagingConn = await openStagingConnection(stagingUri);
+    try {
+      let withResult = 0;
+      let withZeroResult = 0;
+      let alreadyProcessedOtherRun = 0;
+      let missingOverture = 0;
+      let inserted = 0;
+      let accept = 0;
+      let review = 0;
+      let skip = 0;
+      let notApplicable = 0;
+      let zeroResult = 0;
+      let errors = 0;
+      let driveProvisioned = 0;
+      let enrichmentQueued = 0;
+
+      // Serialize priorSet updates behind a lock-free "seen-this-pass"
+      // set so two workers can't both promote the same sourceId when the
+      // bot enqueued it twice.
+      const claimedThisPass = new Set<string>();
+
+      const processOne = async (job: any): Promise<void> => {
+        const sourceId = String(job.discoveryOvertureSourceId ?? '');
+        const jobId = job._id;
+
+        // Any terminal outcome flips consumed:true — record the
+        // decision path so we can inspect audit later.
+        const markConsumed = async (bizId: string | null): Promise<void> => {
+          await this.botJobModel.updateOne(
+            { _id: jobId },
+            {
+              $set: {
+                consumed: true,
+                consumedAt: new Date(),
+                consumedBusinessId: bizId,
+              },
+            },
+          );
+        };
+
+        try {
+          // Zero-result / error path — Q1: still mark consumed, log
+          // discoveryProcessed as zero_result, no downstream.
+          const hasResult =
+            job.discoveryResult &&
+            typeof job.discoveryResult.placeId === 'string' &&
+            job.discoveryResult.placeId.length > 0;
+          if (!hasResult) {
+            withZeroResult++;
+            zeroResult++;
+            if (sourceId && !priorSet.has(sourceId) && !claimedThisPass.has(sourceId)) {
+              claimedThisPass.add(sourceId);
+              await this.logProcessed(opts.runId, run.regionId, sourceId, {
+                action: 'zero_result',
+                businessId: null,
+                resolvedPlaceId: null,
+                reasoning:
+                  String(job.discoveryError || '').trim() || 'bot_zero_result',
+              });
+            } else {
+              alreadyProcessedOtherRun++;
+            }
+            await markConsumed(null);
+            return;
+          }
+
+          withResult++;
+
+          // Cross-run duplicate short-circuit — the earlier run (or an
+          // earlier duplicate job in the same run) already produced a
+          // discoveryProcessed row for this sourceId. Mark consumed
+          // without a fresh judge/insert.
+          if (sourceId && (priorSet.has(sourceId) || claimedThisPass.has(sourceId))) {
+            alreadyProcessedOtherRun++;
+            await markConsumed(null);
+            return;
+          }
+          if (sourceId) claimedThisPass.add(sourceId);
+
+          const overture = sourceId ? bySourceId.get(sourceId) : undefined;
+          if (!overture) {
+            // Bot completed the search but we can't find the Overture
+            // candidate to feed judgment. Overture release may have
+            // rolled between run start and consume — nothing to do but
+            // log + move on.
+            missingOverture++;
+            await this.logProcessed(opts.runId, run.regionId, sourceId, {
+              action: 'skip',
+              businessId: null,
+              resolvedPlaceId: job.discoveryResult.placeId,
+              reasoning: 'consume_missing_overture',
+            });
+            await markConsumed(null);
+            return;
+          }
+
+          const resolved = {
+            placeId: String(job.discoveryResult.placeId),
+            name: String(job.discoveryResult.name ?? ''),
+            formattedAddress: String(job.discoveryResult.formattedAddress ?? ''),
+            lat: Number(job.discoveryResult.lat),
+            lng: Number(job.discoveryResult.lng),
+          };
+          const dist = haversineMeters(overture.lat, overture.lng, resolved.lat, resolved.lng);
+          const sim = nameSimilarity(
+            normalizeName(overture.name),
+            normalizeName(resolved.name),
+          );
+          const matchConfirmed =
+            dist <= MATCH_CONFIRM_MAX_DIST_M && sim >= MATCH_CONFIRM_MIN_NAME_SIM;
+          const matchReason = `name_sim=${sim.toFixed(2)} dist=${dist.toFixed(0)}m`;
+
+          const existsInStaging = await this.placeIdExistsInStaging(
+            stagingConn,
+            resolved.placeId,
+          );
+
+          const judgment = await this.judgment.judgeRecord({
+            overture: {
+              name: overture.name,
+              address: overture.address,
+              lat: overture.lat,
+              lng: overture.lng,
+              category: overture.overtureCategory,
+              sourceId: overture.sourceId,
+            },
+            resolved: { ...resolved, matchConfirmed, matchReason },
+            dedup: {
+              existsInStaging: !!existsInStaging,
+              existsInProd: false,
+              stagingIsSeeded: existsInStaging ? existsInStaging.isSeeded : null,
+              prodIsSeeded: null,
+            },
+          });
+
+          if (judgment.finalAction === 'skip') {
+            skip++;
+            await this.logProcessed(opts.runId, run.regionId, sourceId, {
+              action: 'skip',
+              businessId: null,
+              resolvedPlaceId: resolved.placeId,
+              reasoning: judgment.finalActionReasoning,
+            });
+            await markConsumed(null);
+            return;
+          }
+          if (judgment.finalAction === 'not_applicable') {
+            notApplicable++;
+            await this.logProcessed(opts.runId, run.regionId, sourceId, {
+              action: 'not_applicable',
+              businessId: null,
+              resolvedPlaceId: resolved.placeId,
+              reasoning: judgment.finalActionReasoning,
+            });
+            await markConsumed(null);
+            return;
+          }
+
+          const needsReview = judgment.finalAction === 'review';
+          const businessId = await insertBusinessOn(
+            stagingConn,
+            { regionId: run.regionId, runId: opts.runId },
+            { overture, resolved, judgment, needsReview },
+          );
+          inserted++;
+          if (needsReview) review++;
+          else accept++;
+          await this.logProcessed(opts.runId, run.regionId, sourceId, {
+            action: needsReview ? 'review' : 'accept',
+            businessId,
+            resolvedPlaceId: resolved.placeId,
+            reasoning: judgment.finalActionReasoning,
+          });
+
+          // Same post-accept wire executeRun runs.
+          if (!needsReview) {
+            const drivePrev = driveProvisioned;
+            const enrichPrev = enrichmentQueued;
+            await this.provisionBusinessDrive(opts.runId, businessId, stagingConn);
+            // provisionBusinessDrive is best-effort — count it as done
+            // whether success or logged-warning, matches executeRun's
+            // stat model (we don't record drive-success stats there
+            // either, but we do want the operator to see we tried).
+            driveProvisioned = drivePrev + 1;
+            await this.enqueueEnrichmentJobs(opts.runId, businessId, resolved);
+            enrichmentQueued = enrichPrev + 1;
+          }
+          await markConsumed(businessId);
+        } catch (err) {
+          errors++;
+          this.logger.warn(
+            `[consume ${opts.runId}] job ${jobId} failed: ${(err as Error).message ?? err}`,
+          );
+          try {
+            if (sourceId) {
+              await this.logProcessed(opts.runId, run.regionId, sourceId, {
+                action: 'skip',
+                businessId: null,
+                resolvedPlaceId: job.discoveryResult?.placeId ?? null,
+                reasoning: `consume_error: ${(err as Error).message ?? err}`,
+              });
+            }
+          } catch {
+            // dup key on shared sourceId is fine.
+          }
+          // Do NOT mark consumed on unexpected error — leave the job
+          // for a follow-up sweep to retry once the underlying issue
+          // (e.g. staging connection blip) clears.
+        }
+      };
+
+      const parallelism = Math.max(1, Math.min(opts.parallelism ?? 5, 15));
+      let cursor = 0;
+      const workers = Array.from({ length: parallelism }, async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= jobs.length) return;
+          await processOne(jobs[i]);
+        }
+      });
+      await Promise.all(workers);
+
+      // Finalize the run doc — flip status to completed and stamp the
+      // stats we just observed. Only touch stats keys the consumer
+      // actually knows about; leaves executeRun-only counters (claude
+      // usage, placesCalls) alone since they weren't produced here.
+      if (opts.finalizeRunStatus !== false) {
+        const priorStats = (run.stats ?? {}) as any;
+        await this.runModel.updateOne(
+          { runId: opts.runId },
+          {
+            $set: {
+              status: DiscoveryRunStatus.COMPLETED,
+              completedAt: new Date(),
+              error: null,
+              'stats.processed':
+                (priorStats.processed ?? 0) + inserted + skip + notApplicable + zeroResult,
+              'stats.actionAccept': (priorStats.actionAccept ?? 0) + accept,
+              'stats.actionReview': (priorStats.actionReview ?? 0) + review,
+              'stats.actionSkip': (priorStats.actionSkip ?? 0) + skip,
+              'stats.actionNotApplicable':
+                (priorStats.actionNotApplicable ?? 0) + notApplicable,
+              'stats.actionZeroResultNoInsert':
+                (priorStats.actionZeroResultNoInsert ?? 0) + zeroResult,
+              'stats.errorCount': (priorStats.errorCount ?? 0) + errors,
+            },
+          },
+        );
+      }
+
+      this.logger.log(
+        `[consume ${opts.runId}] DONE totalDone=${totalDone} alreadyConsumed=${alreadyConsumed} ` +
+          `processedNow=${jobs.length} withResult=${withResult} withZeroResult=${withZeroResult} ` +
+          `alreadyProcessedOtherRun=${alreadyProcessedOtherRun} missingOverture=${missingOverture} ` +
+          `inserted=${inserted} accept=${accept} review=${review} skip=${skip} ` +
+          `notApplicable=${notApplicable} zeroResult=${zeroResult} errors=${errors} ` +
+          `driveProvisioned=${driveProvisioned} enrichmentQueued=${enrichmentQueued}`,
+      );
+
+      return {
+        runId: opts.runId,
+        regionId: String(run.regionId),
+        totalDone,
+        alreadyConsumed,
+        processedNow: jobs.length,
+        withResult,
+        withZeroResult,
+        alreadyProcessedOtherRun,
+        missingOverture,
+        inserted,
+        accept,
+        review,
+        skip,
+        notApplicable,
+        zeroResult,
+        errors,
+        driveProvisioned,
+        enrichmentQueued,
+      };
+    } finally {
+      await stagingConn.close();
     }
   }
 

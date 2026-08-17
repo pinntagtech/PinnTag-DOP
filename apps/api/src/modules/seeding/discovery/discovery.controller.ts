@@ -318,6 +318,41 @@ categorySource: {
     }
   }
 
+  // One-off recovery endpoint: consume DONE-but-unconsumed
+  // DISCOVERY_SEARCH bot jobs for a given runId, drive them through the
+  // downstream pipeline (judge → insert → discoveryProcessed), and mark
+  // each job consumed. Built to recover orphan runs where executeRun
+  // errored out before draining the bot pool. Idempotent — a second
+  // call on the same runId processes 0 jobs.
+  @Post('consume-run')
+  async consumeRun(
+    @Body()
+    body: {
+      runId: string;
+      parallelism?: number;
+      finalizeRunStatus?: boolean;
+      adminPassword?: string;
+    },
+  ) {
+    const configured = process.env.DOP_ADMIN_PASSWORD;
+    if (!configured || body.adminPassword !== configured) {
+      throw new HttpException('Invalid admin password', 403);
+    }
+    if (!body.runId) throw new HttpException('runId required', 400);
+    try {
+      return await this.runService.consumeBotResults({
+        runId: body.runId,
+        parallelism: body.parallelism,
+        finalizeRunStatus: body.finalizeRunStatus,
+      });
+    } catch (e) {
+      if (e instanceof HttpException) throw e;
+      const msg = (e as Error).message ?? String(e);
+      this.logger.error(`consumeRun ${body.runId} failed: ${msg}`);
+      throw new HttpException(msg, 500);
+    }
+  }
+
   // ── Bot result webhook for DISCOVERY_SEARCH jobs ──────────────────────
   //
   // The discovery bot POSTs the resolved Google Maps match (or an error)

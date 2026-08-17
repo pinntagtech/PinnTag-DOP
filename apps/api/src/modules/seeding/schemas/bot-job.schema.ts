@@ -151,6 +151,22 @@ export class BotJob {
   // outcome without a downstream judge/insert.
   @Prop({ type: String, default: '' })
   discoveryError?: string;
+
+  // Set by DiscoveryRunService.consumeBotResults once the bot's result
+  // has been driven through the downstream pipeline (judge → insert →
+  // discoveryProcessed) or logged as zero_result. Prevents a re-run
+  // of the consumer from re-judging + double-inserting the same
+  // sourceId. Only meaningful on DISCOVERY_SEARCH jobs.
+  @Prop({ type: Boolean, default: false })
+  consumed?: boolean;
+
+  @Prop({ type: Date, default: null })
+  consumedAt?: Date | null;
+
+  // Populated when the consumer produced an accept/review insert.
+  // Null for zero_result / skip / not_applicable / duplicate-of-earlier-run.
+  @Prop({ type: String, default: null })
+  consumedBusinessId?: string | null;
 }
 
 export type BotJobDocument = BotJob & Document;
@@ -158,3 +174,5 @@ export const BotJobSchema = SchemaFactory.createForClass(BotJob);
 
 BotJobSchema.index({ status: 1, createdAt: 1 });
 BotJobSchema.index({ sessionId: 1 });
+// Consumer sweep — pull done+unconsumed DISCOVERY_SEARCH jobs by runId.
+BotJobSchema.index({ type: 1, discoveryRunId: 1, status: 1, consumed: 1 });
