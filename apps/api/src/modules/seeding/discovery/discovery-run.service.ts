@@ -42,6 +42,7 @@ import {
 import { isBlockedOvertureCategory } from './category-blocklist';
 import { JudgmentService } from '../judgment/judgment.service';
 import { ClaudeClient } from '../judgment/claude-client';
+import { OllamaClient } from '../judgment/ollama-client';
 import {
   insertBusinessOn,
   openStagingConnection,
@@ -84,8 +85,16 @@ export class DiscoveryRunService {
     private readonly configService: ConfigService,
     private readonly judgment: JudgmentService,
     private readonly claude: ClaudeClient,
+    private readonly ollama: OllamaClient,
     private readonly botJobService: BotJobService,
   ) {}
+
+  // Threshold at which the run-completion log escalates to WARN.
+  // Anything above this fraction of local-llm calls returning null
+  // means the run's review pile is dominated by Ollama-down noise,
+  // not genuine ambiguity — the operator should re-judge once Ollama
+  // is back rather than start hand-clearing review.
+  private static readonly LOCAL_LLM_NULL_WARN_PCT = 0.2;
 
   // Kick off a run in the background. Returns the runId immediately —
   // caller polls GET /seeding/discovery/runs/:runId for status.
@@ -126,7 +135,31 @@ export class DiscoveryRunService {
   ): Promise<void> {
     const t0 = Date.now();
     this.claude.resetUsage();
+    this.ollama.resetUsage();
     const startingUsage = this.claude.getUsage(); // 0's
+
+    // Pre-flight: if OLLAMA_HOST is set but the endpoint doesn't respond
+    // to /api/tags within 4s, the local-llm tier is guaranteed to
+    // produce confidence=0 placeholders for every judge call — the run
+    // would burn a full Places API budget only to dump most results
+    // into review. Bail early rather than proceed.
+    //
+    // No hard-refuse — surface it as a run-doc error and mark FAILED so
+    // pm2 logs + /runs/:id both scream. The operator restarts once the
+    // GPU is verified up (start-gpu.sh or a Slack /gpu-start).
+    if (this.ollama.enabled) {
+      const reachable = await this.ollama.isReachable();
+      if (!reachable) {
+        const msg =
+          `Ollama pre-flight failed: OLLAMA_HOST set but /api/tags did not respond. ` +
+          `Aborting run to avoid burning Places API budget into a guaranteed-review pile. ` +
+          `Bring the AI server up (start-gpu.sh) and re-invoke run-batch.`;
+        this.logger.error(`[${runId}] ${msg}`);
+        await this.markFailed(runId, msg);
+        return;
+      }
+      this.logger.log(`[${runId}] Ollama pre-flight OK (${process.env.OLLAMA_HOST})`);
+    }
 
     const bbox = {
       west: region.bbox.west,
@@ -370,6 +403,7 @@ export class DiscoveryRunService {
 
       const flushStats = async (): Promise<void> => {
         const u = this.claude.getUsage();
+        const o = this.ollama.getUsage();
         await this.runModel
           .updateOne(
             { runId },
@@ -389,6 +423,8 @@ export class DiscoveryRunService {
                 'stats.actionNotApplicable': actionNotApplicable,
                 'stats.actionZeroResultNoInsert': actionZeroResult,
                 'stats.errorCount': errorCount,
+                'stats.localLlmCalls': o.calls,
+                'stats.localLlmNullReturns': o.nullReturns,
               },
             },
           )
@@ -418,6 +454,7 @@ export class DiscoveryRunService {
 
       // Final stats write.
       const u = this.claude.getUsage();
+      const o = this.ollama.getUsage();
       const totalWallSeconds = (Date.now() - t0) / 1000;
       await this.runModel.updateOne(
         { runId },
@@ -438,16 +475,40 @@ export class DiscoveryRunService {
             'stats.actionNotApplicable': actionNotApplicable,
             'stats.actionZeroResultNoInsert': actionZeroResult,
             'stats.errorCount': errorCount,
+            'stats.localLlmCalls': o.calls,
+            'stats.localLlmNullReturns': o.nullReturns,
           },
         },
       );
-      this.logger.log(
+
+      // Ollama health watermark. If a large fraction of local-llm
+      // calls returned null, every one of those became a confidence=0
+      // placeholder and (via the 0.9 gate) a needsReview flip — so
+      // the review pile is largely infrastructure noise, not real
+      // ambiguity. Log at WARN so the completion line is impossible
+      // to miss in pm2 logs.
+      const nullPct = o.calls > 0 ? o.nullReturns / o.calls : 0;
+      const nullPctStr = (nullPct * 100).toFixed(1);
+      const summary =
         `[${runId}] DONE in ${totalWallSeconds.toFixed(1)}s: ` +
-          `processed=${processed} placesCalls=${placesCallsTotal} ` +
-          `zero_result=${actionZeroResult} accept=${actionAccept} ` +
-          `review=${actionReview} skip=${actionSkip} ` +
-          `not_applicable=${actionNotApplicable} errors=${errorCount}`,
-      );
+        `processed=${processed} placesCalls=${placesCallsTotal} ` +
+        `zero_result=${actionZeroResult} accept=${actionAccept} ` +
+        `review=${actionReview} skip=${actionSkip} ` +
+        `not_applicable=${actionNotApplicable} errors=${errorCount} ` +
+        `localLlm=${o.calls}(null=${o.nullReturns},${nullPctStr}%)`;
+      if (
+        this.ollama.enabled &&
+        o.calls > 0 &&
+        nullPct > DiscoveryRunService.LOCAL_LLM_NULL_WARN_PCT
+      ) {
+        this.logger.warn(
+          `${summary} — HIGH LOCAL-LLM NULL RATE. Most needsReview flips ` +
+            `are Ollama-down placeholders, not genuine ambiguity. Verify ` +
+            `Ollama health, then reJudgeRun this runId to recover accepts.`,
+        );
+      } else {
+        this.logger.log(summary);
+      }
     } finally {
       await stagingConn.close();
     }

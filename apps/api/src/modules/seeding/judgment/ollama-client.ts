@@ -18,8 +18,48 @@ export class OllamaClient {
   private readonly host = process.env.OLLAMA_HOST; // e.g. "http://10.x.x.x:11434"
   private readonly model = process.env.OLLAMA_MODEL || 'llama3.1:8b';
 
+  // Lightweight per-process usage counters. DiscoveryRunService reads
+  // these to compute the confidence-zero watermark (askJson returning
+  // null is what the judges convert into a confidence=0 placeholder).
+  // Reset via resetUsage() at the top of each run, same pattern as
+  // ClaudeClient.
+  private callCount = 0;
+  private nullReturns = 0;
+
   get enabled(): boolean {
     return !!this.host;
+  }
+
+  getUsage(): { calls: number; nullReturns: number } {
+    return { calls: this.callCount, nullReturns: this.nullReturns };
+  }
+
+  resetUsage(): void {
+    this.callCount = 0;
+    this.nullReturns = 0;
+  }
+
+  // Cheap health probe used by DiscoveryRunService's pre-flight check.
+  // Hits /api/tags (the model-list endpoint) with a short timeout —
+  // Ollama returns 200 with a tag list even when no generate call has
+  // ever been issued, so this doesn't warm the GPU or block on
+  // cold-start. Returns false on any failure (disabled, HTTP != 200,
+  // network error, timeout).
+  async isReachable(timeoutMs = 4000): Promise<boolean> {
+    if (!this.enabled) return false;
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${this.host}/api/tags`, {
+        method: 'GET',
+        signal: controller.signal,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(t);
+    }
   }
 
   /**
@@ -36,6 +76,7 @@ export class OllamaClient {
     timeoutMs?: number;
   }): Promise<T | null> {
     if (!this.enabled) return null;
+    this.callCount++;
 
     const timeoutMs = opts.timeoutMs ?? 60000;
     const controller = new AbortController();
@@ -61,6 +102,7 @@ export class OllamaClient {
 
       if (!res.ok) {
         this.logger.warn(`Ollama HTTP ${res.status}: ${await res.text()}`);
+        this.nullReturns++;
         return null;
       }
 
@@ -70,10 +112,12 @@ export class OllamaClient {
         return JSON.parse(data.response) as T;
       } catch {
         this.logger.warn(`Ollama returned non-JSON response: ${data.response.slice(0, 200)}`);
+        this.nullReturns++;
         return null;
       }
     } catch (err) {
       this.logger.warn(`Ollama request failed: ${(err as Error).message}`);
+      this.nullReturns++;
       return null;
     } finally {
       clearTimeout(timeout);

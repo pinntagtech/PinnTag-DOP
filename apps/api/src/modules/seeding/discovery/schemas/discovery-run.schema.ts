@@ -34,6 +34,16 @@ export class RunStats {
   @Prop({ type: Number, default: 0 }) actionNotApplicable!: number;
   @Prop({ type: Number, default: 0 }) actionZeroResultNoInsert!: number;
   @Prop({ type: Number, default: 0 }) errorCount!: number;
+
+  // Ollama health watermark. `localLlmCalls` counts every askJson issued
+  // from this run's judge invocations; `localLlmNullReturns` counts those
+  // that returned null (HTTP failure, network error, timeout, or bad
+  // JSON) — each of which the judges convert into a confidence=0
+  // placeholder → needsReview via the 0.9 gate. High values indicate
+  // Ollama was unreachable/overloaded and the run's review pile is
+  // largely infrastructure noise rather than genuine ambiguity.
+  @Prop({ type: Number, default: 0 }) localLlmCalls!: number;
+  @Prop({ type: Number, default: 0 }) localLlmNullReturns!: number;
 }
 export const RunStatsSchema = SchemaFactory.createForClass(RunStats);
 
