@@ -14,6 +14,7 @@ import { MediaModule } from './modules/media/media.module';
 import { SeedingModule } from './modules/seeding/seeding.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { LocationsModule } from './modules/locations/locations.module';
+import { LaunchEngagementModule } from './modules/launch-engagement/launch-engagement.module';
 
 @Module({
   imports: [
@@ -37,6 +38,7 @@ import { LocationsModule } from './modules/locations/locations.module';
     MenuModule,
     MediaModule,
     LocationsModule,
+    LaunchEngagementModule,
     SeedingModule,
   ],
 })
