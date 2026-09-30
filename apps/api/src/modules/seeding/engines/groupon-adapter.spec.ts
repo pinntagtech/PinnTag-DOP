@@ -28,6 +28,19 @@ describe('adaptGrouponScraperData', () => {
   });
 });
 
+describe('groupon state + creatable', () => {
+  it('takes state from sourceCity when location has none; flags no-street as not creatable', () => {
+    const r = adaptGrouponScraperData([
+      card({ location: '7173 Covington Highway, Lithonia', sourceCity: '/local/atlanta' }),
+      card({ cardUUID: 'u9', merchantName: 'Buck', location: 'Buckhead, Atlanta', sourceCity: '/local/atlanta' }),
+    ]);
+    expect(r.groups[0].business.state).toBe('GA');
+    expect(r.groups[0].creatable).toBe(true);
+    expect(r.groups[1].creatable).toBe(false);
+    expect(r.groups[1].cardUUIDs).toEqual(['u9']);
+  });
+});
+
 describe('isAttachEligible', () => {
   it('guards claimed', () => {
     expect(isAttachEligible({ isClaimed: true, isFromCrawler: true })).toBe(false);

@@ -325,7 +325,10 @@ export class SeedingController {
 
     const matchedAttach = plan.filter((p) => p.match?.action === 'attach').length;
     const matchedReview = plan.filter((p) => p.match?.action === 'manual_review').length;
-    const unmatched = plan.filter((p) => !p.match).length;
+    const unmatchedAll = plan.filter((p) => !p.match);
+    // Unmatched with no street number: never created, but listed in full for follow-up.
+    const noStreet = unmatchedAll.filter((p) => !p.group.creatable);
+    const unmatched = unmatchedAll.length - noStreet.length;
     const summary = {
       db: dbName,
       environment,
@@ -333,6 +336,15 @@ export class SeedingController {
       matchedAttach,
       matchedManualReview: matchedReview,
       unmatchedNew: unmatched,
+      unmatchedNoStreetNumber: noStreet.length,
+      unmatchedNoStreetNumberList: noStreet.map((p) => ({
+        merchant: p.group.name,
+        addressLine1: p.group.business.addressLine1,
+        city: p.group.business.city,
+        lat: p.group.latitude,
+        lng: p.group.longitude,
+        cardUUIDs: p.group.cardUUIDs,
+      })),
       rejectedSample: adapted.rejected.slice(0, 10),
     };
 
@@ -362,6 +374,7 @@ export class SeedingController {
     const warn = (message: string) => ({ field: 'name', message, severity: 'warning' });
 
     for (const { group, match } of plan) {
+      if (!match && !group.creatable) continue;
       if (match) {
         const data = {
           name: group.name,
@@ -412,7 +425,7 @@ export class SeedingController {
       plan.map((p) => ({ rawData: p.group.business, transformedData: p.group.business })),
     );
     await this.sessionService.updateById(sessionId, {
-      totalRecords: plan.length,
+      totalRecords: plan.length - noStreet.length,
       status: SeedingSessionStatus.TRANSFORMED,
       dominantCity: dominant.dominantCity,
       dominantState: dominant.dominantState,
@@ -424,7 +437,8 @@ export class SeedingController {
       message:
         `Groupon import (${dbName}): ${adapted.stats.deals} deals / ${adapted.stats.merchants} merchants, ` +
         `${matchedAttach} matched-attach, ${matchedReview} matched-claimed (manual review), ` +
-        `${unmatched} new, ${adapted.stats.rejected} rejected`,
+        `${unmatched} new, ${noStreet.length} skipped (no street number), ${adapted.stats.rejected} rejected`,
+      metadata: { noStreetNumber: summary.unmatchedNoStreetNumberList },
     });
     return { sessionId, ...summary };
   }

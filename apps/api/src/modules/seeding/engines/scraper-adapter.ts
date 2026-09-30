@@ -2063,6 +2063,10 @@ export interface GrouponMerchantGroup {
   // Fully-formed new-business draft (used only when no existing match)
   business: any;
   warnings: string[];
+  // false when the address has no street number: may still MATCH+attach, but
+  // must not create a new business (addressLine1 would be a neighborhood name).
+  creatable: boolean;
+  cardUUIDs: string[];
 }
 
 export interface GrouponAdapterResult {
@@ -2070,6 +2074,16 @@ export interface GrouponAdapterResult {
   rejected: { cardUUID: string; reason: string }[];
   stats: { processed: number; rejected: number; merchants: number; deals: number };
 }
+
+// Groupon `location` is "street, city" with no state. State comes from the
+// scrape's sourceCity, never guessed per record.
+const SOURCE_CITY_STATE: Record<string, string> = {
+  atlanta: 'GA',
+  nyc: 'NY',
+  'new-york': 'NY',
+  chicago: 'IL',
+  newark: 'NJ',
+};
 
 const usd = (c: number) => `$${(c / 100).toFixed(2).replace(/\.00$/, '')}`;
 
@@ -2129,6 +2143,7 @@ export function adaptGrouponScraperData(cards: GrouponCard[]): GrouponAdapterRes
     );
     if (existing) {
       existing.promotions.push(promo);
+      existing.cardUUIDs.push(id);
       continue;
     }
 
@@ -2137,7 +2152,13 @@ export function adaptGrouponScraperData(cards: GrouponCard[]): GrouponAdapterRes
     if (!addr.address1 || !addr.city) {
       reject('address could not be parsed into street + city'); continue;
     }
-    if (!addr.state) warnings.push('State could not be resolved from the address');
+    const state =
+      addr.state ||
+      SOURCE_CITY_STATE[(c.sourceCity ?? '').replace(/^\/local\//, '').toLowerCase()] ||
+      '';
+    if (!state) warnings.push('State could not be resolved from the address or sourceCity');
+    const creatable = /^\d/.test(addr.address1.trim());
+    if (!creatable) warnings.push('No street number in address - not creatable as a new business');
     if (!addr.postalCode) warnings.push('Postal code missing from address');
     if (!isUsCoord(lat, lng)) warnings.push('[stage-b] coordinates are outside the United States');
     warnings.push('Industry/category not available from Groupon - will be set by Fix taxonomy after publish');
@@ -2149,7 +2170,7 @@ export function adaptGrouponScraperData(cards: GrouponCard[]): GrouponAdapterRes
       // enrichment engine reads address1 for the Google lookup
       address1: addr.address1,
       city: addr.city,
-      state: addr.state,
+      state,
       postalCode: addr.postalCode,
       country: 'United States',
       countryCode: '+1',
@@ -2168,7 +2189,7 @@ export function adaptGrouponScraperData(cards: GrouponCard[]): GrouponAdapterRes
     if (addr.address2) business.address2 = addr.address2;
 
     // promotions array is shared by reference, so later deals in the group show up in the draft
-    groups.push({ name, latitude: lat, longitude: lng, promotions, business, warnings });
+    groups.push({ name, latitude: lat, longitude: lng, promotions, business, warnings, creatable, cardUUIDs: [id] });
   }
 
   return {
