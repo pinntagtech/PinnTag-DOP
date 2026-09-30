@@ -1,5 +1,6 @@
 import { BusinessStatus } from '../../../common/enums';
 import { OPEN_24H_DURATION } from '../resolve/hours-constants';
+import { haversineM, MATCH_RADIUS_M } from './business-matcher';
 
 export interface ScraperRecord {
   place_name?: string;
@@ -2014,4 +2015,170 @@ export function adaptScraperData(
   });
 
   return { records, stats };
+}
+
+// ─── Groupon deal cards ─────────────────────────────────────────────────
+// Groupon cards have no placeId, so this is a separate adapter (not an
+// overload of adaptScraperData). Pure: no DB access. Matching against the
+// target env happens in the controller via business-matcher.
+
+export interface GrouponCard {
+  cardUUID?: string;
+  title?: string;
+  merchantName?: string | null;
+  merchantRating?: number | null;
+  location?: string;
+  lat?: number;
+  lng?: number;
+  sourceCity?: string;
+  url?: string;
+  pricing?: {
+    bestPriceCents?: number | null;
+    strikeThroughCents?: number | null;
+    discountPercent?: number | null;
+    currency?: string;
+  };
+  scrapedAt?: string;
+}
+
+// Real Promotion type (pinntagBackend types.model.ts) is
+// { name, description, startDate, endDate }. Extra keys (source, cardUUID,
+// sourceUrl, pricing) are additive; cardUUID is the publish idempotency key.
+export interface GrouponPromotion {
+  name: string;
+  description: string;
+  startDate: Date;
+  endDate?: Date;
+  source: 'groupon';
+  cardUUID: string;
+  sourceUrl: string;
+  pricing: GrouponCard['pricing'];
+}
+
+export interface GrouponMerchantGroup {
+  name: string;
+  latitude: number;
+  longitude: number;
+  promotions: GrouponPromotion[];
+  // Fully-formed new-business draft (used only when no existing match)
+  business: any;
+  warnings: string[];
+}
+
+export interface GrouponAdapterResult {
+  groups: GrouponMerchantGroup[];
+  rejected: { cardUUID: string; reason: string }[];
+  stats: { processed: number; rejected: number; merchants: number; deals: number };
+}
+
+const usd = (c: number) => `$${(c / 100).toFixed(2).replace(/\.00$/, '')}`;
+
+function buildGrouponPromotion(c: GrouponCard): GrouponPromotion {
+  const p = c.pricing ?? {};
+  const bits: string[] = [];
+  if (p.bestPriceCents != null) {
+    let s = usd(p.bestPriceCents);
+    if (p.strikeThroughCents != null) s += ` (was ${usd(p.strikeThroughCents)})`;
+    bits.push(s);
+  }
+  if (p.discountPercent != null) bits.push(`${p.discountPercent}% off`);
+  const scraped = c.scrapedAt ? new Date(c.scrapedAt) : new Date();
+  return {
+    name: String(c.title).trim(),
+    description: bits.join(' - '),
+    startDate: isNaN(scraped.getTime()) ? new Date() : scraped,
+    source: 'groupon',
+    cardUUID: String(c.cardUUID),
+    sourceUrl: c.url ?? '',
+    pricing: p,
+  };
+}
+
+export function adaptGrouponScraperData(cards: GrouponCard[]): GrouponAdapterResult {
+  const groups: GrouponMerchantGroup[] = [];
+  const rejected: { cardUUID: string; reason: string }[] = [];
+  const seen = new Set<string>();
+
+  for (const c of cards) {
+    const id = String(c?.cardUUID ?? '');
+    const reject = (reason: string) => rejected.push({ cardUUID: id, reason });
+
+    if (!id) { reject('missing cardUUID'); continue; }
+    if (seen.has(id)) { reject('duplicate cardUUID in batch'); continue; }
+    seen.add(id);
+
+    const name = (c.merchantName ?? '').trim();
+    if (!name) { reject('missing merchantName'); continue; }
+    if (!c.title?.trim()) { reject('missing title'); continue; }
+    const lat = Number(c.lat);
+    const lng = Number(c.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) {
+      reject('missing/invalid coordinates'); continue;
+    }
+    const loc = (c.location ?? '').trim();
+    if (!loc.includes(',')) { reject('location has no comma (not a full address)'); continue; }
+
+    const promo = buildGrouponPromotion(c);
+
+    // One business per merchant: same name (case-insensitive) within the
+    // match radius shares a group so N deals don't become N businesses.
+    const existing = groups.find(
+      (g) =>
+        g.name.toLowerCase() === name.toLowerCase() &&
+        haversineM(g.latitude, g.longitude, lat, lng) <= MATCH_RADIUS_M,
+    );
+    if (existing) {
+      existing.promotions.push(promo);
+      continue;
+    }
+
+    const warnings: string[] = [];
+    const addr = parseAddress(loc);
+    if (!addr.address1 || !addr.city) {
+      reject('address could not be parsed into street + city'); continue;
+    }
+    if (!addr.state) warnings.push('State could not be resolved from the address');
+    if (!addr.postalCode) warnings.push('Postal code missing from address');
+    if (!isUsCoord(lat, lng)) warnings.push('[stage-b] coordinates are outside the United States');
+    warnings.push('Industry/category not available from Groupon - will be set by Fix taxonomy after publish');
+
+    const promotions = [promo];
+    const business: any = {
+      name,
+      addressLine1: addr.address1,
+      // enrichment engine reads address1 for the Google lookup
+      address1: addr.address1,
+      city: addr.city,
+      state: addr.state,
+      postalCode: addr.postalCode,
+      country: 'United States',
+      countryCode: '+1',
+      latitude: lat,
+      longitude: lng,
+      rating: typeof c.merchantRating === 'number' ? c.merchantRating : 0,
+      userRatingCount: 0,
+      industry: '',
+      categories: [],
+      promotions,
+      // Groupon deal URL is NOT the merchant's website; website left blank.
+      sourceUrl: c.url ?? '',
+      status: BusinessStatus.CONFETTI_SCREEN,
+      continueJourney: false,
+    };
+    if (addr.address2) business.address2 = addr.address2;
+
+    // promotions array is shared by reference, so later deals in the group show up in the draft
+    groups.push({ name, latitude: lat, longitude: lng, promotions, business, warnings });
+  }
+
+  return {
+    groups,
+    rejected,
+    stats: {
+      processed: cards.length,
+      rejected: rejected.length,
+      merchants: groups.length,
+      deals: groups.reduce((n, g) => n + g.promotions.length, 0),
+    },
+  };
 }

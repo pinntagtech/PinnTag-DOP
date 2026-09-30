@@ -22,6 +22,7 @@ import { TransformationEngine } from './engines/transformation.engine';
 import { EnrichmentEngine } from './engines/enrichment.engine';
 import { PostPublishService } from './activation/post-publish.service';
 import { fullStateName } from './common/us-states';
+import { isAttachEligible } from './engines/business-matcher';
 import { computeDominant } from './common/dominant';
 import {
   SEED_DEFAULT_COVER,
@@ -448,6 +449,43 @@ export class SeedingPipelineService {
             );
           }
 
+          // Groupon deal matched to an existing business: guarded $push of the
+          // promotion(s), never an insert. Claimed merchants are refused.
+          const gm = (record as any).metadata?.grouponMatch;
+          if (gm?.businessId) {
+            const res = await this.attachGrouponPromotions(
+              targetConnection,
+              gm.businessId,
+              (record.transformedData as any)?.promotions ?? [],
+            );
+            if (!res.ok) {
+              failedCount++;
+              await this.recordService.updateStatus(String(record._id), SeedingRecordStatus.FAILED);
+              await this.recordService.setFailureReason(String(record._id), res.reason);
+              await this.logService.log({
+                sessionId,
+                recordId: String(record._id),
+                action: SeedingLogActions.PUBLISH_FAILED,
+                actor,
+                fromStatus: SeedingRecordStatus.READY,
+                toStatus: SeedingRecordStatus.FAILED,
+                message: res.reason,
+              });
+              continue;
+            }
+            await this.recordService.markPublished(String(record._id), gm.businessId);
+            await this.logService.log({
+              sessionId,
+              recordId: String(record._id),
+              action: SeedingLogActions.PUBLISHED,
+              actor,
+              fromStatus: SeedingRecordStatus.READY,
+              toStatus: SeedingRecordStatus.PUBLISHED,
+              message: `Groupon: ${res.pushed} promotion(s) attached, ${res.already} already present on ${gm.businessId}`,
+            });
+            continue;
+          }
+
           // Pre-publish duplicate check against target DB
           const dupCheck = await this.checkPublishDuplicate(
             record.transformedData,
@@ -546,7 +584,10 @@ export class SeedingPipelineService {
         { status: SeedingRecordStatus.PUBLISHED },
       );
       const toActivate = businessRecordsToActivate.filter(
-        (r) => r.module === SeedingModules.BUSINESS && r.publishedId,
+        (r) =>
+          r.module === SeedingModules.BUSINESS &&
+          r.publishedId &&
+          !(r as any).metadata?.grouponMatch,
       );
 
       const BATCH_SIZE = 5;
@@ -688,6 +729,46 @@ export class SeedingPipelineService {
       message: `Reference data seeded for ${environment}`,
       email,
     };
+  }
+
+  // Idempotent: each promotion is pushed only if no promotion with the same
+  // cardUUID exists, and only onto an unclaimed/seeded, non-deleted business.
+  private async attachGrouponPromotions(
+    conn: mongoose.Connection,
+    businessId: string,
+    promotions: any[],
+  ): Promise<{ ok: true; pushed: number; already: number } | { ok: false; reason: string }> {
+    const col = conn.collection('businesses');
+    const _id = new mongoose.Types.ObjectId(businessId);
+    const biz = (await col.findOne(
+      { _id, isDeleted: { $ne: true } },
+      { projection: { isClaimed: 1, isCvb: 1, isFromCrawler: 1 } },
+    )) as any;
+    if (!biz) return { ok: false, reason: `Groupon: business ${businessId} not found` };
+    if (!isAttachEligible(biz)) {
+      return { ok: false, reason: `Groupon: business ${businessId} is claimed/not seeded - manual review` };
+    }
+    let pushed = 0;
+    let already = 0;
+    for (const p of promotions) {
+      const promo = { ...p, startDate: new Date(p.startDate) };
+      const res = await col.findOneAndUpdate(
+        {
+          _id,
+          isDeleted: { $ne: true },
+          'promotions.cardUUID': { $ne: promo.cardUUID },
+          $or: [
+            { isClaimed: false },
+            { isClaimed: { $ne: true }, isCvb: true },
+            { isClaimed: { $ne: true }, isFromCrawler: true },
+          ],
+        },
+        { $push: { promotions: promo } as any, $set: { updatedAt: new Date() } },
+      );
+      if (res) pushed++;
+      else already++;
+    }
+    return { ok: true, pushed, already };
   }
 
   // ── Pre-publish duplicate check ──────────────────────────────────────────────

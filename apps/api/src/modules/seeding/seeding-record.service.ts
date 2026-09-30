@@ -41,6 +41,7 @@ export class SeedingRecordService {
     status: string;
     cvbBusinessId?: string;
     validationErrors?: ValidationError[];
+    metadata?: any;
   }): Promise<SeedingRecordDocument> {
     validateObjectId(input.sessionId, 'sessionId');
     const doc = new this.recordModel({
@@ -50,6 +51,7 @@ export class SeedingRecordService {
       rawData: input.rawData,
       transformedData: input.transformedData,
       cvbBusinessId: input.cvbBusinessId,
+      ...(input.metadata ? { metadata: input.metadata } : {}),
       ...(input.validationErrors
         ? { validationErrors: input.validationErrors }
         : {}),

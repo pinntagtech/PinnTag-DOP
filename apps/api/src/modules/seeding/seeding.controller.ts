@@ -33,7 +33,8 @@ import { LocationsService } from '../locations/locations.service';
 import { CreateSeedingSessionDto } from './dto/create-seeding-session.dto';
 import { BulkUploadRecordsDto } from './dto/bulk-upload-records.dto';
 import { PublishSessionDto } from './dto/publish-session.dto';
-import { adaptScraperData } from './engines/scraper-adapter';
+import { adaptScraperData, adaptGrouponScraperData } from './engines/scraper-adapter';
+import { findBusinessMatch } from './engines/business-matcher';
 import { computeDominant } from './common/dominant';
 import { GOOGLE_IMAGE_HOST_REGEX } from './common/google-url';
 import { buildSeededFilter } from './common/seeded-cohort';
@@ -102,9 +103,15 @@ export class SeedingController {
       defaultCategories?: string;
       defaultCity?: string;
       defaultState?: string;
+      source?: 'google-maps' | 'groupon';
+      dryRun?: string;
+      limit?: string;
     },
     @Request() req: any,
   ) {
+    if (body.source && body.source !== 'google-maps' && body.source !== 'groupon') {
+      throw new HttpException(`Unknown source "${body.source}"`, 400);
+    }
     if (!files || files.length < 1) {
       throw new HttpException(
         'At least scraper data file is required',
@@ -145,6 +152,10 @@ export class SeedingController {
         'Scraper data must be a JSON array',
         400,
       );
+    }
+
+    if (body.source === 'groupon') {
+      return this.importGrouponDeals(scraperData, body, req);
     }
 
     let defaultCategories: string[] | undefined;
@@ -274,6 +285,148 @@ export class SeedingController {
       sessionId,
       stats: result.stats,
     };
+  }
+
+  // Groupon deal cards -> seeding records. READ-ONLY against the target env
+  // (matching only); writes go to pinntagDOP session/records. Matched deals
+  // attach to the existing business at publish time; misses become new
+  // business candidates. dryRun=true returns the split without creating a session.
+  private async importGrouponDeals(
+    cards: any[],
+    body: { name: string; environment: string; actor?: string; dryRun?: string; limit?: string },
+    req: any,
+  ) {
+    const environment = body.environment || 'staging';
+    const uriKey = EnvironmentUriKey[environment as keyof typeof EnvironmentUriKey];
+    const targetUri = uriKey ? this.configService.get<string>(uriKey) : undefined;
+    if (!targetUri) throw new HttpException(`No target URI for "${environment}"`, 400);
+
+    const limit = parseInt(body.limit ?? '', 10);
+    if (limit > 0 && limit < cards.length) {
+      // evenly-strided sample so it spans the dataset, not just its head
+      const step = cards.length / limit;
+      cards = Array.from({ length: limit }, (_, i) => cards[Math.floor(i * step)]);
+    }
+
+    const adapted = adaptGrouponScraperData(cards);
+    const conn = mongoose.createConnection(targetUri);
+    const plan: { group: (typeof adapted.groups)[number]; match: any }[] = [];
+    let dbName = '';
+    try {
+      await conn.asPromise();
+      dbName = conn.db!.databaseName;
+      for (const group of adapted.groups) {
+        const match = await findBusinessMatch(conn, group.name, group.latitude, group.longitude);
+        plan.push({ group, match });
+      }
+    } finally {
+      await conn.close();
+    }
+
+    const matchedAttach = plan.filter((p) => p.match?.action === 'attach').length;
+    const matchedReview = plan.filter((p) => p.match?.action === 'manual_review').length;
+    const unmatched = plan.filter((p) => !p.match).length;
+    const summary = {
+      db: dbName,
+      environment,
+      ...adapted.stats,
+      matchedAttach,
+      matchedManualReview: matchedReview,
+      unmatchedNew: unmatched,
+      rejectedSample: adapted.rejected.slice(0, 10),
+    };
+
+    if (body.dryRun === 'true') {
+      return {
+        dryRun: true,
+        ...summary,
+        preview: plan.slice(0, 25).map((p) => ({
+          merchant: p.group.name,
+          deals: p.group.promotions.length,
+          addressLine1: p.group.business.addressLine1,
+          city: p.group.business.city,
+          state: p.group.business.state,
+          match: p.match,
+        })),
+      };
+    }
+
+    const actor = req.user?.name || body.actor || 'Operator';
+    const session = await this.sessionService.create({
+      name: body.name || `Groupon Import ${new Date().toISOString().slice(0, 10)}`,
+      environment,
+      modules: [SeedingModules.BUSINESS],
+      createdBy: actor,
+    });
+    const sessionId = String(session._id);
+    const warn = (message: string) => ({ field: 'name', message, severity: 'warning' });
+
+    for (const { group, match } of plan) {
+      if (match) {
+        const data = {
+          name: group.name,
+          addressLine1: group.business.addressLine1,
+          city: group.business.city,
+          state: group.business.state,
+          latitude: group.latitude,
+          longitude: group.longitude,
+          promotions: group.promotions,
+          matchedBusinessId: match.businessId,
+        };
+        const claimedNote =
+          match.action === 'manual_review'
+            ? `Matched CLAIMED business ${match.businessId} - NOT publishable, manual review required`
+            : `Matched, will update existing business ${match.businessId} (${match.distanceM}m away)`;
+        await this.recordService.create({
+          sessionId,
+          module: SeedingModules.BUSINESS,
+          rawData: data,
+          transformedData: data,
+          // Nothing to enrich on an attach; claimed matches are FAILED so approve never promotes them.
+          status:
+            match.action === 'attach'
+              ? SeedingRecordStatus.ENRICHED
+              : SeedingRecordStatus.FAILED,
+          metadata: { grouponMatch: match },
+          validationErrors: [
+            {
+              field: 'name',
+              message: claimedNote,
+              severity: match.action === 'manual_review' ? 'error' : 'info',
+            },
+          ],
+        });
+      } else {
+        await this.recordService.create({
+          sessionId,
+          module: SeedingModules.BUSINESS,
+          rawData: group.business,
+          transformedData: group.business,
+          status: SeedingRecordStatus.TRANSFORMED,
+          validationErrors: group.warnings.map(warn),
+        });
+      }
+    }
+
+    const dominant = computeDominant(
+      plan.map((p) => ({ rawData: p.group.business, transformedData: p.group.business })),
+    );
+    await this.sessionService.updateById(sessionId, {
+      totalRecords: plan.length,
+      status: SeedingSessionStatus.TRANSFORMED,
+      dominantCity: dominant.dominantCity,
+      dominantState: dominant.dominantState,
+    });
+    await this.logService.log({
+      sessionId,
+      action: SeedingLogActions.SCRAPER_IMPORT,
+      actor,
+      message:
+        `Groupon import (${dbName}): ${adapted.stats.deals} deals / ${adapted.stats.merchants} merchants, ` +
+        `${matchedAttach} matched-attach, ${matchedReview} matched-claimed (manual review), ` +
+        `${unmatched} new, ${adapted.stats.rejected} rejected`,
+    });
+    return { sessionId, ...summary };
   }
 
   @Get('sessions')
